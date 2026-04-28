@@ -35,9 +35,10 @@ export default async function DashboardPage() {
           subtitle="Questrade balances — TFSA, RRSP, RESP"
           href="/accounts"
         />
-        <PlaceholderCard
+        <LinkedCard
           title="Tickets"
-          subtitle="Sprint 1 — pre-trade ticket form, sized from streak-scaled risk"
+          subtitle="Pre-trade tickets with streak-scaled sizing"
+          href="/tickets"
         />
         <PlaceholderCard
           title="Breakout monitor"
