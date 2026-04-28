@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git config *)",
+      "Bash(docker compose *)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python.exe -m pip install --quiet --upgrade pip)",
+      "Bash(.venv/Scripts/python.exe -m pip install --quiet -e \".[dev]\")",
+      "Bash(.venv/Scripts/python.exe -m pip install -e \".[dev]\")",
+      "Bash(.venv/Scripts/python.exe -c \"from app.main import app; print\\('app:', app.title, app.version\\); from app.db import models; print\\('models OK; tables:', sorted\\(models.Base.metadata.tables.keys\\(\\)\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import alembic.config; cfg = alembic.config.Config\\('alembic.ini'\\); print\\('script_location:', cfg.get_main_option\\('script_location'\\)\\)\")",
+      "Bash(docker info *)"
+    ]
+  }
+}
