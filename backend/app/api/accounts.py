@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,8 @@ from app.brokers.registry import get_broker
 from app.db.models import Account, AccountBalance
 from app.db.session import get_session
 from app.services.accounts_service import get_household_equity, sync_accounts
+from app.services.audit_service import log_event
+from app.services.positions_service import sync_positions
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -44,12 +47,13 @@ class HouseholdOut(BaseModel):
 
 @router.get("/sync", response_model=HouseholdOut)
 async def sync(session: AsyncSession = Depends(get_session)) -> HouseholdOut:
-    """Pull latest accounts + balances from Questrade and return them."""
+    """Pull latest accounts, balances, and positions from Questrade."""
     broker = get_broker()
     try:
-        # Paper mode wraps Questrade; list_accounts hits the live QT broker.
+        # Paper mode wraps Questrade; live data still comes from the QT broker.
         qt_broker = getattr(broker, "_quote_source", broker)
         accounts = await sync_accounts(session, qt_broker)
+        await sync_positions(session, qt_broker)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -75,6 +79,44 @@ async def list_accounts(session: AsyncSession = Depends(get_session)) -> Househo
         accounts=[_account_to_out(a) for a in accounts],
         household_equity=equity,
     )
+
+
+class AccountSettingsIn(BaseModel):
+    real_money_enabled: bool
+    nickname: str | None = None
+
+
+@router.patch("/{account_id}", response_model=AccountOut)
+async def update_account(
+    account_id: uuid.UUID,
+    body: AccountSettingsIn,
+    session: AsyncSession = Depends(get_session),
+) -> AccountOut:
+    """Toggle real-money execution and set nickname for an account."""
+    account = await session.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    prev = account.real_money_enabled
+    account.real_money_enabled = body.real_money_enabled
+    if body.nickname is not None:
+        account.nickname = body.nickname or None
+
+    await log_event(
+        session,
+        actor="user",
+        event_type="account_settings_changed",
+        entity_type="account",
+        entity_id=account.id,
+        payload={
+            "real_money_enabled": body.real_money_enabled,
+            "previous": prev,
+            "questrade_account_id": account.questrade_account_id,
+        },
+    )
+    await session.commit()
+    await session.refresh(account, ["balances"])
+    return _account_to_out(account)
 
 
 def _account_to_out(a: Account) -> AccountOut:

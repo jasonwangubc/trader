@@ -36,8 +36,23 @@ log = logging.getLogger(__name__)
 _TOKEN_URL = "{login_server}/oauth2/token"
 _GRANT = "refresh_token"
 
-# Seconds before expiry at which we proactively refresh.
 _REFRESH_BUFFER_SECS = 60
+
+
+def _infer_currency(symbol: str) -> str:
+    """Infer trading currency from the symbol suffix.
+
+    Questrade's positions API does not include a currency field, so we derive
+    it from the exchange suffix. The .U.TO / .U.V form denotes a USD-denominated
+    fund listed on a Canadian exchange (e.g. PSU.U.TO). Plain .TO / .V / .VN
+    trade in CAD. Everything else is assumed USD (US-listed).
+    """
+    s = symbol.upper()
+    if s.endswith(".U.TO") or s.endswith(".U.V") or s.endswith(".U.VN"):
+        return "USD"
+    if s.endswith(".TO") or s.endswith(".V") or s.endswith(".VN"):
+        return "CAD"
+    return "USD"
 
 
 class _TokenState:
@@ -71,6 +86,8 @@ class QuestradeBroker(BrokerInterface):
         self._token: _TokenState | None = None
         self._lock = asyncio.Lock()
         self._http: httpx.AsyncClient | None = None
+        # symbol name → Questrade symbolId; populated lazily, lives for process lifetime.
+        self._symbol_id_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -96,13 +113,17 @@ class QuestradeBroker(BrokerInterface):
                 await self._refresh()
         return self._token  # type: ignore[return-value]
 
-    async def _refresh(self) -> None:
-        """Exchange refresh token for a new access + refresh token pair."""
-        refresh_token = await self._get_stored_refresh_token()
+    async def _refresh(self, *, env_fallback: bool = False) -> None:
+        """Exchange refresh token for a new access + refresh token pair.
+
+        env_fallback=True means the DB token already failed — try .env instead.
+        """
+        refresh_token = await self._get_stored_refresh_token(env_fallback=env_fallback)
         if not refresh_token:
             raise RuntimeError(
                 "No Questrade refresh token available. "
-                "Set QUESTRADE_REFRESH_TOKEN in backend/.env and restart."
+                "Generate a new token at https://login.questrade.com/APIAccess/UserApps.aspx "
+                "and set QUESTRADE_REFRESH_TOKEN in backend/.env, then restart the backend."
             )
 
         login_server = self._settings.questrade_login_server
@@ -111,15 +132,19 @@ class QuestradeBroker(BrokerInterface):
         client = await self._client()
         resp = await client.post(
             url,
-            params={
-                "grant_type": _GRANT,
-                "refresh_token": refresh_token,
-            },
+            params={"grant_type": _GRANT, "refresh_token": refresh_token},
         )
+
+        if resp.status_code == 400 and not env_fallback:
+            # DB token is stale (already rotated or expired). Try .env bootstrap.
+            log.warning("DB refresh token rejected (400); retrying with .env token")
+            return await self._refresh(env_fallback=True)
 
         if resp.status_code != 200:
             raise RuntimeError(
-                f"Questrade token refresh failed: {resp.status_code} {resp.text}"
+                f"Questrade token refresh failed: {resp.status_code} {resp.text}. "
+                "Generate a new token at https://login.questrade.com/APIAccess/UserApps.aspx "
+                "and set QUESTRADE_REFRESH_TOKEN in backend/.env, then restart the backend."
             )
 
         data = resp.json()
@@ -137,11 +162,31 @@ class QuestradeBroker(BrokerInterface):
         )
         log.info("Questrade token refreshed; api_server=%s", self._token.api_server)
 
-    async def _get_stored_refresh_token(self) -> str | None:
-        """Prefer DB-stored token; fall back to .env bootstrap token."""
-        # Lazy import to avoid circular deps at module load time.
+    async def _get_stored_refresh_token(self, *, env_fallback: bool = False) -> str | None:
+        """Return the best available refresh token.
+
+        Normal flow: prefer the DB-persisted token (which is the most recently
+        rotated one) over the .env bootstrap token.
+
+        env_fallback=True: skip the DB token and go straight to .env. Used
+        when the DB token just returned a 401 (already rotated or revoked).
+        """
         from app.db.session import SessionLocal
-        from app.services.settings_service import get_setting
+        from app.services.settings_service import del_setting, get_setting
+
+        env_token = self._settings.questrade_refresh_token or None
+
+        if env_fallback:
+            if env_token:
+                log.info("Falling back to .env QUESTRADE_REFRESH_TOKEN after DB token failure")
+                # Clear the stale DB token so the next boot doesn't try it again.
+                try:
+                    async with SessionLocal() as session:
+                        await del_setting(session, "questrade_refresh_token")
+                        await session.commit()
+                except Exception:
+                    pass
+            return env_token
 
         try:
             async with SessionLocal() as session:
@@ -151,7 +196,7 @@ class QuestradeBroker(BrokerInterface):
         except Exception:
             pass  # DB not ready yet (e.g. first boot before migration)
 
-        return self._settings.questrade_refresh_token or None
+        return env_token
 
     async def _persist_token(self, refresh_token: str, api_server: str) -> None:
         """Write updated token + api_server back to the settings table."""
@@ -170,7 +215,7 @@ class QuestradeBroker(BrokerInterface):
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _get(self, path: str, **params: object) -> dict:
+    async def _get(self, path: str, *, _retry: bool = True, **params: object) -> dict:
         token = await self.ensure_token()
         client = await self._client()
         url = token.api_server + path.lstrip("/")
@@ -179,13 +224,33 @@ class QuestradeBroker(BrokerInterface):
             params={k: v for k, v in params.items() if v is not None},
             headers={"Authorization": f"Bearer {token.access_token}"},
         )
+        if resp.status_code == 401 and _retry:
+            # Access token was invalidated mid-flight. Force a refresh and retry once.
+            log.warning("Questrade GET %s returned 401; forcing token refresh", path)
+            async with self._lock:
+                self._token = None
+                await self._refresh()
+            return await self._get(path, _retry=False, **params)
         if resp.status_code != 200:
             raise RuntimeError(
                 f"Questrade GET {path} failed: {resp.status_code} {resp.text}"
             )
         return resp.json()
 
-    async def _post(self, path: str, body: dict) -> dict:
+    async def _delete(self, path: str, *, _retry: bool = True) -> None:
+        token = await self.ensure_token()
+        client = await self._client()
+        url = token.api_server + path.lstrip("/")
+        resp = await client.delete(url, headers={"Authorization": f"Bearer {token.access_token}"})
+        if resp.status_code == 401 and _retry:
+            async with self._lock:
+                self._token = None
+                await self._refresh()
+            return await self._delete(path, _retry=False)
+        if resp.status_code not in (200, 204):
+            raise RuntimeError(f"Questrade DELETE {path} failed: {resp.status_code} {resp.text}")
+
+    async def _post(self, path: str, body: dict, *, _retry: bool = True) -> dict:
         token = await self.ensure_token()
         client = await self._client()
         url = token.api_server + path.lstrip("/")
@@ -197,6 +262,12 @@ class QuestradeBroker(BrokerInterface):
                 "Content-Type": "application/json",
             },
         )
+        if resp.status_code == 401 and _retry:
+            log.warning("Questrade POST %s returned 401; forcing token refresh", path)
+            async with self._lock:
+                self._token = None
+                await self._refresh()
+            return await self._post(path, body, _retry=False)
         if resp.status_code not in (200, 201):
             raise RuntimeError(
                 f"Questrade POST {path} failed: {resp.status_code} {resp.text}"
@@ -244,7 +315,8 @@ class QuestradeBroker(BrokerInterface):
             BrokerPosition(
                 account_id=account_id,
                 symbol=p["symbol"],
-                currency=p.get("currency", "USD"),
+                # Questrade omits currency from position rows; infer from symbol.
+                currency=p.get("currency") or _infer_currency(p["symbol"]),
                 quantity=Decimal(str(p.get("openQuantity", 0))),
                 avg_cost=Decimal(str(p.get("averageEntryPrice", 0))),
                 current_price=Decimal(str(p["currentPrice"]))
@@ -257,24 +329,141 @@ class QuestradeBroker(BrokerInterface):
         ]
 
     # ------------------------------------------------------------------
-    # BrokerInterface — quotes (Sprint 2)
+    # BrokerInterface — quotes
     # ------------------------------------------------------------------
+
+    async def _resolve_symbol_ids(self, symbols: list[str]) -> dict[str, int]:
+        """Return {symbol: symbolId} for the given list, using cache where possible."""
+        missing = [s for s in symbols if s not in self._symbol_id_cache]
+        if missing:
+            # Questrade accepts comma-separated symbol names.
+            data = await self._get("v1/symbols", names=",".join(missing))
+            for info in data.get("symbols", []):
+                name = info.get("symbol") or info.get("symbolCode")
+                sid = info.get("symbolId")
+                if name and sid:
+                    self._symbol_id_cache[name] = sid
+                    # Also cache without .TO/.V suffix → same ID so bare lookups work.
+                    bare = name.split(".")[0]
+                    if bare not in self._symbol_id_cache:
+                        self._symbol_id_cache[bare] = sid
+        return {s: self._symbol_id_cache[s] for s in symbols if s in self._symbol_id_cache}
 
     async def get_quote(self, symbol: str) -> BrokerQuote:
-        raise NotImplementedError("QuestradeBroker.get_quote — Sprint 2")
+        quotes = await self.get_quotes_batch([symbol])
+        if symbol not in quotes:
+            raise RuntimeError(f"No quote returned for {symbol}")
+        return quotes[symbol]
+
+    async def get_quotes_batch(self, symbols: list[str]) -> dict[str, BrokerQuote]:
+        """Fetch quotes for multiple symbols in one Questrade API call."""
+        sym_to_id = await self._resolve_symbol_ids(symbols)
+        if not sym_to_id:
+            return {}
+        ids_param = ",".join(str(v) for v in sym_to_id.values())
+        data = await self._get("v1/markets/quotes", ids=ids_param)
+
+        id_to_sym = {v: k for k, v in sym_to_id.items()}
+        out: dict[str, BrokerQuote] = {}
+        now = datetime.now(timezone.utc)
+
+        for q in data.get("quotes", []):
+            sid = q.get("symbolId")
+            sym = id_to_sym.get(sid, q.get("symbol", ""))
+            last_raw = q.get("lastTradePriceTrHrs") or q.get("lastTradePrice")
+            if last_raw is None:
+                continue
+            out[sym] = BrokerQuote(
+                symbol=sym,
+                last=Decimal(str(last_raw)),
+                bid=Decimal(str(q["bidPrice"])) if q.get("bidPrice") is not None else None,
+                ask=Decimal(str(q["askPrice"])) if q.get("askPrice") is not None else None,
+                volume=int(q["volume"]) if q.get("volume") is not None else None,
+                at=now,
+                delay=int(q.get("delay", 0)),
+            )
+        return out
 
     def stream_quotes(self, symbols: list[str]) -> AsyncIterator[BrokerQuote]:
-        raise NotImplementedError("QuestradeBroker.stream_quotes — Sprint 2")
+        raise NotImplementedError("QuestradeBroker.stream_quotes — Sprint 3")
 
     # ------------------------------------------------------------------
-    # BrokerInterface — orders (Sprint 2)
+    # BrokerInterface — orders
     # ------------------------------------------------------------------
+
+    _ORDER_TYPE_MAP = {
+        "market": "Market",
+        "limit": "Limit",
+        "stop_market": "StopMarket",
+        "stop_limit": "StopLimit",
+    }
+    _QT_STATE_MAP = {
+        "Queued": "pending",
+        "Accepted": "accepted",
+        "Rejected": "rejected",
+        "Canceled": "cancelled",
+        "Execution": "partial",
+        "FilledAll": "filled",
+        "FilledPartially": "partial",
+        "ReplacePending": "pending",
+        "Replaced": "cancelled",
+        "StopTriggered": "accepted",
+    }
+
+    def _map_qt_state(self, state: str) -> str:
+        return self._QT_STATE_MAP.get(state, "pending")
 
     async def place_order(self, req: BrokerOrderRequest) -> BrokerOrderAck:
-        raise NotImplementedError("QuestradeBroker.place_order — Sprint 2")
+        sym_to_id = await self._resolve_symbol_ids([req.symbol])
+        symbol_id = sym_to_id.get(req.symbol)
+        if not symbol_id:
+            raise RuntimeError(f"Cannot resolve Questrade symbolId for {req.symbol}")
 
-    async def cancel_order(self, broker_order_id: str) -> None:
-        raise NotImplementedError("QuestradeBroker.cancel_order — Sprint 2")
+        body: dict = {
+            "accountId": req.account_id,
+            "symbolId": symbol_id,
+            "quantity": req.quantity,
+            "orderType": self._ORDER_TYPE_MAP[req.order_type],
+            "action": req.side.capitalize(),
+            "timeInForce": req.time_in_force,
+            "isAllOrNone": False,
+            "isAnonymous": False,
+            "primaryRoute": "AUTO",
+            "secondaryRoute": "AUTO",
+        }
+        if req.limit_price is not None:
+            body["limitPrice"] = float(req.limit_price)
+        if req.stop_price is not None:
+            body["stopPrice"] = float(req.stop_price)
 
-    async def get_order(self, broker_order_id: str) -> BrokerOrderAck:
-        raise NotImplementedError("QuestradeBroker.get_order — Sprint 2")
+        data = await self._post(f"v1/accounts/{req.account_id}/orders", body)
+        orders = data.get("orders", []) or [data]
+        order = orders[0]
+
+        return BrokerOrderAck(
+            broker_order_id=str(order["id"]),
+            status=self._map_qt_state(order.get("state", "")),
+            submitted_at=datetime.now(timezone.utc),
+        )
+
+    async def get_order(self, account_id: str, broker_order_id: str) -> BrokerOrderAck:
+        data = await self._get(f"v1/accounts/{account_id}/orders/{broker_order_id}")
+        orders = data.get("orders", []) or [data]
+        order = orders[0]
+
+        fill_price = None
+        fill_qty = None
+        if order.get("filledQuantity") and order.get("avgExecPrice"):
+            fill_price = Decimal(str(order["avgExecPrice"]))
+            fill_qty = int(order["filledQuantity"])
+
+        return BrokerOrderAck(
+            broker_order_id=broker_order_id,
+            status=self._map_qt_state(order.get("state", "")),
+            submitted_at=datetime.now(timezone.utc),
+            fill_price=fill_price,
+            fill_quantity=fill_qty,
+        )
+
+    async def cancel_order(self, account_id: str, broker_order_id: str) -> None:
+        await self._delete(f"v1/accounts/{account_id}/orders/{broker_order_id}")

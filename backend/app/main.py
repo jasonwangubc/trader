@@ -1,17 +1,31 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import accounts, health, tickets
+from app.api import accounts, chart, health, journal, monitor, options, positions, regime, screener, tickets
 from app.config import get_settings
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Startup hooks (monitor task spawn, broker session warmup) will live here.
+    from app.brokers.registry import get_broker
+    from app.services.monitor_service import MonitorService
+
+    broker = get_broker()
+    svc = MonitorService(broker)
+    monitor.set_monitor(svc)
+    task = asyncio.create_task(svc.run())
+
     yield
-    # Shutdown hooks (graceful broker disconnect, etc.).
+
+    await svc.stop()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def create_app() -> FastAPI:
@@ -35,7 +49,14 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(accounts.router)
+    app.include_router(positions.router)
     app.include_router(tickets.router)
+    app.include_router(monitor.router)
+    app.include_router(screener.router)
+    app.include_router(journal.router)
+    app.include_router(regime.router)
+    app.include_router(options.router)
+    app.include_router(chart.router)
     return app
 
 

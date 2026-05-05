@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.db.models import Account, Ticket, TicketStatus
 from app.services.accounts_service import get_household_equity
 from app.services.audit_service import log_event
+from app.services.positions_service import buying_power_breakdown
 from app.services.sizing_service import SizingResult, compute_sizing
 from app.services.streak_service import StreakSnapshot, get_snapshot
 
@@ -32,8 +33,9 @@ async def preview_ticket(
     currency: str,
     trigger_price: Decimal,
     stop_price: Decimal,
-) -> tuple[SizingResult, StreakSnapshot]:
-    """Compute sizing + streak snapshot without persisting anything."""
+) -> tuple[SizingResult, StreakSnapshot, dict[str, Decimal]]:
+    """Compute sizing + streak snapshot + buying-power breakdown for the
+    trade currency. Nothing is persisted."""
     account = await session.get(Account, account_id)
     if account is None:
         raise TicketValidationError(f"Account {account_id} not found.")
@@ -47,7 +49,8 @@ async def preview_ticket(
         equity_by_currency=equity,
         multiplier=streak.multiplier,
     )
-    return sizing, streak
+    buying_power = await buying_power_breakdown(session, currency=currency)
+    return sizing, streak, buying_power
 
 
 async def create_ticket(
@@ -78,7 +81,7 @@ async def create_ticket(
     if is_paper is None:
         is_paper = not account.real_money_enabled or settings.paper_mode_default
 
-    sizing, streak = await preview_ticket(
+    sizing, streak, _bp = await preview_ticket(
         session,
         account_id=account_id,
         currency=currency,

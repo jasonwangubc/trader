@@ -11,6 +11,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { API_URL } from "@/lib/api";
 import {
   type Account,
+  type GuardrailWarning,
   type SizingPreview,
   type StreakSnapshot,
   type TicketPreviewOut,
@@ -35,15 +36,23 @@ type FormState = {
   thesis: string;
 };
 
-export function TicketForm({ accounts }: { accounts: Account[] }) {
+export function TicketForm({
+  accounts,
+  prefillSymbol,
+  prefillTrigger,
+}: {
+  accounts: Account[];
+  prefillSymbol?: string;
+  prefillTrigger?: string;
+}) {
   const router = useRouter();
   const [form, setForm] = useState<FormState>(() => ({
     account_id: accounts[0]?.id ?? "",
-    symbol: "",
+    symbol: prefillSymbol ?? "",
     currency: "USD",
     setup_type: "VCP",
     trigger_type: "price_above_with_volume",
-    trigger_price: "",
+    trigger_price: prefillTrigger ?? "",
     stop_price: "",
     target_price: "",
     time_stop_days: "21",
@@ -55,6 +64,10 @@ export function TicketForm({ accounts }: { accounts: Account[] }) {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [guardrailBlock, setGuardrailBlock] = useState<{ code: string; message: string } | null>(null);
+  const [overrideRegime, setOverrideRegime] = useState(false);
+  const [overrideStreak, setOverrideStreak] = useState(false);
+  const [isPaper, setIsPaper] = useState<boolean | null>(null); // null = auto (follows account)
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
     setForm((s) => ({ ...s, [key]: value }));
@@ -126,12 +139,19 @@ export function TicketForm({ accounts }: { accounts: Account[] }) {
       const res = await fetch(`${API_URL}/api/tickets`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...body, is_paper: isPaper, override_regime: overrideRegime, override_streak: overrideStreak }),
       });
       if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`${res.status}: ${text}`);
+        const data = await res.json().catch(() => null);
+        // Guardrail violation (422)
+        if (res.status === 422 && data?.detail?.code) {
+          setGuardrailBlock(data.detail);
+          setSubmitting(false);
+          return;
+        }
+        throw new Error(`${res.status}: ${JSON.stringify(data ?? await res.text())}`);
       }
+      setGuardrailBlock(null);
       router.push("/tickets");
       router.refresh();
     } catch (e) {
@@ -148,17 +168,67 @@ export function TicketForm({ accounts }: { accounts: Account[] }) {
     return ((target - t) / (t - s)).toFixed(2);
   }, [form.trigger_price, form.stop_price, form.target_price]);
 
+  const thesisLen = form.thesis.trim().length;
+  const missingReasons: string[] = [];
+  if (!form.symbol.trim()) missingReasons.push("symbol required");
+  if (thesisLen < 10) missingReasons.push(`thesis too short (${thesisLen}/10 chars)`);
+  if (!preview) missingReasons.push("enter trigger and stop prices");
+  if (preview && preview.sizing.shares === 0) missingReasons.push("sizing returns 0 shares — sync accounts");
+
   const canSubmit =
     !!form.account_id &&
     form.symbol.trim().length > 0 &&
-    form.thesis.trim().length >= 10 &&
+    thesisLen >= 10 &&
     preview !== null &&
     preview.sizing.shares > 0 &&
     !submitting;
 
+  const regimeColor =
+    preview?.regime === "bull"    ? "text-emerald-600 dark:text-emerald-400" :
+    preview?.regime === "caution" ? "text-amber-600 dark:text-amber-400" :
+    preview?.regime === "bear"    ? "text-destructive" : "";
+
+  const selectedAccount = accounts.find(a => a.id === form.account_id);
+  const effectiveLive = isPaper === false || (isPaper === null && selectedAccount && !isPaper);
+
   return (
     <form onSubmit={submit} className="grid gap-6 lg:grid-cols-[1fr_22rem]">
       <div className="space-y-6">
+        {/* Paper / Live mode selector */}
+        <div className={`rounded-lg border px-4 py-3 ${isPaper === false ? "border-destructive/50 bg-destructive/5" : "border-muted bg-muted/30"}`}>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium">
+                {isPaper === false ? "⚠ LIVE execution — real order will be sent to Questrade" : "Paper mode — simulated trade only"}
+              </p>
+              <p className="text-muted-foreground text-xs mt-0.5">
+                {isPaper === null ? "Following account default setting" : isPaper ? "Override: forced paper" : "Override: forced live"}
+              </p>
+            </div>
+            <div className="flex rounded-md border overflow-hidden text-xs font-medium">
+              {([["paper", true], ["auto", null], ["live", false]] as const).map(([label, val]) => (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => setIsPaper(val)}
+                  className={`px-3 py-1.5 capitalize transition-colors ${
+                    isPaper === val
+                      ? val === false ? "bg-destructive text-destructive-foreground" : "bg-primary text-primary-foreground"
+                      : "hover:bg-muted"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {isPaper === false && (
+            <p className="text-destructive text-xs mt-2 font-medium">
+              This ticket will send real buy and stop-loss orders to Questrade when it triggers. Make sure your account has real-money execution enabled.
+            </p>
+          )}
+        </div>
+
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Setup</CardTitle>
@@ -334,6 +404,52 @@ export function TicketForm({ accounts }: { accounts: Account[] }) {
           </div>
         )}
 
+        {/* Regime indicator */}
+        {preview?.regime && (
+          <div className={`text-xs ${regimeColor}`}>
+            Market regime: <span className="font-semibold uppercase">{preview.regime}</span>
+            {preview.regime === "bear" && " — new tickets not recommended"}
+          </div>
+        )}
+
+        {/* Guardrail warnings from preview */}
+        {preview?.guardrail_warnings && preview.guardrail_warnings.length > 0 && (
+          <div className="space-y-1">
+            {preview.guardrail_warnings.map((w) => (
+              <div key={w.code} className="text-amber-600 dark:text-amber-400 text-xs border border-amber-200 dark:border-amber-800 rounded-md px-3 py-2">
+                ⚠ {w.message}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Hard guardrail block */}
+        {guardrailBlock && (
+          <div className="border-destructive/50 bg-destructive/10 rounded-md border p-4 text-sm space-y-3">
+            <p className="text-destructive font-medium">Guardrail blocked: {guardrailBlock.code.replace(/_/g, " ")}</p>
+            <p className="text-sm">{guardrailBlock.message}</p>
+            {(guardrailBlock.code === "regime_bear" || guardrailBlock.code === "regime_caution") && (
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={overrideRegime} onChange={e => setOverrideRegime(e.target.checked)} />
+                I understand the regime risk — override and arm anyway
+              </label>
+            )}
+            {guardrailBlock.code === "loss_streak" && (
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={overrideStreak} onChange={e => setOverrideStreak(e.target.checked)} />
+                I have reviewed my recent trades — override loss-streak block
+              </label>
+            )}
+          </div>
+        )}
+
+        {/* Why button is disabled */}
+        {!canSubmit && !submitting && missingReasons.length > 0 && (
+          <p className="text-muted-foreground text-xs">
+            To arm: {missingReasons.join(" · ")}
+          </p>
+        )}
+
         <div className="flex items-center justify-end gap-2">
           <button
             type="button"
@@ -344,7 +460,7 @@ export function TicketForm({ accounts }: { accounts: Account[] }) {
           </button>
           <button
             type="submit"
-            disabled={!canSubmit}
+            disabled={!canSubmit && !(guardrailBlock && (overrideRegime || overrideStreak))}
             className="bg-primary text-primary-foreground inline-flex h-10 items-center rounded-md px-5 text-sm font-medium transition-colors hover:bg-primary/90 disabled:opacity-50"
           >
             {submitting ? "Arming…" : "Arm ticket"}
@@ -407,7 +523,13 @@ function SizingPreviewPanel({
     );
   }
 
-  const { sizing, streak } = preview;
+  const { sizing, streak, buying_power } = preview;
+
+  const positionValue = parseFloat(sizing.position_value);
+  const cash = parseFloat(buying_power.cash);
+  const cashEquiv = parseFloat(buying_power.cash_equivalents);
+  const cashShortfall = positionValue > cash ? positionValue - cash : 0;
+  const canFreeFromCashEquiv = cashShortfall > 0 && cashEquiv >= cashShortfall;
 
   return (
     <Card>
@@ -438,6 +560,41 @@ function SizingPreviewPanel({
           label={`${sizing.equity_currency} equity basis`}
           value={fmtMoney(sizing.equity_basis, sizing.equity_currency)}
         />
+
+        <div className="border-t pt-3 text-xs">
+          <div className="text-muted-foreground mb-1">
+            {buying_power.currency} buying power
+          </div>
+          <div className="flex justify-between">
+            <span>Cash</span>
+            <span className="tabular-nums">
+              {fmtMoney(buying_power.cash, buying_power.currency)}
+            </span>
+          </div>
+          {cashEquiv > 0 && (
+            <div className="flex justify-between">
+              <span>Parked (cash-eq)</span>
+              <span className="tabular-nums">
+                {fmtMoney(buying_power.cash_equivalents, buying_power.currency)}
+              </span>
+            </div>
+          )}
+          {cashShortfall > 0 && (
+            <div className="mt-1">
+              {canFreeFromCashEquiv ? (
+                <span className="text-amber-600 dark:text-amber-400">
+                  Cash short by {fmtMoney(cashShortfall, buying_power.currency)} — free
+                  it by selling parked cash-equivalents.
+                </span>
+              ) : (
+                <span className="text-destructive">
+                  Cash short by {fmtMoney(cashShortfall, buying_power.currency)} — even
+                  liquidating cash-equivalents won&rsquo;t cover this trade.
+                </span>
+              )}
+            </div>
+          )}
+        </div>
 
         <div className="border-t pt-3 text-xs">
           <div className="text-muted-foreground mb-1">Streak</div>

@@ -243,6 +243,9 @@ class Ticket(Base, TimestampMixin):
     thesis: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     notes: Mapped[str | None] = mapped_column(String(4000), nullable=True)
 
+    # Exit ladder: [{price, shares, reason}] — partial exits at multiple levels
+    exit_plan: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     orders: Mapped[list[Order]] = relationship(back_populates="ticket", cascade="all, delete-orphan")
     positions: Mapped[list[Position]] = relationship(back_populates="ticket")
 
@@ -324,6 +327,128 @@ class StreakState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class OptionStrategy(StrEnum):
+    COVERED_CALL  = "covered_call"
+    CASH_SECURED_PUT = "cash_secured_put"
+    PROTECTIVE_PUT = "protective_put"
+
+
+class OptionStatus(StrEnum):
+    OPEN      = "open"
+    CLOSED    = "closed"       # bought back or sold
+    EXPIRED   = "expired"      # expired worthless
+    ASSIGNED  = "assigned"     # exercised / assigned
+
+
+class OptionTicket(Base, TimestampMixin):
+    """An options income / hedge position ticket (CC, CSP, protective put)."""
+    __tablename__ = "option_tickets"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id"), index=True
+    )
+    underlying_symbol: Mapped[str] = mapped_column(String(32), index=True)
+    currency: Mapped[str] = mapped_column(String(3))
+    strategy: Mapped[str] = mapped_column(String(32))          # OptionStrategy
+    option_type: Mapped[str] = mapped_column(String(4))        # "call" | "put"
+    strike_price: Mapped[Decimal] = mapped_column(_money)
+    expiry_date: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    contracts: Mapped[int] = mapped_column(Integer, default=1)  # 1 contract = 100 shares
+    premium_received: Mapped[Decimal] = mapped_column(_money)   # per share (so × 100 × contracts for total)
+    break_even: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(16), default=OptionStatus.OPEN.value, index=True)
+    is_paper: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    thesis: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+
+    # Closing details
+    premium_paid_to_close: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    realized_pnl: Mapped[Decimal | None] = mapped_column(_money, nullable=True)  # total, not per share
+
+    # Link to underlying position (for CC) or associated regular ticket
+    position_ticket_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class DailyBar(Base):
+    """End-of-day OHLCV bar, adjusted for splits/dividends. Source: yfinance."""
+    __tablename__ = "daily_bars"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    bar_date: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True)
+    open: Mapped[Decimal] = mapped_column(_money)
+    high: Mapped[Decimal] = mapped_column(_money)
+    low: Mapped[Decimal] = mapped_column(_money)
+    close: Mapped[Decimal] = mapped_column(_money)
+    volume: Mapped[int] = mapped_column(Integer)
+    adj_close: Mapped[Decimal] = mapped_column(_money)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "bar_date", name="uq_daily_bar_symbol_date"),
+        Index("ix_daily_bar_symbol_date", "symbol", "bar_date"),
+    )
+
+
+class ScreenerSymbol(Base, TimestampMixin):
+    """Symbols on the active watchlist for nightly screening."""
+    __tablename__ = "screener_symbols"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class ScreenerScore(Base):
+    """Latest scoring result per symbol. One row per symbol; overwritten on each run."""
+    __tablename__ = "screener_scores"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    scored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Universe metadata
+    sector: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    universe_source: Mapped[str | None] = mapped_column(String(32), nullable=True)  # sp500|nasdaq100|tsx60|manual
+
+    # Trend Template: 0-8 integer, one point per passing criterion
+    tt_score: Mapped[int] = mapped_column(Integer, default=0)
+    tt_criteria: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    # VCP: 0.0-1.0 float, heuristic likelihood score
+    vcp_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal(0))
+    vcp_details: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    # Relative strength vs SPY/XIU (0-99 percentile within screener universe)
+    rs_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rs_raw: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+
+    # Price data snapshot at scoring time
+    last_close: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    ma_50: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    ma_150: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    ma_200: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    high_52w: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    low_52w: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+
+    # Fundamentals from EDGAR (via SEC companyfacts API, same source as decadex)
+    fundamental_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal(0))
+    revenue_growth: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    net_income_growth: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    net_margin: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    eps_ttm: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    fundamental_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # Composite score — TT 25% + VCP 25% + RS 20% + Fundamentals 30%
+    composite_score: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal(0))
 
 
 class AuditLog(Base):

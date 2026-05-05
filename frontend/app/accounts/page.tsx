@@ -1,6 +1,8 @@
+import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api, ApiError } from "@/lib/api";
+import { LiveToggle } from "./live-toggle";
 
 interface Balance {
   currency: string;
@@ -27,10 +29,8 @@ interface HouseholdData {
 
 function fmt(value: string, currency: string) {
   return new Intl.NumberFormat("en-CA", {
-    style: "currency",
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    style: "currency", currency,
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
   }).format(parseFloat(value));
 }
 
@@ -44,22 +44,40 @@ export default async function AccountsPage() {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
 
+  const anyLive = data?.accounts.some(a => a.real_money_enabled) ?? false;
+
   return (
     <main className="container mx-auto max-w-5xl p-6 sm:p-10">
       <header className="mb-8 flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-semibold tracking-tight">Accounts</h1>
           <p className="text-muted-foreground mt-1 text-sm">
-            Live balances from Questrade — synced on page load.
+            Questrade balances — data always reflects real holdings.
           </p>
         </div>
-        <SyncButton />
+        <Link
+          href="/accounts/sync"
+          className="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+        >
+          Sync now
+        </Link>
       </header>
 
+      {/* Mode explanation */}
+      <div className={`mb-6 rounded-lg border px-4 py-3 text-sm ${anyLive ? "border-destructive/40 bg-destructive/5" : "border-muted bg-muted/30"}`}>
+        <p className="font-medium mb-1">
+          {anyLive
+            ? "⚠ Real-money execution is ENABLED on one or more accounts"
+            : "Paper mode — all ticket execution is simulated (no real orders sent to Questrade)"}
+        </p>
+        <p className="text-muted-foreground text-xs">
+          Position data always comes from your live Questrade accounts regardless of this setting.
+          Enabling live execution means the monitor will place real buy and stop-loss orders when a ticket triggers.
+        </p>
+      </div>
+
       {error && (
-        <div className="mb-6 rounded-md border border-destructive/50 bg-destructive/10 p-4 text-sm text-destructive">
-          {error}
-        </div>
+        <div className="mb-6 rounded-md border border-destructive/50 bg-destructive/10 p-4 text-sm text-destructive">{error}</div>
       )}
 
       {data && (
@@ -98,27 +116,24 @@ function HouseholdSummary({ equity }: { equity: Record<string, string> }) {
 function AccountCard({ account }: { account: Account }) {
   const usd = account.balances.find((b) => b.currency === "USD");
   const cad = account.balances.find((b) => b.currency === "CAD");
-  const primary = account.balances.find((b) => b.currency === account.primary_currency);
 
   return (
-    <Card>
+    <Card className={account.real_money_enabled ? "border-destructive/40" : ""}>
       <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-base">
-            {account.nickname ?? account.type}
-          </CardTitle>
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <CardTitle className="text-base">{account.nickname ?? account.type}</CardTitle>
+            <CardDescription>#{account.questrade_account_id}</CardDescription>
+          </div>
           <Badge variant={account.real_money_enabled ? "destructive" : "secondary"}>
-            {account.real_money_enabled ? "live" : "paper"}
+            {account.real_money_enabled ? "LIVE" : "paper"}
           </Badge>
         </div>
-        <CardDescription>#{account.questrade_account_id}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
         {[cad, usd].filter(Boolean).map((b) => (
           <div key={b!.currency} className="space-y-1">
-            <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-              {b!.currency}
-            </div>
+            <div className="text-muted-foreground text-xs font-medium uppercase tracking-wide">{b!.currency}</div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">Total equity</span>
               <span className="font-semibold tabular-nums">{fmt(b!.total_equity, b!.currency)}</span>
@@ -137,19 +152,17 @@ function AccountCard({ account }: { account: Account }) {
             </div>
           </div>
         ))}
+
+        {/* Live toggle */}
+        <div className="border-t pt-3">
+          <LiveToggle
+            accountId={account.id}
+            currentLive={account.real_money_enabled}
+            accountType={account.type}
+            accountNumber={account.questrade_account_id}
+          />
+        </div>
       </CardContent>
     </Card>
-  );
-}
-
-// Client component just for the sync button — lives in its own file to keep this page a Server Component.
-function SyncButton() {
-  return (
-    <a
-      href="/accounts/sync"
-      className="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-    >
-      Sync now
-    </a>
   );
 }

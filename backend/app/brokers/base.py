@@ -59,8 +59,10 @@ class BrokerOrderRequest:
 @dataclass(frozen=True)
 class BrokerOrderAck:
     broker_order_id: str
-    status: str
+    status: str           # pending | submitted | accepted | partial | filled | cancelled | rejected
     submitted_at: datetime
+    fill_price: Decimal | None = None    # set when status == filled
+    fill_quantity: int | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,7 @@ class BrokerQuote:
     ask: Decimal | None
     volume: int | None
     at: datetime
+    delay: int = 0  # minutes of quote delay; 0 = real-time
 
 
 class BrokerInterface(ABC):
@@ -88,19 +91,29 @@ class BrokerInterface(ABC):
     @abstractmethod
     async def get_positions(self, account_id: str) -> list[BrokerPosition]: ...
 
-    # ---- Quotes (Sprint 2) ----
+    # ---- Quotes ----
     @abstractmethod
     async def get_quote(self, symbol: str) -> BrokerQuote: ...
+
+    async def get_quotes_batch(self, symbols: list[str]) -> dict[str, BrokerQuote]:
+        """Fetch multiple quotes. Default: sequential; override for efficiency."""
+        out: dict[str, BrokerQuote] = {}
+        for sym in symbols:
+            try:
+                out[sym] = await self.get_quote(sym)
+            except Exception:
+                pass
+        return out
 
     @abstractmethod
     def stream_quotes(self, symbols: list[str]) -> AsyncIterator[BrokerQuote]: ...
 
-    # ---- Orders (Sprint 2) ----
+    # ---- Orders ----
     @abstractmethod
     async def place_order(self, req: BrokerOrderRequest) -> BrokerOrderAck: ...
 
     @abstractmethod
-    async def cancel_order(self, broker_order_id: str) -> None: ...
+    async def cancel_order(self, account_id: str, broker_order_id: str) -> None: ...
 
     @abstractmethod
-    async def get_order(self, broker_order_id: str) -> BrokerOrderAck: ...
+    async def get_order(self, account_id: str, broker_order_id: str) -> BrokerOrderAck: ...

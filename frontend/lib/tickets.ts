@@ -35,9 +35,24 @@ export interface StreakSnapshot {
   last_outcome: string | null;
 }
 
+export interface BuyingPowerPreview {
+  currency: string;
+  cash: string;
+  cash_equivalents: string;
+  freeable_total: string;
+}
+
+export interface GuardrailWarning {
+  code: string;
+  message: string;
+}
+
 export interface TicketPreviewOut {
   sizing: SizingPreview;
   streak: StreakSnapshot;
+  buying_power: BuyingPowerPreview;
+  regime: string;
+  guardrail_warnings: GuardrailWarning[];
 }
 
 export interface Ticket {
@@ -61,7 +76,13 @@ export interface Ticket {
   thesis: string | null;
   created_at: string;
   armed_at: string | null;
+  triggered_at: string | null;
+  filled_at: string | null;
+  closed_at: string | null;
   expires_at: string | null;
+  realized_pnl: string | null;
+  r_multiple: string | null;
+  outcome: string | null;
 }
 
 export const SETUP_TYPES = [

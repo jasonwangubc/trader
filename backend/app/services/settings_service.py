@@ -24,3 +24,9 @@ async def set_setting(session: AsyncSession, key: str, value: str) -> None:
     else:
         row.value = value
         row.updated_at = datetime.now(timezone.utc)
+
+
+async def del_setting(session: AsyncSession, key: str) -> None:
+    row = await session.get(Setting, key)
+    if row is not None:
+        await session.delete(row)
