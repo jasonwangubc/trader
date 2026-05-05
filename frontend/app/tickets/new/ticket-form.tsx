@@ -67,10 +67,30 @@ export function TicketForm({
   const [guardrailBlock, setGuardrailBlock] = useState<{ code: string; message: string } | null>(null);
   const [overrideRegime, setOverrideRegime] = useState(false);
   const [overrideStreak, setOverrideStreak] = useState(false);
-  const [isPaper, setIsPaper] = useState<boolean | null>(null); // null = auto (follows account)
+  const [isPaper, setIsPaper] = useState<boolean | null>(null);
+  const [earningsWarning, setEarningsWarning] = useState<string | null>(null);
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
     setForm((s) => ({ ...s, [key]: value }));
+
+  // Fetch earnings warning when symbol changes
+  useEffect(() => {
+    const sym = form.symbol.trim().toUpperCase();
+    if (!sym || sym.length < 1) { setEarningsWarning(null); return; }
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/earnings/${sym}`, { signal: ctrl.signal });
+        if (res.ok) {
+          const d = await res.json();
+          setEarningsWarning(d.warning ?? null);
+        } else {
+          setEarningsWarning(null);
+        }
+      } catch { setEarningsWarning(null); }
+    }, 600);
+    return () => { clearTimeout(t); ctrl.abort(); };
+  }, [form.symbol]);
 
   // Live sizing preview — debounced.
   const previewKey = `${form.account_id}|${form.currency}|${form.trigger_price}|${form.stop_price}`;
@@ -401,6 +421,13 @@ export function TicketForm({
         {submitError && (
           <div className="border-destructive/50 bg-destructive/10 text-destructive rounded-md border p-4 text-sm">
             {submitError}
+          </div>
+        )}
+
+        {/* Earnings warning */}
+        {earningsWarning && (
+          <div className="border-amber-400 bg-amber-50 dark:bg-amber-950/20 text-amber-800 dark:text-amber-300 rounded-md border px-3 py-2 text-xs font-medium">
+            📅 {earningsWarning}
           </div>
         )}
 

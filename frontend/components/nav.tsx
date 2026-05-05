@@ -13,20 +13,22 @@ import {
   ClipboardList,
   Shield,
   LineChart,
+  Eye,
   Menu,
   X,
 } from "lucide-react";
 import { API_URL } from "@/lib/api";
 
 const NAV = [
-  { href: "/",          label: "Dashboard",  Icon: LayoutDashboard },
-  { href: "/routine",   label: "Routine",    Icon: ClipboardList },
-  { href: "/tickets",   label: "Tickets",    Icon: FileText },
-  { href: "/options",   label: "Options",    Icon: LineChart },
-  { href: "/positions", label: "Positions",  Icon: TrendingUp },
-  { href: "/accounts",  label: "Accounts",   Icon: Wallet },
-  { href: "/screener",  label: "Screener",   Icon: Search },
-  { href: "/journal",   label: "Journal",    Icon: BookOpen },
+  { href: "/",           label: "Dashboard",  Icon: LayoutDashboard },
+  { href: "/routine",    label: "Routine",    Icon: ClipboardList },
+  { href: "/screener",   label: "Screener",   Icon: Search },
+  { href: "/watchlist",  label: "Watchlist",  Icon: Eye },
+  { href: "/tickets",    label: "Tickets",    Icon: FileText },
+  { href: "/options",    label: "Options",    Icon: LineChart },
+  { href: "/positions",  label: "Positions",  Icon: TrendingUp },
+  { href: "/accounts",   label: "Accounts",   Icon: Wallet },
+  { href: "/journal",    label: "Journal",    Icon: BookOpen },
 ];
 
 type MonitorStatus = { running: boolean; armed_tickets: number; kill_switch: boolean; market_open: boolean };

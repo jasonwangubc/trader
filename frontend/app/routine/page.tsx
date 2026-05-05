@@ -14,6 +14,8 @@ interface Regime {
   xiu_price: number | null;
   xiu_ma200: number | null;
   xiu_pct_vs_ma200: number | null;
+  distribution_days: number;
+  distribution_status: string;
   message: string;
 }
 
@@ -110,6 +112,23 @@ export default async function RoutinePage() {
                   </div>
                 </div>
               )}
+              {/* Distribution days */}
+              <div className="col-span-2 border-t pt-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">Distribution days (last 25 sessions)</span>
+                  <span className={`font-semibold ${
+                    regime.distribution_status === "heavy"    ? "text-destructive" :
+                    regime.distribution_status === "elevated" ? "text-amber-600 dark:text-amber-400" :
+                    "text-emerald-600 dark:text-emerald-400"
+                  }`}>
+                    {regime.distribution_days} — {regime.distribution_status}
+                  </span>
+                </div>
+                <p className="text-muted-foreground text-xs mt-1">
+                  Counts sessions where SPY closed down ≥0.2% on rising volume (institutional selling signal).
+                  5+ days = uptrend under pressure.
+                </p>
+              </div>
             </CardContent>
           </Card>
         )}

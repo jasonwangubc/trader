@@ -18,6 +18,8 @@ class RegimeOut(BaseModel):
     xiu_price: float | None
     xiu_ma200: float | None
     xiu_pct_vs_ma200: float | None
+    distribution_days: int
+    distribution_status: str   # "healthy" | "elevated" | "heavy"
     message: str
 
 
@@ -32,5 +34,7 @@ async def current_regime(session: AsyncSession = Depends(get_session)) -> Regime
         xiu_price=r.xiu_price,
         xiu_ma200=r.xiu_ma200,
         xiu_pct_vs_ma200=r.xiu_pct_vs_ma200,
+        distribution_days=r.distribution_days,
+        distribution_status=r.distribution_status,
         message=r.message,
     )

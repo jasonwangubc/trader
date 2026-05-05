@@ -396,6 +396,21 @@ class DailyBar(Base):
     )
 
 
+class EarningsDate(Base):
+    """Next (and recent) earnings dates per symbol, synced from yfinance."""
+    __tablename__ = "earnings_dates"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    next_earnings_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_eps_surprise_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    last_earnings_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    avg_volume: Mapped[int | None] = mapped_column(Integer, nullable=True)   # 50d avg volume for PEP calc
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = ()
+
+
 class ScreenerSymbol(Base, TimestampMixin):
     """Symbols on the active watchlist for nightly screening."""
     __tablename__ = "screener_symbols"
