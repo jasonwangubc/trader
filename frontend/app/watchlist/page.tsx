@@ -156,7 +156,7 @@ function WatchlistCard({ result: r, earnings }: { result: ScoreResult; earnings?
         )}
       </CardHeader>
       <CardContent>
-        <StockChart symbol={r.symbol} height={240} showPivot className="w-full" />
+        <StockChart symbol={r.symbol} height={280} showPivot showSmas className="w-full" />
       </CardContent>
     </Card>
   );

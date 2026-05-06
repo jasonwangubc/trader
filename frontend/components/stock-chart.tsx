@@ -29,12 +29,13 @@ interface ChartData {
 interface StockChartProps {
   symbol: string;
   height?: number;
-  mini?: boolean;
+  mini?: boolean;          // compact sparkline mode — fewer overlays, no axes
   showPivot?: boolean;
+  showSmas?: boolean;      // show 50/150 SMA in mini mode (default true)
   className?: string;
 }
 
-export function StockChart({ symbol, height = 420, mini = false, showPivot = true, className }: StockChartProps) {
+export function StockChart({ symbol, height = 420, mini = false, showPivot = true, showSmas = true, className }: StockChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef     = useRef<IChartApi | null>(null);
   const [data, setData]       = useState<ChartData | null>(null);
@@ -46,7 +47,8 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetch(`${API_URL}/api/chart/${symbol}?days=${mini ? 126 : 504}`)
+    // Mini needs enough bars for SMA150 — fetch 252 (1yr)
+    fetch(`${API_URL}/api/chart/${symbol}?days=${mini ? 252 : 504}`)
       .then(r => r.ok ? r.json() : r.json().then((d: any) => Promise.reject(d.detail ?? "No data")))
       .then((d: ChartData) => { if (!cancelled) { setData(d); setLoading(false); } })
       .catch((e: unknown) => { if (!cancelled) { setError(String(e)); setLoading(false); } });
@@ -66,7 +68,10 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
       width:  containerRef.current.clientWidth,
       height,
       layout: { background: { color: bg }, textColor },
-      grid:   { vertLines: { color: gridColor }, horzLines: { color: gridColor } },
+      grid: {
+        vertLines: { color: mini ? "transparent" : gridColor },
+        horzLines: { color: mini ? "transparent" : gridColor },
+      },
       crosshair: { mode: mini ? CrosshairMode.Hidden : CrosshairMode.Normal },
       rightPriceScale: { borderColor: gridColor, visible: !mini },
       timeScale: { borderColor: gridColor, visible: !mini, rightOffset: 5, barSpacing: mini ? 2 : 6 },
@@ -110,26 +115,33 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
     });
     candleSeries.setData(data.bars as any[]);
 
-    if (!mini) {
-      // ── SMA overlays ───────────────────────────────────────────────────────
-      const smaConfig = [
-        { pts: data.sma50,  color: "#f59e0b", title: "50"  },
-        { pts: data.sma150, color: "#8b5cf6", title: "150" },
-        { pts: data.sma200, color: "#ef4444", title: "200" },
-      ];
+    // ── SMA overlays — full chart: all three; mini: 50 + 150 ─────────────────
+    if (showSmas) {
+      const smaConfig = mini
+        ? [
+            { pts: data.sma50,  color: "#f59e0b", title: "" },
+            { pts: data.sma150, color: "#8b5cf6", title: "" },
+          ]
+        : [
+            { pts: data.sma50,  color: "#f59e0b", title: "50"  },
+            { pts: data.sma150, color: "#8b5cf6", title: "150" },
+            { pts: data.sma200, color: "#ef4444", title: "200" },
+          ];
       for (const { pts, color, title } of smaConfig) {
         if (!pts.length) continue;
         const s = chart.addSeries(LineSeries, {
           color,
-          lineWidth: 1,
+          lineWidth: mini ? 1 : 1,
           title,
           crosshairMarkerVisible: false,
-          lastValueVisible: true,
+          lastValueVisible: !mini,
           priceLineVisible: false,
         });
         s.setData(pts as any[]);
       }
+    }
 
+    if (!mini) {
       // ── Pivot line ─────────────────────────────────────────────────────────
       if (showPivot && data.pivot) {
         const pivotS = chart.addSeries(LineSeries, {

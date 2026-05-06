@@ -309,15 +309,36 @@ class ScoreOut(BaseModel):
     composite_score: Decimal
 
 
-@router.get("/results", response_model=list[ScoreOut])
+class ResultsPage(BaseModel):
+    items: list[ScoreOut]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+
+
+@router.get("/results", response_model=ResultsPage)
 async def results(
     min_tt: int = 0,
     min_vcp: float = 0.0,
     sector: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
     session: AsyncSession = Depends(get_session),
-) -> list[ScoreOut]:
-    rows = await get_screener_results(session, min_tt=min_tt, min_vcp=min_vcp, sector=sector)
-    return [_score_out(r) for r in rows]
+) -> ResultsPage:
+    all_rows = await get_screener_results(session, min_tt=min_tt, min_vcp=min_vcp, sector=sector)
+    total = len(all_rows)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page  = max(1, min(page, pages))
+    start = (page - 1) * page_size
+    rows  = all_rows[start : start + page_size]
+    return ResultsPage(
+        items=[_score_out(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
 
 
 def _score_out(r: ScreenerScore) -> ScoreOut:

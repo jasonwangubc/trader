@@ -1,3 +1,11 @@
+export interface ResultsPage {
+  items: ScoreResult[];
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
+}
+
 export interface ScreenerSymbol {
   id: string;
   symbol: string;

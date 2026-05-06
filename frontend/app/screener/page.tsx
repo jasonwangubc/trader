@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api, ApiError } from "@/lib/api";
 import {
+  type ResultsPage,
   type ScoreResult,
   type ScreenerSymbol,
   TT_CRITERIA_LABELS,
@@ -47,29 +48,34 @@ interface SyncStatus { running: boolean; message: string }
 
 // ---- Page ----
 
+const PAGE_SIZE = 20;
+
 export default async function ScreenerPage({
   searchParams,
 }: {
-  searchParams: Promise<{ min_tt?: string; min_vcp?: string }>;
+  searchParams: Promise<{ min_tt?: string; min_vcp?: string; page?: string }>;
 }) {
   const params = await searchParams;
   const minTT  = parseInt(params.min_tt  ?? "0") || 0;
   const minVCP = parseFloat(params.min_vcp ?? "0") || 0;
+  const page   = Math.max(1, parseInt(params.page ?? "1") || 1);
 
-  let results: ScoreResult[] = [];
+  let resultsPage: ResultsPage | null = null;
   let watchlist: ScreenerSymbol[] = [];
   let health: ScreenerHealth | null = null;
   let syncStatus: SyncStatus = { running: false, message: "" };
   let error: string | null = null;
 
   const qp = new URLSearchParams();
-  if (minTT)  qp.set("min_tt",  String(minTT));
-  if (minVCP) qp.set("min_vcp", String(minVCP));
-  const resultPath = `/api/screener/results${qp.size ? "?" + qp : ""}`;
+  if (minTT)  qp.set("min_tt",   String(minTT));
+  if (minVCP) qp.set("min_vcp",  String(minVCP));
+  qp.set("page",      String(page));
+  qp.set("page_size", String(PAGE_SIZE));
+  const resultPath = `/api/screener/results?${qp}`;
 
   try {
-    [results, watchlist, health, syncStatus] = await Promise.all([
-      api<ScoreResult[]>(resultPath),
+    [resultsPage, watchlist, health, syncStatus] = await Promise.all([
+      api<ResultsPage>(resultPath),
       api<ScreenerSymbol[]>("/api/screener/watchlist"),
       api<ScreenerHealth>("/api/screener/health"),
       api<SyncStatus>("/api/screener/sync/status"),
@@ -77,6 +83,8 @@ export default async function ScreenerPage({
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
+
+  const results = resultsPage?.items ?? [];
 
   return (
     <main className="container mx-auto max-w-7xl p-6 sm:p-10">
@@ -106,7 +114,13 @@ export default async function ScreenerPage({
       {/* Results */}
       <div className="mt-6 grid gap-6 lg:grid-cols-[1fr_18rem]">
         <div className="space-y-4">
-          <FilterBar currentMinTT={minTT} currentMinVCP={minVCP} totalResults={results.length} />
+          <FilterBar
+            currentMinTT={minTT}
+            currentMinVCP={minVCP}
+            totalResults={resultsPage?.total ?? 0}
+            page={page}
+            pages={resultsPage?.pages ?? 1}
+          />
           {results.length === 0 ? (
             <Card>
               <CardContent className="py-12 text-center text-sm text-muted-foreground">
@@ -335,13 +349,24 @@ function TTBar({ distribution, total }: { distribution: Record<string, number>; 
 // ---- Filters ----
 
 function FilterBar({
-  currentMinTT, currentMinVCP, totalResults,
+  currentMinTT, currentMinVCP, totalResults, page, pages,
 }: {
-  currentMinTT: number; currentMinVCP: number; totalResults: number;
+  currentMinTT: number; currentMinVCP: number; totalResults: number; page: number; pages: number;
 }) {
+  const buildUrl = (p: number) => {
+    const q = new URLSearchParams();
+    if (currentMinTT)  q.set("min_tt",  String(currentMinTT));
+    if (currentMinVCP) q.set("min_vcp", String(currentMinVCP));
+    if (p > 1)         q.set("page",    String(p));
+    return `/screener${q.size ? "?" + q : ""}`;
+  };
+
   return (
     <div className="flex flex-wrap items-center gap-3">
-      <span className="text-muted-foreground text-sm font-medium">{totalResults} candidates</span>
+      <span className="text-muted-foreground text-sm font-medium">
+        {totalResults} candidates
+        {pages > 1 && ` · page ${page}/${pages}`}
+      </span>
       <form method="get" className="flex items-center gap-2 ml-auto">
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">Min Trend Template</span>
@@ -364,6 +389,23 @@ function FilterBar({
           <Link href="/screener" className="text-muted-foreground text-xs hover:underline">Clear</Link>
         )}
       </form>
+
+      {/* Pagination */}
+      {pages > 1 && (
+        <div className="flex items-center gap-1 ml-auto">
+          {page > 1 && (
+            <Link href={buildUrl(page - 1)} className="border-input hover:bg-muted inline-flex h-7 items-center rounded border px-2 text-xs">
+              ← Prev
+            </Link>
+          )}
+          <span className="text-muted-foreground text-xs px-1">{page} / {pages}</span>
+          {page < pages && (
+            <Link href={buildUrl(page + 1)} className="border-input hover:bg-muted inline-flex h-7 items-center rounded border px-2 text-xs">
+              Next →
+            </Link>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -476,8 +518,8 @@ function ResultCard({ result: r }: { result: ScoreResult }) {
           </div>
         )}
 
-        {/* Mini chart */}
-        <StockChart symbol={r.symbol} height={80} mini className="rounded-md overflow-hidden" />
+        {/* Mini chart — 50 SMA (amber) + 150 SMA (violet) overlaid */}
+        <StockChart symbol={r.symbol} height={180} mini showSmas className="rounded-md overflow-hidden" />
 
         <Link href={`/chart/${r.symbol}`} className="text-primary text-xs flex items-center gap-1 hover:underline">
           <BarChart2 className="h-3 w-3" /> View full chart with SMA overlays + pivot →

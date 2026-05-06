@@ -86,7 +86,11 @@ def _detect_pivot(df) -> tuple[float | None, str | None]:
 
     # Base start: first bar where price dipped from the base high
     peak_idx = int(np.argmax(h))
-    base_start_date = str(d[peak_idx]) if peak_idx < len(d) else None
+    raw = d[peak_idx] if peak_idx < len(d) else None
+    base_start_date = (
+        raw.strftime("%Y-%m-%d") if hasattr(raw, "strftime")
+        else str(raw)[:10] if raw else None
+    )
 
     # Recent tightest 10-bar window — pivot is the high of that window
     if len(h) >= 10:
@@ -117,7 +121,11 @@ async def chart(
     spy_df = await get_bars_df(session, "SPY", days=days)
 
     closes = df["close"].values.astype(float)
-    dates  = [str(d.date()) if hasattr(d, "date") else str(d)[:10] for d in df["date"].tolist()]
+    dates  = [
+        d.strftime("%Y-%m-%d") if hasattr(d, "strftime")
+        else str(d)[:10]
+        for d in df["date"].tolist()
+    ]
 
     sma50_vals  = _sma(closes, 50)
     sma150_vals = _sma(closes, 150)
