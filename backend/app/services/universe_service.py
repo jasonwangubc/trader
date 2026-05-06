@@ -33,9 +33,14 @@ SEC_USER_AGENT = "trader-screener/1.0 contact@example.com"
 # Wikipedia table indices that hold ticker symbols
 _WIKI_TABLES = {
     "sp500":    ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",    0, "Symbol"),
+    "sp400":    ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",    0, "Symbol"),
     "nasdaq100":("https://en.wikipedia.org/wiki/Nasdaq-100",                      5, "Ticker"),
     "tsx60":    ("https://en.wikipedia.org/wiki/S%26P/TSX_60",                    1, "Symbol"),
 }
+
+# TSX-listed symbols need the .TO suffix for yfinance.
+# We add it here so price downloads and info fetches work correctly.
+_TSX_SOURCES = {"tsx60"}
 
 
 _WIKI_UA = (
@@ -56,26 +61,33 @@ def _fetch_wikipedia_tickers(source_key: str) -> list[dict]:
             html = r.text
 
         tables = pd.read_html(io.StringIO(html))
-        if table_idx >= len(tables):
-            log.warning("Table index %d out of range for %s (%d tables found)", table_idx, source_key, len(tables))
-            # Try all tables to find the right one
-            for i, df in enumerate(tables):
-                for candidate in [col, "Symbol", "Ticker", "Symbols"]:
-                    if candidate in df.columns:
-                        syms = df[candidate].dropna().astype(str).str.strip().str.upper().tolist()
-                        syms = [s.replace(".", "-") for s in syms if s and s != "NAN"]
-                        if syms:
-                            log.info("Found tickers in table %d column '%s' for %s", i, candidate, source_key)
-                            return [{"symbol": s, "source": source_key} for s in syms]
+        is_tsx = source_key in _TSX_SOURCES
+
+        def _extract(df) -> list[str]:
+            for candidate in [col, "Symbol", "Ticker", "Symbols"]:
+                if candidate in df.columns:
+                    raw = df[candidate].dropna().astype(str).str.strip().str.upper().tolist()
+                    syms = [s.replace(".", "-") for s in raw if s and s != "NAN"]
+                    if is_tsx:
+                        # Add .TO suffix for TSX-listed symbols so yfinance can find them.
+                        # BIP-UN → BIP-UN.TO, ATD → ATD.TO etc.
+                        syms = [s if s.endswith(".TO") else f"{s}.TO" for s in syms]
+                    return syms
             return []
 
-        df = tables[table_idx]
-        for candidate in [col, "Symbol", "Ticker", "Symbols"]:
-            if candidate in df.columns:
-                syms = df[candidate].dropna().astype(str).str.strip().str.upper().tolist()
-                syms = [s.replace(".", "-") for s in syms if s and s != "NAN"]
-                return [{"symbol": s, "source": source_key} for s in syms]
-        log.warning("Could not find ticker column in %s table %d — available: %s", url, table_idx, list(df.columns)[:10])
+        if table_idx >= len(tables):
+            log.warning("Table index %d out of range for %s (%d tables found)", table_idx, source_key, len(tables))
+            for i, df in enumerate(tables):
+                syms = _extract(df)
+                if syms:
+                    log.info("Found tickers in table %d for %s", i, source_key)
+                    return [{"symbol": s, "source": source_key} for s in syms]
+            return []
+
+        syms = _extract(tables[table_idx])
+        if syms:
+            return [{"symbol": s, "source": source_key} for s in syms]
+        log.warning("Could not find ticker column in %s table %d", url, table_idx)
         return []
     except Exception:
         log.exception("Failed to fetch %s universe from Wikipedia", source_key)
@@ -138,7 +150,9 @@ async def build_universe(session: AsyncSession) -> dict[str, int]:
     for row in all_rows:
         sym = row["symbol"]
         source = row["source"]
-        cik = cik_map.get(sym)
+        # Strip .TO for CIK lookup — SEC doesn't use exchange suffixes.
+        bare_sym = sym.removesuffix(".TO").removesuffix(".V")
+        cik = cik_map.get(sym) or cik_map.get(bare_sym)
         counts[source] = counts.get(source, 0) + 1
 
         if sym in existing:

@@ -1,41 +1,81 @@
 """Screener pipeline orchestrator.
 
 Two modes:
-  auto   — pulls S&P 500 + NASDAQ 100 + TSX 60 universe, runs full pipeline
+  auto   — pulls S&P 500 + S&P 400 + NASDAQ 100 + TSX 60, runs full pipeline
   manual — only scores symbols explicitly in the watchlist
 
 Pipeline (auto mode):
-  1. Universe fetch     — Wikipedia S&P 500/NASDAQ 100/TSX 60 → upsert screener_symbols
-  2. EOD download       — incremental (delta for existing, full 2yr for new symbols)
-  3. TT pre-filter      — discard TT < 3 to avoid scoring 700 symbols deeply
-  4. VCP scoring        — on TT-passing subset only
-  5. EDGAR fundamentals — SEC companyfacts API for top 200 by TT+VCP
-  6. RS rank            — percentile within screener universe vs SPY
-  7. Composite score    — TT 25% + VCP 25% + RS 20% + Fundamentals 30%
+  1. Universe fetch    — Wikipedia → upsert screener_symbols
+  2. EOD download      — incremental (delta for existing, full 2yr for new)
+  3. TT pre-filter     — discard TT < 3 to avoid scoring everything deeply
+  4. VCP scoring       — on TT-passing subset only
+  5. yfinance fundamentals — earningsQuarterlyGrowth, revenueGrowth, ROE, margins
+                             covers ALL scored symbols including Canadian stocks
+  6. RS rank           — percentile within screener universe vs SPY
+  7. Composite score   — TT 25% + VCP 25% + RS 20% + Fundamentals 30%
   8. Persist results
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import numpy as np
+import yfinance as yf
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import ScreenerScore, ScreenerSymbol
 from app.services.eod_service import BENCHMARKS, get_bars_df, sync_eod_incremental
-from app.services.edgar_fundamentals import fetch_fundamentals_batch
 from app.services.trend_template import MIN_BARS, score_trend_template
-from app.services.universe_service import build_universe, extract_cik
+from app.services.universe_service import build_universe
 from app.services.vcp_scorer import score_vcp
 
 log = logging.getLogger(__name__)
 
 TT_PREFILTER_THRESHOLD = 3    # symbols below this TT score are dropped
-FUNDAMENTAL_TOP_N = 200        # how many symbols get EDGAR fundamental fetch
+YF_FUNDAMENTALS_CONCURRENCY = 12  # concurrent yfinance info calls
+
+
+async def _fetch_yf_fundamentals_batch(symbols: list[str]) -> dict[str, dict]:
+    """Fetch earningsQuarterlyGrowth, revenueGrowth, ROE, margins from yfinance.
+
+    Uses yfinance ticker.info — covers ALL symbols including Canadian (TSX).
+    earningsQuarterlyGrowth = most recent quarter's YoY EPS growth (Minervini's #1 metric).
+    Runs concurrently; much faster than EDGAR for the screener use case.
+    """
+    sem = asyncio.Semaphore(YF_FUNDAMENTALS_CONCURRENCY)
+    results: dict[str, dict] = {}
+
+    def _info_sync(sym: str) -> dict:
+        try:
+            info = yf.Ticker(sym).info or {}
+            eps_growth = info.get("earningsQuarterlyGrowth")
+            if eps_growth is None:
+                eps_growth = info.get("earningsGrowth")
+            return {
+                "net_income_growth": eps_growth,
+                "revenue_growth":    info.get("revenueGrowth"),
+                "net_margin":        info.get("profitMargins"),
+                "roe":               info.get("returnOnEquity"),
+                "sector":            info.get("sector"),
+                "trailing_eps":      info.get("trailingEps"),
+            }
+        except Exception:
+            return {}
+
+    async def _fetch_one(sym: str) -> None:
+        async with sem:
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, _info_sync, sym)
+            if data:
+                results[sym] = data
+
+    await asyncio.gather(*[_fetch_one(s) for s in symbols])
+    return results
 
 
 @dataclass
@@ -114,23 +154,13 @@ async def run_screener(
 
     stats.scored = len(scored)
 
-    # ── Step 5: EDGAR fundamentals ───────────────────────────────────────────
-    # Sort by TT+VCP to pick the most promising symbols for EDGAR fetch
-    scored.sort(key=lambda x: x[2].score / 8.0 + float(x[3].score), reverse=True)
-    top_for_fundamentals = scored[:FUNDAMENTAL_TOP_N]
-
-    symbol_cik_pairs = []
-    for sym, _, _, _ in top_for_fundamentals:
-        sym_row = sym_row_map.get(sym)
-        cik = extract_cik(sym_row) if sym_row else None
-        if cik:
-            symbol_cik_pairs.append((sym, cik))
-
-    fundamental_map = {}
-    if symbol_cik_pairs:
-        log.info("Fetching EDGAR fundamentals for %d symbols", len(symbol_cik_pairs))
-        fundamental_map = await fetch_fundamentals_batch(symbol_cik_pairs, concurrency=5)
-        stats.with_fundamentals = len(fundamental_map)
+    # ── Step 5: yfinance fundamentals for ALL scored symbols ─────────────────
+    # Using yfinance ticker.info instead of EDGAR — covers Canadian stocks too,
+    # 10× faster, and earningsQuarterlyGrowth is the Minervini key metric.
+    all_scored_symbols = [sym for sym, _, _, _ in scored]
+    log.info("Fetching yfinance fundamentals for %d symbols", len(all_scored_symbols))
+    fundamental_map = await _fetch_yf_fundamentals_batch(all_scored_symbols)
+    stats.with_fundamentals = sum(1 for v in fundamental_map.values() if v)
 
     # ── Step 6: Upsert screener_scores ───────────────────────────────────────
     existing_result = await session.execute(select(ScreenerScore))
@@ -139,7 +169,6 @@ async def run_screener(
     result_rows: list[ScreenerScore] = []
     for sym, df, tt, vcp in scored:
         sym_row = sym_row_map.get(sym)
-        fund = fundamental_map.get(sym)
 
         score_row = existing_scores.get(sym)
         if score_row is None:
@@ -165,13 +194,29 @@ async def run_screener(
         score_row.high_52w = Decimal(str(tt.high_52w)) if tt.high_52w else None
         score_row.low_52w  = Decimal(str(tt.low_52w))  if tt.low_52w  else None
 
+        fund = fundamental_map.get(sym)
         if fund:
-            score_row.fundamental_score   = Decimal(str(fund.score))
-            score_row.revenue_growth      = Decimal(str(round(fund.revenue_growth, 4))) if fund.revenue_growth is not None else None
-            score_row.net_income_growth   = Decimal(str(round(fund.net_income_growth, 4))) if fund.net_income_growth is not None else None
-            score_row.net_margin          = Decimal(str(round(fund.net_margin, 4))) if fund.net_margin is not None else None
-            score_row.eps_ttm             = Decimal(str(round(fund.eps_ttm, 4))) if fund.eps_ttm is not None else None
-            score_row.fundamental_error   = fund.error
+            rev_g  = fund.get("revenue_growth")
+            ni_g   = fund.get("net_income_growth")
+            margin = fund.get("net_margin")
+            roe    = fund.get("roe")
+            eps    = fund.get("trailing_eps")
+            sector = fund.get("sector")
+
+            # Minervini 4-point fundamental score
+            score_pts = 0
+            if ni_g   is not None and ni_g   >= 0.25: score_pts += 1
+            if rev_g  is not None and rev_g  >= 0.15: score_pts += 1
+            if margin is not None and margin >= 0.10: score_pts += 1
+            if roe    is not None and roe    >= 0.17: score_pts += 1
+
+            score_row.fundamental_score  = Decimal(str(round(score_pts / 4.0, 3)))
+            score_row.revenue_growth     = Decimal(str(round(rev_g,  4))) if rev_g  is not None else None
+            score_row.net_income_growth  = Decimal(str(round(ni_g,   4))) if ni_g   is not None else None
+            score_row.net_margin         = Decimal(str(round(margin, 4))) if margin is not None else None
+            score_row.eps_ttm            = Decimal(str(round(eps,    4))) if eps    is not None else None
+            score_row.sector             = sector or score_row.sector
+            score_row.fundamental_error  = None
         else:
             score_row.fundamental_score = Decimal(0)
 
