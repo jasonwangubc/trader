@@ -465,30 +465,15 @@ function ResultCard({ result: r }: { result: ScoreResult }) {
           </div>
         )}
 
-        {/* Fundamentals row */}
-        {(r.revenue_growth || r.net_margin) ? (
-          <div className="grid grid-cols-3 gap-1 rounded-md bg-muted/30 px-2 py-1.5 text-center text-xs">
-            <div>
-              <div className="text-muted-foreground">Revenue growth</div>
-              <div className={`tabular-nums font-medium ${r.revenue_growth && parseFloat(r.revenue_growth) > 0.1 ? "text-emerald-600 dark:text-emerald-400" : ""}`}>
-                {fmtPct(r.revenue_growth)}
-              </div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">Earnings growth</div>
-              <div className={`tabular-nums font-medium ${r.net_income_growth && parseFloat(r.net_income_growth) > 0.15 ? "text-emerald-600 dark:text-emerald-400" : ""}`}>
-                {fmtPct(r.net_income_growth)}
-              </div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">Net margin</div>
-              <div className={`tabular-nums font-medium ${r.net_margin && parseFloat(r.net_margin) > 0.1 ? "text-emerald-600 dark:text-emerald-400" : ""}`}>
-                {fmtPct(r.net_margin)}
-              </div>
-            </div>
+        {/* Fundamentals — visual bars */}
+        {(r.revenue_growth || r.net_income_growth || r.net_margin) ? (
+          <div className="rounded-md bg-muted/30 px-3 py-2 space-y-1.5">
+            <GrowthBar label="Rev growth"  value={r.revenue_growth}     target={0.25} />
+            <GrowthBar label="EPS growth"  value={r.net_income_growth}  target={0.25} />
+            <GrowthBar label="Net margin"  value={r.net_margin}         target={0.10} isMargin />
           </div>
         ) : (
-          <p className="text-muted-foreground text-xs">No fundamental data — may be Canadian (TSX) or pending next scan.</p>
+          <p className="text-muted-foreground text-xs">No fundamental data — Canadian (TSX) stocks don't file with SEC.</p>
         )}
 
         {/* TT criteria chips */}
@@ -534,6 +519,33 @@ function Score({ label, value, color = "" }: { label: string; value: string; col
     <div className="text-center">
       <div className={`text-lg font-bold tabular-nums ${color}`}>{value}</div>
       <div className="text-muted-foreground text-[10px] uppercase">{label}</div>
+    </div>
+  );
+}
+
+function GrowthBar({
+  label, value, target, isMargin,
+}: {
+  label: string; value: string | null; target: number; isMargin?: boolean;
+}) {
+  if (!value) return null;
+  const v = parseFloat(value);
+  const passing = v >= target;
+  const great   = v >= target * 2;
+  // Cap visual bar at 200% of target for display
+  const barPct  = Math.min(Math.max(v / (target * 2), 0), 1) * 100;
+  const color   = great ? "bg-emerald-500" : passing ? "bg-emerald-400" : v > 0 ? "bg-amber-400" : "bg-destructive";
+  const textCls = great ? "text-emerald-600 dark:text-emerald-400" : passing ? "text-emerald-600/70" : v > 0 ? "text-amber-600" : "text-destructive";
+
+  return (
+    <div className="flex items-center gap-2 text-[11px]">
+      <span className="text-muted-foreground w-20 shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+        <div className={`h-full rounded-full ${color}`} style={{ width: `${barPct}%` }} />
+      </div>
+      <span className={`tabular-nums font-medium w-12 text-right ${textCls}`}>
+        {v >= 0 ? "+" : ""}{(v * 100).toFixed(0)}%
+      </span>
     </div>
   );
 }

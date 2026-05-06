@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { ArrowLeft, TrendingUp } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { StockChart } from "@/components/stock-chart";
+import { FundamentalsPanel } from "@/components/fundamentals-panel";
 import { api, ApiError } from "@/lib/api";
 
 interface ChartData {
@@ -103,6 +104,19 @@ export default async function ChartPage({
       <Card className="mb-4">
         <CardContent className="p-4">
           <StockChart symbol={sym} height={480} showPivot className="w-full" />
+        </CardContent>
+      </Card>
+
+      {/* Fundamentals panel */}
+      <Card className="mb-4">
+        <CardHeader>
+          <CardTitle className="text-base">Fundamentals</CardTitle>
+          <CardDescription className="text-xs">
+            Quarterly EPS + revenue · Minervini targets: EPS ≥+25% YoY (accelerating), Revenue ≥+25%, ROE ≥17%
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <FundamentalsPanel symbol={sym} />
         </CardContent>
       </Card>
 

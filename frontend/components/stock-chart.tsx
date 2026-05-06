@@ -153,13 +153,20 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
           priceLineVisible: false,
           crosshairMarkerVisible: false,
         });
-        const times = data.bars.map(b => b.time);
-        const startTime = data.base_start ?? times[Math.max(0, times.length - 65)];
+        const times     = data.bars.map(b => b.time);
         const endTime   = times[times.length - 1];
-        pivotS.setData([
-          { time: startTime as any, value: data.pivot },
-          { time: endTime   as any, value: data.pivot },
-        ]);
+        const rawStart  = data.base_start ?? times[Math.max(0, times.length - 65)];
+        // lightweight-charts requires strictly ascending time — if base_start equals
+        // the last bar (stock at recent high), step back one bar to avoid the error.
+        const startTime = rawStart < endTime
+          ? rawStart
+          : times[Math.max(0, times.length - 2)];
+        if (startTime < endTime) {
+          pivotS.setData([
+            { time: startTime as any, value: data.pivot },
+            { time: endTime   as any, value: data.pivot },
+          ]);
+        }
       }
 
       // ── RS line (vs SPY) ───────────────────────────────────────────────────
