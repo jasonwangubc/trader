@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import accounts, chart, earnings, health, journal, monitor, options, positions, regime, screener, tickets
+from app.api import accounts, backtest, chart, earnings, health, journal, monitor, options, positions, regime, screener, tickets
 from app.config import get_settings
 
 
@@ -58,6 +58,7 @@ def create_app() -> FastAPI:
     app.include_router(options.router)
     app.include_router(chart.router)
     app.include_router(earnings.router)
+    app.include_router(backtest.router)
     return app
 
 

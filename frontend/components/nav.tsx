@@ -14,6 +14,7 @@ import {
   Shield,
   LineChart,
   Eye,
+  FlaskConical,
   Menu,
   X,
 } from "lucide-react";
@@ -29,6 +30,7 @@ const NAV = [
   { href: "/positions",  label: "Positions",  Icon: TrendingUp },
   { href: "/accounts",   label: "Accounts",   Icon: Wallet },
   { href: "/journal",    label: "Journal",    Icon: BookOpen },
+  { href: "/backtest",   label: "Backtest",   Icon: FlaskConical },
 ];
 
 type MonitorStatus = { running: boolean; armed_tickets: number; kill_switch: boolean; market_open: boolean };

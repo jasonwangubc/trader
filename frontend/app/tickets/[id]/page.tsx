@@ -6,6 +6,7 @@ import { type Ticket, fmtMoney, fmtPct } from "@/lib/tickets";
 import { CancelButton } from "./cancel-button";
 import { CloseForm } from "./close-form";
 import { ExitPlanForm } from "./exit-plan-form";
+import { PyramidForm } from "./pyramid-form";
 import { StockChart } from "@/components/stock-chart";
 
 interface TicketOrder {
@@ -30,9 +31,18 @@ interface TicketFill {
   occurred_at: string;
 }
 
+interface TrailingSuggestion {
+  open_r: number;
+  new_stop: string | null;
+  action: string;
+  urgency: string;
+  milestone_label: string;
+}
+
 interface TicketDetail extends Ticket {
   orders: TicketOrder[];
   exit_plan: { targets: Array<{ price: string; shares: number; label: string; hit: boolean }> } | null;
+  trailing: TrailingSuggestion | null;
 }
 
 const STATUS_VARIANTS: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
@@ -208,6 +218,43 @@ export default async function TicketDetailPage({
           </Card>
         )}
 
+        {/* Trailing stop suggestion */}
+        {ticket.trailing && ticket.status === "filled" && (
+          <Card className={`lg:col-span-2 ${
+            ticket.trailing.urgency === "act"  ? "border-emerald-400 dark:border-emerald-700 bg-emerald-50/50 dark:bg-emerald-950/20" :
+            ticket.trailing.urgency === "warn" ? "border-amber-400 dark:border-amber-700 bg-amber-50/50 dark:bg-amber-950/20" : ""
+          }`}>
+            <CardHeader className="pb-2">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-base">
+                  {ticket.trailing.urgency === "act"  ? "🎯 " :
+                   ticket.trailing.urgency === "warn" ? "⚠ " : ""}
+                  {ticket.trailing.milestone_label}
+                </CardTitle>
+                <span className={`text-2xl font-bold tabular-nums ${
+                  ticket.trailing.open_r >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"
+                }`}>
+                  {ticket.trailing.open_r > 0 ? "+" : ""}{ticket.trailing.open_r.toFixed(2)}R
+                </span>
+              </div>
+              <CardDescription className="text-sm mt-1">{ticket.trailing.action}</CardDescription>
+            </CardHeader>
+            {ticket.trailing.new_stop && (
+              <CardContent className="pt-0 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">Suggested new stop</span>
+                  <span className="font-mono font-semibold text-lg">
+                    ${parseFloat(ticket.trailing.new_stop).toFixed(2)}
+                  </span>
+                </div>
+                <p className="text-muted-foreground text-xs mt-1">
+                  Based on last daily close. Update the stop order in Questrade manually, then record the new stop below.
+                </p>
+              </CardContent>
+            )}
+          </Card>
+        )}
+
         {/* Exit ladder */}
         {ticket.status === "filled" && (
           <Card className="lg:col-span-2">
@@ -226,6 +273,27 @@ export default async function TicketDetailPage({
                 triggerPrice={ticket.trigger_price}
                 stopPrice={ticket.stop_price}
                 currentPlan={ticket.exit_plan as any}
+              />
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Pyramiding */}
+        {ticket.status === "filled" && (
+          <Card className="lg:col-span-2">
+            <CardHeader>
+              <CardTitle className="text-base">Add to position (pyramid)</CardTitle>
+              <CardDescription>
+                Record an add-on entry when the stock acts well. Blended cost basis is computed
+                automatically. Stop stays fixed — it manages the full combined position.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <PyramidForm
+                ticketId={ticket.id}
+                currency={ticket.currency}
+                currentShares={ticket.position_size_shares}
+                stopPrice={ticket.stop_price}
               />
             </CardContent>
           </Card>

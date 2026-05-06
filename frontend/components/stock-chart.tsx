@@ -3,13 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
   createChart,
+  CandlestickSeries,
+  HistogramSeries,
+  LineSeries,
   type IChartApi,
-  type ISeriesApi,
-  type CandlestickData,
-  type LineData,
   CrosshairMode,
   LineStyle,
-  PriceScaleMode,
 } from "lightweight-charts";
 import { API_URL } from "@/lib/api";
 
@@ -30,7 +29,7 @@ interface ChartData {
 interface StockChartProps {
   symbol: string;
   height?: number;
-  mini?: boolean;          // compact sparkline mode (no axes, no RS panel)
+  mini?: boolean;
   showPivot?: boolean;
   className?: string;
 }
@@ -38,19 +37,19 @@ interface StockChartProps {
 export function StockChart({ symbol, height = 420, mini = false, showPivot = true, className }: StockChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef     = useRef<IChartApi | null>(null);
-  const [data, setData] = useState<ChartData | null>(null);
+  const [data, setData]       = useState<ChartData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError]     = useState<string | null>(null);
 
-  // Fetch chart data
+  // Fetch data
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     fetch(`${API_URL}/api/chart/${symbol}?days=${mini ? 126 : 504}`)
-      .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.detail || "No data")))
-      .then(d => { if (!cancelled) { setData(d); setLoading(false); } })
-      .catch(e => { if (!cancelled) { setError(String(e)); setLoading(false); } });
+      .then(r => r.ok ? r.json() : r.json().then((d: any) => Promise.reject(d.detail ?? "No data")))
+      .then((d: ChartData) => { if (!cancelled) { setData(d); setLoading(false); } })
+      .catch((e: unknown) => { if (!cancelled) { setError(String(e)); setLoading(false); } });
     return () => { cancelled = true; };
   }, [symbol, mini]);
 
@@ -64,8 +63,8 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
     const bg        = isDark ? "#0f172a" : "#ffffff";
 
     const chart = createChart(containerRef.current, {
-      width: containerRef.current.clientWidth,
-      height: mini ? height : height,
+      width:  containerRef.current.clientWidth,
+      height,
       layout: { background: { color: bg }, textColor },
       grid:   { vertLines: { color: gridColor }, horzLines: { color: gridColor } },
       crosshair: { mode: mini ? CrosshairMode.Hidden : CrosshairMode.Normal },
@@ -76,54 +75,64 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
     });
     chartRef.current = chart;
 
-    // Volume (behind candles)
-    const volSeries = chart.addHistogramSeries({
+    // ── Volume histogram ──────────────────────────────────────────────────────
+    const volSeries = chart.addSeries(HistogramSeries, {
       color: isDark ? "#1e3a5f" : "#dbeafe",
-      priceFormat: { type: "volume" },
+      priceFormat: { type: "volume" as const },
       priceScaleId: "vol",
       lastValueVisible: false,
       priceLineVisible: false,
     });
-    chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.80, bottom: 0 }, visible: false });
-    volSeries.setData(data.bars.map(b => ({
-      time: b.time as any,
-      value: b.volume,
-      color: b.close >= b.open
-        ? (isDark ? "#166534" : "#bbf7d0")
-        : (isDark ? "#7f1d1d" : "#fecaca"),
-    })));
+    chart.priceScale("vol").applyOptions({
+      scaleMargins: { top: 0.80, bottom: 0 },
+      visible: false,
+    });
+    volSeries.setData(
+      data.bars.map(b => ({
+        time: b.time as any,
+        value: b.volume,
+        color: b.close >= b.open
+          ? (isDark ? "#166534" : "#bbf7d0")
+          : (isDark ? "#7f1d1d" : "#fecaca"),
+      }))
+    );
 
-    // Candlesticks
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: "#16a34a",   downColor: "#dc2626",
-      borderUpColor: "#16a34a", borderDownColor: "#dc2626",
-      wickUpColor: "#16a34a",   wickDownColor: "#dc2626",
+    // ── Candlesticks ─────────────────────────────────────────────────────────
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor:          "#16a34a",
+      downColor:        "#dc2626",
+      borderUpColor:    "#16a34a",
+      borderDownColor:  "#dc2626",
+      wickUpColor:      "#16a34a",
+      wickDownColor:    "#dc2626",
       lastValueVisible: !mini,
       priceLineVisible: !mini,
     });
-    candleSeries.setData(data.bars as CandlestickData[]);
+    candleSeries.setData(data.bars as any[]);
 
     if (!mini) {
-      // SMA overlays
+      // ── SMA overlays ───────────────────────────────────────────────────────
       const smaConfig = [
-        { data: data.sma50,  color: "#f59e0b", title: "50" },
-        { data: data.sma150, color: "#8b5cf6", title: "150" },
-        { data: data.sma200, color: "#ef4444", title: "200" },
+        { pts: data.sma50,  color: "#f59e0b", title: "50"  },
+        { pts: data.sma150, color: "#8b5cf6", title: "150" },
+        { pts: data.sma200, color: "#ef4444", title: "200" },
       ];
-      for (const { data: pts, color, title } of smaConfig) {
-        if (pts.length === 0) continue;
-        const s = chart.addLineSeries({
-          color, lineWidth: 1, title,
+      for (const { pts, color, title } of smaConfig) {
+        if (!pts.length) continue;
+        const s = chart.addSeries(LineSeries, {
+          color,
+          lineWidth: 1,
+          title,
           crosshairMarkerVisible: false,
           lastValueVisible: true,
           priceLineVisible: false,
         });
-        s.setData(pts as LineData[]);
+        s.setData(pts as any[]);
       }
 
-      // Pivot line
+      // ── Pivot line ─────────────────────────────────────────────────────────
       if (showPivot && data.pivot) {
-        const pivotSeries = chart.addLineSeries({
+        const pivotS = chart.addSeries(LineSeries, {
           color: "#06b6d4",
           lineWidth: 1,
           lineStyle: LineStyle.Dashed,
@@ -132,19 +141,18 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
           priceLineVisible: false,
           crosshairMarkerVisible: false,
         });
-        // Draw pivot line across the full time range
         const times = data.bars.map(b => b.time);
         const startTime = data.base_start ?? times[Math.max(0, times.length - 65)];
         const endTime   = times[times.length - 1];
-        pivotSeries.setData([
+        pivotS.setData([
           { time: startTime as any, value: data.pivot },
           { time: endTime   as any, value: data.pivot },
         ]);
       }
 
-      // RS line (on a separate right price scale, secondary pane feel)
+      // ── RS line (vs SPY) ───────────────────────────────────────────────────
       if (data.rs.length > 0) {
-        const rsSeries = chart.addLineSeries({
+        const rsSeries = chart.addSeries(LineSeries, {
           color: "#a78bfa",
           lineWidth: 1,
           priceScaleId: "rs",
@@ -157,11 +165,10 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
           scaleMargins: { top: 0.85, bottom: 0.0 },
           visible: false,
         });
-        rsSeries.setData(data.rs as LineData[]);
+        rsSeries.setData(data.rs as any[]);
       }
     }
 
-    // Fit content
     chart.timeScale().fitContent();
 
     // Resize observer
@@ -170,7 +177,7 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
         chart.applyOptions({ width: containerRef.current.clientWidth });
       }
     });
-    if (containerRef.current) ro.observe(containerRef.current);
+    ro.observe(containerRef.current);
 
     return () => {
       ro.disconnect();
@@ -181,7 +188,10 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
 
   if (loading) {
     return (
-      <div style={{ height }} className={`flex items-center justify-center bg-muted/20 rounded-lg animate-pulse ${className ?? ""}`}>
+      <div
+        style={{ height }}
+        className={`flex items-center justify-center rounded-lg bg-muted/20 animate-pulse ${className ?? ""}`}
+      >
         <span className="text-muted-foreground text-xs">Loading chart…</span>
       </div>
     );
@@ -189,8 +199,11 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
 
   if (error) {
     return (
-      <div style={{ height }} className={`flex items-center justify-center bg-muted/20 rounded-lg ${className ?? ""}`}>
-        <span className="text-muted-foreground text-xs text-center px-4">{error}</span>
+      <div
+        style={{ height }}
+        className={`flex items-center justify-center rounded-lg bg-muted/20 ${className ?? ""}`}
+      >
+        <span className="text-muted-foreground text-center px-4 text-xs">{error}</span>
       </div>
     );
   }
@@ -198,15 +211,15 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
   return (
     <div className={className}>
       {!mini && data?.pivot && (
-        <div className="flex items-center gap-4 mb-2 text-xs text-muted-foreground px-1">
-          <span><span className="inline-block w-3 h-0.5 bg-amber-400 mr-1" />50 SMA</span>
-          <span><span className="inline-block w-3 h-0.5 bg-violet-500 mr-1" />150 SMA</span>
-          <span><span className="inline-block w-3 h-0.5 bg-red-500 mr-1" />200 SMA</span>
-          <span><span className="inline-block w-3 h-0.5 bg-cyan-500 mr-1 border-dashed" />Pivot {data.pivot.toFixed(2)}</span>
-          <span className="ml-auto"><span className="inline-block w-3 h-0.5 bg-violet-400 mr-1" />RS line</span>
+        <div className="mb-2 flex items-center gap-4 px-1 text-xs text-muted-foreground">
+          <span><span className="mr-1 inline-block h-0.5 w-3 bg-amber-400" />50 SMA</span>
+          <span><span className="mr-1 inline-block h-0.5 w-3 bg-violet-500" />150 SMA</span>
+          <span><span className="mr-1 inline-block h-0.5 w-3 bg-red-500" />200 SMA</span>
+          <span><span className="mr-1 inline-block h-0.5 w-3 border-dashed bg-cyan-500" />Pivot {data.pivot.toFixed(2)}</span>
+          <span className="ml-auto"><span className="mr-1 inline-block h-0.5 w-3 bg-violet-400" />RS line</span>
         </div>
       )}
-      <div ref={containerRef} style={{ height }} className="rounded-lg overflow-hidden" />
+      <div ref={containerRef} style={{ height }} className="overflow-hidden rounded-lg" />
     </div>
   );
 }

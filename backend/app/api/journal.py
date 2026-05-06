@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Account, Fill, Order, OrderIntent, Ticket, TicketStatus
 from app.db.session import get_session
 from app.services.accounts_service import get_household_equity
+from app.services.coach_service import Insight, compute_insights
 
 router = APIRouter(prefix="/api/journal", tags=["journal"])
 
@@ -275,3 +276,26 @@ async def summary(session: AsyncSession = Depends(get_session)) -> JournalSummar
         by_month=by_month,
         equity_curve=equity_curve,
     )
+
+
+# ── Behavioral coach ─────────────────────────────────────────────────────────
+
+class InsightOut(BaseModel):
+    category: str
+    severity: str
+    headline: str
+    detail: str
+    data: dict
+
+
+@router.get("/coach", response_model=list[InsightOut])
+async def coach(session: AsyncSession = Depends(get_session)) -> list[InsightOut]:
+    """Return behavioral insights based on your closed trade history."""
+    insights = await compute_insights(session)
+    return [InsightOut(
+        category=i.category,
+        severity=i.severity,
+        headline=i.headline,
+        detail=i.detail,
+        data=i.data,
+    ) for i in insights]

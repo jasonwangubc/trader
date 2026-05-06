@@ -25,6 +25,7 @@ from app.db.session import get_session
 from app.services.guardrail_service import GuardrailViolation, check_all
 from app.services.order_service import close_ticket
 from app.services.regime_service import get_regime
+from app.services.trailing_service import TrailingSuggestion, compute_trailing_suggestion
 from app.services.tickets_service import (
     TicketValidationError,
     cancel_ticket,
@@ -190,9 +191,18 @@ class OrderOut(BaseModel):
     fills: list[FillOut]
 
 
+class TrailingOut(BaseModel):
+    open_r: float
+    new_stop: Decimal | None
+    action: str
+    urgency: str
+    milestone_label: str
+
+
 class TicketDetailOut(TicketOut):
     orders: list[OrderOut] = []
     exit_plan: dict | None = None
+    trailing: TrailingOut | None = None
 
 
 # -------- Routes --------
@@ -346,8 +356,49 @@ async def get_ticket(
                    for f in fills],
         ))
 
+    # Trailing stop suggestion for filled tickets
+    trailing_out = None
+    if t.status == TicketStatus.FILLED.value:
+        # Get entry fill price
+        entry_price = t.trigger_price  # fallback
+        fill_result = await session.execute(
+            select(Fill).join(Order).where(
+                Order.ticket_id == ticket_id,
+                Order.intent == "entry",
+                Fill.order_id == Order.id,
+            ).order_by(Fill.occurred_at).limit(1)
+        )
+        fill = fill_result.scalar_one_or_none()
+        if fill:
+            entry_price = fill.price
+
+        # Get last daily close from daily_bars
+        from app.db.models import DailyBar
+        bar_result = await session.execute(
+            select(DailyBar)
+            .where(DailyBar.symbol == t.symbol)
+            .order_by(DailyBar.bar_date.desc())
+            .limit(1)
+        )
+        last_bar = bar_result.scalar_one_or_none()
+        if last_bar and last_bar.close > 0:
+            suggestion = compute_trailing_suggestion(
+                entry_price=entry_price,
+                stop_price=t.stop_price,
+                current_price=last_bar.close,
+                shares=t.position_size_shares,
+            )
+            if suggestion:
+                trailing_out = TrailingOut(
+                    open_r=suggestion.open_r,
+                    new_stop=suggestion.new_stop,
+                    action=suggestion.action,
+                    urgency=suggestion.urgency,
+                    milestone_label=suggestion.milestone_label,
+                )
+
     base = TicketOut.from_orm_obj(t)
-    return TicketDetailOut(**base.model_dump(), orders=order_outs, exit_plan=t.exit_plan)
+    return TicketDetailOut(**base.model_dump(), orders=order_outs, exit_plan=t.exit_plan, trailing=trailing_out)
 
 
 @router.post("/{ticket_id}/cancel", response_model=TicketOut)
@@ -359,6 +410,66 @@ async def cancel(
         ticket = await cancel_ticket(session, ticket_id)
     except TicketValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    return TicketOut.from_orm_obj(ticket)
+
+
+class PyramidIn(BaseModel):
+    add_price: Decimal = Field(gt=0)       # price at which you're adding
+    add_shares: int    = Field(gt=0)       # shares being added
+
+
+@router.post("/{ticket_id}/pyramid", response_model=TicketOut)
+async def add_pyramid_entry(
+    ticket_id: uuid.UUID,
+    body: PyramidIn,
+    session: AsyncSession = Depends(get_session),
+) -> TicketOut:
+    """Record an add-on (pyramid) entry on a filled ticket.
+    Updates position_size_shares and recomputes blended cost basis.
+    The stop price stays immutable — the unified stop manages the whole position.
+    """
+    from app.services.audit_service import log_event
+
+    ticket = await session.get(Ticket, ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if ticket.status != TicketStatus.FILLED.value:
+        raise HTTPException(400, detail="Can only pyramid into a filled position.")
+
+    # Blended cost: (old_shares × avg_entry + add_shares × add_price) / total
+    old_shares = ticket.position_size_shares
+    # Find existing entry fill for blended calc
+    fill_r = await session.execute(
+        select(Fill).join(Order).where(
+            Order.ticket_id == ticket_id, Order.intent == "entry"
+        ).order_by(Fill.occurred_at).limit(1)
+    )
+    existing_fill = fill_r.scalar_one_or_none()
+    old_price = existing_fill.price if existing_fill else ticket.trigger_price
+
+    blended_price = ((old_price * old_shares + body.add_price * body.add_shares)
+                     / (old_shares + body.add_shares))
+
+    new_total = old_shares + body.add_shares
+    ticket.position_size_shares = new_total
+    ticket.position_size_value  = (blended_price * new_total).quantize(Decimal("0.01"))
+
+    await log_event(
+        session,
+        actor="user",
+        event_type="pyramid_entry",
+        entity_type="ticket",
+        entity_id=ticket.id,
+        payload={
+            "symbol":         ticket.symbol,
+            "add_price":      str(body.add_price),
+            "add_shares":     body.add_shares,
+            "blended_price":  str(blended_price.quantize(Decimal("0.0001"))),
+            "new_total":      new_total,
+        },
+    )
+    await session.commit()
+    await session.refresh(ticket)
     return TicketOut.from_orm_obj(ticket)
 
 
@@ -374,7 +485,9 @@ class ExitPlanIn(BaseModel):
 
 class CloseIn(BaseModel):
     exit_price: Decimal = Field(gt=0)
-    exit_reason: str = Field(default="manual")  # manual | stop_hit | target_hit | time_stop
+    exit_reason: str = Field(default="manual")
+    close_reason_tag: str | None = None   # plan_target_hit | plan_stop_hit | panic_exit | etc.
+    close_notes: str | None = None        # free-text reflection
 
 
 @router.put("/{ticket_id}/exit-plan", response_model=TicketOut)
@@ -419,6 +532,11 @@ async def close(
             detail=f"Can only close a filled ticket (status is '{ticket.status}').",
         )
     await close_ticket(session, ticket, body.exit_price, body.exit_reason)
+    # Persist qualitative journal fields
+    if body.close_reason_tag:
+        ticket.close_reason_tag = body.close_reason_tag
+    if body.close_notes:
+        ticket.close_notes = body.close_notes.strip() or None
     await session.commit()
     await session.refresh(ticket)
     return TicketOut.from_orm_obj(ticket)

@@ -3,12 +3,38 @@ import { api, ApiError } from "@/lib/api";
 import { type JournalSummary } from "@/lib/screener";
 import { fmtMoney } from "@/lib/tickets";
 
+interface Insight {
+  category: string;
+  severity: string;
+  headline: string;
+  detail: string;
+  data: Record<string, unknown>;
+}
+
+const SEVERITY_STYLES: Record<string, string> = {
+  bad:  "border-destructive/40 bg-destructive/5",
+  warn: "border-amber-400/40 bg-amber-50/50 dark:bg-amber-950/20",
+  good: "border-emerald-400/40 bg-emerald-50/50 dark:bg-emerald-950/20",
+  info: "border-muted bg-muted/20",
+};
+
+const SEVERITY_DOT: Record<string, string> = {
+  bad:  "bg-destructive",
+  warn: "bg-amber-400",
+  good: "bg-emerald-500",
+  info: "bg-muted-foreground",
+};
+
 export default async function JournalPage() {
   let data: JournalSummary | null = null;
+  let insights: Insight[] = [];
   let error: string | null = null;
 
   try {
-    data = await api<JournalSummary>("/api/journal/summary");
+    [data, insights] = await Promise.all([
+      api<JournalSummary>("/api/journal/summary"),
+      api<Insight[]>("/api/journal/coach").catch(() => [] as Insight[]),
+    ]);
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
@@ -111,6 +137,32 @@ export default async function JournalPage() {
                     </tbody>
                   </table>
                 </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Behavioral coach */}
+          {insights.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Behavioral coach</CardTitle>
+                <CardDescription>Patterns found in your closed trades. Sorted by severity.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {insights.map((insight, i) => (
+                  <div
+                    key={i}
+                    className={`rounded-lg border p-3 ${SEVERITY_STYLES[insight.severity] ?? SEVERITY_STYLES.info}`}
+                  >
+                    <div className="flex items-start gap-2">
+                      <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${SEVERITY_DOT[insight.severity] ?? "bg-muted-foreground"}`} />
+                      <div>
+                        <p className="text-sm font-medium">{insight.headline}</p>
+                        <p className="text-muted-foreground mt-0.5 text-xs">{insight.detail}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </CardContent>
             </Card>
           )}

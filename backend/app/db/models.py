@@ -242,6 +242,8 @@ class Ticket(Base, TimestampMixin):
 
     thesis: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     notes: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    close_notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    close_reason_tag: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Exit ladder: [{price, shares, reason}] — partial exits at multiple levels
     exit_plan: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
