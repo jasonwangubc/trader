@@ -26,16 +26,23 @@ interface ChartData {
   base_start: string | null;
 }
 
+interface PriceLevel {
+  price: number;
+  label: string;
+  color: string;
+}
+
 interface StockChartProps {
   symbol: string;
   height?: number;
   mini?: boolean;          // compact sparkline mode — fewer overlays, no axes
   showPivot?: boolean;
   showSmas?: boolean;      // show 50/150 SMA in mini mode (default true)
+  levels?: PriceLevel[];  // optional horizontal price lines (stop, targets, etc.)
   className?: string;
 }
 
-export function StockChart({ symbol, height = 420, mini = false, showPivot = true, showSmas = true, className }: StockChartProps) {
+export function StockChart({ symbol, height = 420, mini = false, showPivot = true, showSmas = true, levels, className }: StockChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef     = useRef<IChartApi | null>(null);
   const [data, setData]       = useState<ChartData | null>(null);
@@ -165,6 +172,28 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
           pivotS.setData([
             { time: startTime as any, value: data.pivot },
             { time: endTime   as any, value: data.pivot },
+          ]);
+        }
+      }
+
+      // ── Custom price levels (stop, targets, etc.) ─────────────────────────
+      if (levels && levels.length > 0 && data.bars.length >= 2) {
+        const times = data.bars.map(b => b.time);
+        const t0 = times[Math.max(0, times.length - 65)] as any;
+        const t1 = times[times.length - 1] as any;
+        for (const level of levels) {
+          const ls = chart.addSeries(LineSeries, {
+            color: level.color,
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            title: level.label,
+            lastValueVisible: true,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          ls.setData([
+            { time: t0, value: level.price },
+            { time: t1, value: level.price },
           ]);
         }
       }

@@ -10,7 +10,8 @@
       "Bash(.venv/Scripts/python.exe -m pip install -e \".[dev]\")",
       "Bash(.venv/Scripts/python.exe -c \"from app.main import app; print\\('app:', app.title, app.version\\); from app.db import models; print\\('models OK; tables:', sorted\\(models.Base.metadata.tables.keys\\(\\)\\)\\)\")",
       "Bash(.venv/Scripts/python.exe -c \"import alembic.config; cfg = alembic.config.Config\\('alembic.ini'\\); print\\('script_location:', cfg.get_main_option\\('script_location'\\)\\)\")",
-      "Bash(docker info *)"
+      "Bash(docker info *)",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
     ]
   }
 }

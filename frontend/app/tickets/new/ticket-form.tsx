@@ -56,7 +56,6 @@ export function TicketForm({
     trigger_type: "price_above_with_volume",
     trigger_price: prefillTrigger ?? "",
     stop_price: prefillStop ?? "",
-    stop_price: "",
     target_price: "",
     time_stop_days: "21",
     valid_for_days: "7",

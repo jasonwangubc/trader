@@ -33,17 +33,35 @@ export default async function ChartPage({
   const { symbol } = await params;
   const sym = symbol.toUpperCase();
 
+  interface RecStop { price: number; distance_pct: number }
+  interface RecTarget { label: string; price: number; p_20d: number }
+  interface RecData { recommended_stop: RecStop | null; targets: RecTarget[]; entry_price: number }
+
   let chartData: ChartData | null = null;
   let score: ScoreResult | null = null;
+  let rec: RecData | null = null;
   let error: string | null = null;
 
   try {
-    [chartData, score] = await Promise.all([
+    [chartData, score, rec] = await Promise.all([
       api<ChartData>(`/api/chart/${sym}`),
       api<ScoreResult[]>("/api/screener/results").then(rs => rs.find(r => r.symbol === sym) ?? null).catch(() => null),
+      api<RecData>(`/api/chart/${sym}/recommendations`).catch(() => null),
     ]);
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
+  }
+
+  // Build chart overlays from recommendations
+  const chartLevels = [];
+  if (rec?.recommended_stop) {
+    chartLevels.push({ price: rec.recommended_stop.price, label: `Stop -${rec.recommended_stop.distance_pct.toFixed(1)}%`, color: "#ef4444" });
+  }
+  if (rec?.targets) {
+    const levelColors = ["#16a34a", "#22c55e", "#4ade80"];
+    rec.targets.forEach((t, i) => {
+      chartLevels.push({ price: t.price, label: `${t.label} ${Math.round(t.p_20d * 100)}%`, color: levelColors[i] ?? "#16a34a" });
+    });
   }
 
   const lastBar = chartData?.bars.at(-1);
@@ -77,11 +95,12 @@ export default async function ChartPage({
         </div>
         <div className="flex items-center gap-2">
           <Link
-            href={`/tickets/new?symbol=${sym}${chartData?.pivot ? `&trigger=${chartData.pivot}` : ""}`}
+            href={`/tickets/new?symbol=${sym}${chartData?.pivot ? `&trigger=${chartData.pivot}` : ""}${rec?.recommended_stop ? `&stop=${rec.recommended_stop.price}` : ""}`}
             className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
           >
             <TrendingUp className="h-3.5 w-3.5" />
             Arm ticket{chartData?.pivot ? ` @ $${chartData.pivot.toFixed(2)}` : ""}
+            {rec?.recommended_stop ? `, stop $${rec.recommended_stop.price.toFixed(2)}` : ""}
           </Link>
         </div>
       </header>
@@ -101,10 +120,24 @@ export default async function ChartPage({
         </div>
       )}
 
-      {/* Main chart */}
+      {/* Main chart with stop/target overlays */}
       <Card className="mb-4">
         <CardContent className="p-4">
-          <StockChart symbol={sym} height={480} showPivot className="w-full" />
+          <StockChart
+            symbol={sym}
+            height={480}
+            showPivot
+            levels={chartLevels.length > 0 ? chartLevels : undefined}
+            className="w-full"
+          />
+          {chartLevels.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-3 text-xs text-muted-foreground">
+              <span className="flex items-center gap-1"><span className="inline-block h-0.5 w-4 bg-red-500" />Stop</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-0.5 w-4 bg-emerald-600" />T1</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-0.5 w-4 bg-emerald-500" />T2</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-0.5 w-4 bg-emerald-400" />T3</span>
+            </div>
+          )}
         </CardContent>
       </Card>
 
