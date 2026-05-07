@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { StockChart } from "@/components/stock-chart";
 import { FundamentalsPanel } from "@/components/fundamentals-panel";
+import { RecommendationsPanel } from "@/components/recommendations-panel";
 import { api, ApiError } from "@/lib/api";
 
 interface ChartData {
@@ -104,6 +105,20 @@ export default async function ChartPage({
       <Card className="mb-4">
         <CardContent className="p-4">
           <StockChart symbol={sym} height={480} showPivot className="w-full" />
+        </CardContent>
+      </Card>
+
+      {/* Stop / target recommendations */}
+      <Card className="mb-4">
+        <CardHeader>
+          <CardTitle className="text-base">Stop &amp; target recommendations</CardTitle>
+          <CardDescription className="text-xs">
+            ATR-based and base-low stops · R-multiple targets · Monte Carlo probability estimates
+            (10 000 simulated price paths using {sym}&apos;s historical volatility)
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <RecommendationsPanel symbol={sym} />
         </CardContent>
       </Card>
 

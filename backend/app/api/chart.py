@@ -107,6 +107,61 @@ def _detect_pivot(df) -> tuple[float | None, str | None]:
     return round(pivot * 1.005, 2), base_start_date  # pivot = base high + 0.5% buffer
 
 
+class StopOptionOut(BaseModel):
+    method: str
+    price: float
+    distance_pct: float
+    description: str
+
+
+class TargetOut(BaseModel):
+    label: str
+    r_multiple: float
+    price: float
+    p_20d: float
+    p_40d: float
+
+
+class RecommendationsOut(BaseModel):
+    symbol: str
+    entry_price: float
+    stops: list[StopOptionOut]
+    recommended_stop: StopOptionOut | None
+    targets: list[TargetOut]
+    atr_14: float
+    base_low: float | None
+    annual_vol_pct: float
+    daily_drift: float
+    expected_value_20d: float
+
+
+@router.get("/{symbol}/recommendations", response_model=RecommendationsOut)
+async def recommendations(
+    symbol: str,
+    session: AsyncSession = Depends(get_session),
+) -> RecommendationsOut:
+    from app.services.recommendations_service import compute_recommendations
+    symbol = symbol.upper()
+    df = await get_bars_df(session, symbol, days=252)
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"No price data for {symbol}. Run a scan first.")
+    import asyncio
+    loop = asyncio.get_event_loop()
+    rec = await loop.run_in_executor(None, compute_recommendations, df, symbol)
+    return RecommendationsOut(
+        symbol=rec.symbol,
+        entry_price=rec.entry_price,
+        stops=[StopOptionOut(**s.__dict__) for s in rec.stops],
+        recommended_stop=StopOptionOut(**rec.recommended_stop.__dict__) if rec.recommended_stop else None,
+        targets=[TargetOut(**t.__dict__) for t in rec.targets],
+        atr_14=rec.atr_14,
+        base_low=rec.base_low,
+        annual_vol_pct=rec.annual_vol_pct,
+        daily_drift=rec.daily_drift,
+        expected_value_20d=rec.expected_value_20d,
+    )
+
+
 @router.get("/{symbol}", response_model=ChartData)
 async def chart(
     symbol: str,
