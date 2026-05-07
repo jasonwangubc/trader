@@ -12,20 +12,25 @@ from app.config import get_settings
 async def lifespan(_: FastAPI):
     from app.brokers.registry import get_broker
     from app.services.monitor_service import MonitorService
+    from app.services.nightly_service import run_nightly_loop, startup_stale_check
 
     broker = get_broker()
     svc = MonitorService(broker)
     monitor.set_monitor(svc)
-    task = asyncio.create_task(svc.run())
+
+    monitor_task  = asyncio.create_task(svc.run())
+    nightly_task  = asyncio.create_task(run_nightly_loop())
+    startup_task  = asyncio.create_task(startup_stale_check())
 
     yield
 
     await svc.stop()
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for task in (monitor_task, nightly_task, startup_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_app() -> FastAPI:

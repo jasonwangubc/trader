@@ -20,6 +20,7 @@ interface PriceCoverage {
   symbols_with_recent_bars: number;
   pct_covered: number;
   latest_bar_date: string | null;
+  is_stale: boolean;
   missing_symbols: string[];
 }
 
@@ -175,7 +176,7 @@ function HealthDashboard({ health, syncRunning }: { health: ScreenerHealth; sync
   const lastRun = scores.last_run_at ? new Date(scores.last_run_at) : null;
   const latestBar = price.latest_bar_date ? new Date(price.latest_bar_date + "T00:00:00") : null;
 
-  const priceStale = latestBar ? (Date.now() - latestBar.getTime()) > 3 * 86_400_000 : true;
+  const priceStale = health?.price.is_stale ?? true;
   const scoresStale = lastRun ? (Date.now() - lastRun.getTime()) > 3 * 86_400_000 : true;
 
   return (
@@ -189,8 +190,14 @@ function HealthDashboard({ health, syncRunning }: { health: ScreenerHealth; sync
           good={price.symbols_with_recent_bars}
           total={universe_total}
           detail={latestBar ? `Last close: ${latestBar.toLocaleDateString("en-CA")}` : "No data yet"}
-          stale={priceStale}
-          staleness={latestBar ? `Last bar ${daysSince(latestBar)} ago` : undefined}
+          stale={price.is_stale}
+          staleness={
+            price.is_stale
+              ? latestBar
+                ? `Data is ${daysSince(latestBar)} old — auto-refresh runs at 5:30 PM ET weekdays`
+                : "No data yet"
+              : undefined
+          }
         />
 
         {/* Fundamentals */}

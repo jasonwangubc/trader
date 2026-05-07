@@ -164,6 +164,7 @@ class PriceCoverage(BaseModel):
     symbols_with_recent_bars: int    # bar in last 10 days
     pct_covered: float
     latest_bar_date: str | None      # "YYYY-MM-DD"
+    is_stale: bool                   # True if latest bar is before last trading day
     missing_symbols: list[str]       # watchlist symbols with no recent bars
 
 
@@ -255,13 +256,17 @@ async def screener_health(session: AsyncSession = Depends(get_session)) -> Scree
     price_pct = round(len(recent_syms) / max(universe_total, 1) * 100, 1)
     fund_pct = round(fund_total / max(scored_total, 1) * 100, 1)
 
+    from app.services.nightly_service import _is_stale as _price_stale
+    latest_date = latest_bar.date() if latest_bar and hasattr(latest_bar, "date") else latest_bar
+
     return ScreenerHealth(
         universe_total=universe_total,
         price=PriceCoverage(
             symbols_total=universe_total,
             symbols_with_recent_bars=len(recent_syms),
             pct_covered=price_pct,
-            latest_bar_date=str(latest_bar) if latest_bar else None,
+            latest_bar_date=str(latest_bar)[:10] if latest_bar else None,
+            is_stale=_price_stale(latest_date) if latest_date else True,
             missing_symbols=missing_price[:30],
         ),
         fundamentals=FundamentalCoverage(
