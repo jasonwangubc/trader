@@ -56,6 +56,7 @@ async def preview_ticket(
 async def create_ticket(
     session: AsyncSession,
     *,
+    user_id: str = "user_default",
     account_id: uuid.UUID,
     symbol: str,
     currency: str,
@@ -96,6 +97,7 @@ async def create_ticket(
 
     now = datetime.now(timezone.utc)
     ticket = Ticket(
+        user_id=user_id,
         account_id=account_id,
         symbol=symbol.upper().strip(),
         currency=currency,

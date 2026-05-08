@@ -3,6 +3,9 @@ import { api, ApiError } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { QuestradConnect } from "./questrade-connect";
 
+// Never cache — must always reflect the live connection status.
+export const dynamic = "force-dynamic";
+
 export const metadata = { title: "Settings" };
 
 interface ConnectionStatus { connected: boolean; message: string }

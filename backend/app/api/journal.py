@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from app.db.models import Account, Fill, Order, OrderIntent, Ticket, TicketStatus
 from app.db.session import get_session
+from app.api.auth import get_user_id
 from app.services.accounts_service import get_household_equity
 from app.services.coach_service import Insight, compute_insights
 
@@ -49,16 +50,22 @@ class OpenRiskSummary(BaseModel):
 
 
 @router.get("/risk", response_model=OpenRiskSummary)
-async def open_risk(session: AsyncSession = Depends(get_session)) -> OpenRiskSummary:
-    """Aggregate current open risk across all filled (active) tickets."""
+async def open_risk(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> OpenRiskSummary:
+    """Aggregate current open risk across all filled (active) tickets for this user."""
     MAX_RISK_PCT = Decimal("0.08")
 
     filled_result = await session.execute(
-        select(Ticket).where(Ticket.status == TicketStatus.FILLED.value)
+        select(Ticket).where(
+            Ticket.status == TicketStatus.FILLED.value,
+            Ticket.user_id == user_id,
+        )
     )
     filled_tickets = filled_result.scalars().all()
 
-    equity = await get_household_equity(session)
+    equity = await get_household_equity(session, user_id=user_id)
     total_usd = equity.get("USD", Decimal(0))
     total_cad = equity.get("CAD", Decimal(0))
 
@@ -168,11 +175,15 @@ class JournalSummary(BaseModel):
 
 
 @router.get("/summary", response_model=JournalSummary)
-async def summary(session: AsyncSession = Depends(get_session)) -> JournalSummary:
+async def summary(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> JournalSummary:
     result = await session.execute(
         select(Ticket).where(
             Ticket.outcome.isnot(None),
             Ticket.r_multiple.isnot(None),
+            Ticket.user_id == user_id,
         ).order_by(Ticket.closed_at.asc().nullslast())
     )
     tickets = result.scalars().all()
@@ -286,11 +297,14 @@ async def summary(session: AsyncSession = Depends(get_session)) -> JournalSummar
 # ── Behavioral coach ─────────────────────────────────────────────────────────
 
 @router.get("/export.csv")
-async def export_csv(session: AsyncSession = Depends(get_session)) -> StreamingResponse:
-    """Download all closed trades as a CSV file."""
+async def export_csv(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> StreamingResponse:
+    """Download this user's closed trades as a CSV file."""
     result = await session.execute(
         select(Ticket)
-        .where(Ticket.outcome.isnot(None))
+        .where(Ticket.outcome.isnot(None), Ticket.user_id == user_id)
         .order_by(Ticket.closed_at.asc().nullslast())
     )
     tickets = result.scalars().all()
@@ -336,9 +350,12 @@ class InsightOut(BaseModel):
 
 
 @router.get("/coach", response_model=list[InsightOut])
-async def coach(session: AsyncSession = Depends(get_session)) -> list[InsightOut]:
+async def coach(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> list[InsightOut]:
     """Return behavioral insights based on your closed trade history."""
-    insights = await compute_insights(session)
+    insights = await compute_insights(session, user_id=user_id)
     return [InsightOut(
         category=i.category,
         severity=i.severity,

@@ -29,12 +29,20 @@ async def questrade_status(
 ) -> ConnectionStatus:
     """Check if Questrade is connected for this user."""
     token_key = f"{user_id}:questrade_refresh_token" if user_id != "user_default" else "questrade_refresh_token"
-    token = await get_setting(session, token_key)
-    has_env_token = bool(__import__("app.config", fromlist=["get_settings"]).get_settings().questrade_refresh_token)
-    connected = bool(token or has_env_token)
+    db_token = await get_setting(session, token_key)
+
+    if user_id == "user_default":
+        # Single-user dev mode: also accept the .env bootstrap token as a fallback
+        from app.config import get_settings
+        connected = bool(db_token or get_settings().questrade_refresh_token)
+    else:
+        # Real Clerk user: only connected if they saved a token via the Settings page.
+        # The global .env token belongs to the machine owner, not to this user.
+        connected = bool(db_token)
+
     return ConnectionStatus(
         connected=connected,
-        message="Connected" if connected else "Not connected — add your Questrade token below",
+        message="Connected" if connected else "Not connected — paste your Questrade token below",
     )
 
 

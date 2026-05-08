@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import DailyBar, ScreenerScore, ScreenerSymbol
 from app.db.session import get_session
+from app.api.auth import get_user_id
 from app.services.screener_service import PipelineStats, get_screener_results, run_screener
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
@@ -36,9 +37,15 @@ class SymbolOut(BaseModel):
 
 
 @router.get("/watchlist", response_model=list[SymbolOut])
-async def list_watchlist(session: AsyncSession = Depends(get_session)) -> list[SymbolOut]:
+async def list_watchlist(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> list[SymbolOut]:
     result = await session.execute(
-        select(ScreenerSymbol).where(ScreenerSymbol.is_active == True).order_by(ScreenerSymbol.symbol)  # noqa: E712
+        select(ScreenerSymbol).where(
+            ScreenerSymbol.is_active == True,  # noqa: E712
+            ScreenerSymbol.user_id == user_id,
+        ).order_by(ScreenerSymbol.symbol)
     )
     return [_sym_out(s) for s in result.scalars().all()]
 
@@ -47,17 +54,21 @@ async def list_watchlist(session: AsyncSession = Depends(get_session)) -> list[S
 async def add_symbol(
     body: SymbolIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> SymbolOut:
     sym = body.symbol.strip().upper()
     existing = await session.execute(
-        select(ScreenerSymbol).where(ScreenerSymbol.symbol == sym)
+        select(ScreenerSymbol).where(
+            ScreenerSymbol.symbol == sym,
+            ScreenerSymbol.user_id == user_id,
+        )
     )
     row = existing.scalar_one_or_none()
     if row:
         row.is_active = True
         row.notes = body.notes or row.notes
     else:
-        row = ScreenerSymbol(symbol=sym, notes=body.notes)
+        row = ScreenerSymbol(symbol=sym, notes=body.notes, user_id=user_id)
         session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -68,9 +79,13 @@ async def add_symbol(
 async def remove_symbol(
     symbol: str,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> None:
     result = await session.execute(
-        select(ScreenerSymbol).where(ScreenerSymbol.symbol == symbol.upper())
+        select(ScreenerSymbol).where(
+            ScreenerSymbol.symbol == symbol.upper(),
+            ScreenerSymbol.user_id == user_id,
+        )
     )
     row = result.scalar_one_or_none()
     if row:

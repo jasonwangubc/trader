@@ -19,8 +19,11 @@ async function proxy(req: NextRequest, params: { path: string[] }) {
   // In development without Clerk configured, fall back to the default user
   const effectiveUserId = userId ?? USER_DEFAULT;
 
+  // params.path already contains the full path from the URL
+  // e.g. URL /api/backend/api/screener/results → path = "api/screener/results"
+  // so we just join directly — no extra /api/ prefix needed
   const path = params.path.join("/");
-  const targetUrl = `${BACKEND}/api/${path}${req.nextUrl.search}`;
+  const targetUrl = `${BACKEND}/${path}${req.nextUrl.search}`;
 
   const headers = new Headers(req.headers);
   headers.set("X-User-Id", effectiveUserId);

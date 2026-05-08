@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Account, OptionStatus, OptionStrategy, OptionTicket
 from app.db.session import get_session
+from app.api.auth import get_user_id
 from app.services.audit_service import log_event
 
 router = APIRouter(prefix="/api/options", tags=["options"])
@@ -87,8 +88,9 @@ def _to_out(t: OptionTicket) -> OptionTicketOut:
 async def list_options(
     status: str | None = None,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> list[OptionTicketOut]:
-    q = select(OptionTicket).order_by(OptionTicket.created_at.desc())
+    q = select(OptionTicket).where(OptionTicket.user_id == user_id).order_by(OptionTicket.created_at.desc())
     if status:
         q = q.where(OptionTicket.status == status)
     result = await session.execute(q)
@@ -99,6 +101,7 @@ async def list_options(
 async def create_option(
     body: OptionTicketIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> OptionTicketOut:
     if body.strategy not in {s.value for s in OptionStrategy}:
         raise HTTPException(400, f"Invalid strategy: {body.strategy}")
@@ -117,6 +120,7 @@ async def create_option(
     break_even = body.strike_price - body.premium_received
 
     t = OptionTicket(
+        user_id=user_id,
         account_id=body.account_id,
         underlying_symbol=body.underlying_symbol.upper().strip(),
         currency=body.currency,
@@ -161,9 +165,10 @@ async def close_option(
     ticket_id: uuid.UUID,
     body: CloseOptionIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> OptionTicketOut:
     t = await session.get(OptionTicket, ticket_id)
-    if t is None:
+    if t is None or t.user_id != user_id:
         raise HTTPException(404, "Option ticket not found")
     if t.status != OptionStatus.OPEN.value:
         raise HTTPException(400, f"Cannot close ticket in status '{t.status}'")

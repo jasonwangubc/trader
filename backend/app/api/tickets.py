@@ -22,6 +22,7 @@ from app.db.models import (
     TriggerType,
 )
 from app.db.session import get_session
+from app.api.auth import get_user_id
 from app.services.guardrail_service import GuardrailViolation, check_all
 from app.services.order_service import close_ticket
 from app.services.regime_service import get_regime
@@ -259,6 +260,7 @@ async def preview(
 async def create(
     body: TicketIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketOut:
     # Validate enums
     if body.currency not in {c.value for c in Currency}:
@@ -288,6 +290,7 @@ async def create(
     try:
         ticket = await create_ticket(
             session,
+            user_id=user_id,
             account_id=body.account_id,
             symbol=body.symbol,
             currency=body.currency,
@@ -308,12 +311,31 @@ async def create(
     return TicketOut.from_orm_obj(ticket)
 
 
+async def _get_ticket_for_user(
+    session: AsyncSession, ticket_id: uuid.UUID, user_id: str
+) -> Ticket:
+    """Load a ticket and verify it belongs to the current user. Raises 404/403."""
+    t = await session.get(Ticket, ticket_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if t.user_id != user_id:
+        # Return 404 to avoid leaking that the ticket exists at all
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return t
+
+
 @router.get("", response_model=list[TicketOut])
 async def list_tickets(
     status: str | None = None,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> list[TicketOut]:
-    stmt = select(Ticket).order_by(Ticket.created_at.desc()).limit(200)
+    stmt = (
+        select(Ticket)
+        .where(Ticket.user_id == user_id)
+        .order_by(Ticket.created_at.desc())
+        .limit(200)
+    )
     if status:
         stmt = stmt.where(Ticket.status == status)
     result = await session.execute(stmt)
@@ -324,8 +346,9 @@ async def list_tickets(
 async def get_ticket(
     ticket_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketDetailOut:
-    t = await session.get(Ticket, ticket_id)
+    t = await _get_ticket_for_user(session, ticket_id, user_id)
     if t is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -405,7 +428,9 @@ async def get_ticket(
 async def cancel(
     ticket_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketOut:
+    await _get_ticket_for_user(session, ticket_id, user_id)  # ownership check
     try:
         ticket = await cancel_ticket(session, ticket_id)
     except TicketValidationError as exc:
@@ -423,6 +448,7 @@ async def add_pyramid_entry(
     ticket_id: uuid.UUID,
     body: PyramidIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketOut:
     """Record an add-on (pyramid) entry on a filled ticket.
     Updates position_size_shares and recomputes blended cost basis.
@@ -430,9 +456,7 @@ async def add_pyramid_entry(
     """
     from app.services.audit_service import log_event
 
-    ticket = await session.get(Ticket, ticket_id)
-    if ticket is None:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    ticket = await _get_ticket_for_user(session, ticket_id, user_id)
     if ticket.status != TicketStatus.FILLED.value:
         raise HTTPException(400, detail="Can only pyramid into a filled position.")
 
@@ -495,11 +519,10 @@ async def set_exit_plan(
     ticket_id: uuid.UUID,
     body: ExitPlanIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketOut:
     """Set or replace the staged exit plan for a filled ticket."""
-    ticket = await session.get(Ticket, ticket_id)
-    if ticket is None:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    ticket = await _get_ticket_for_user(session, ticket_id, user_id)
     if ticket.status not in (TicketStatus.FILLED.value, TicketStatus.TRIGGERED.value):
         raise HTTPException(
             status_code=400,
@@ -521,11 +544,10 @@ async def close(
     ticket_id: uuid.UUID,
     body: CloseIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketOut:
     """Manually record an exit for a filled ticket. Updates streak immediately."""
-    ticket = await session.get(Ticket, ticket_id)
-    if ticket is None:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+    ticket = await _get_ticket_for_user(session, ticket_id, user_id)
     if ticket.status != TicketStatus.FILLED.value:
         raise HTTPException(
             status_code=400,

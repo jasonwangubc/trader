@@ -41,14 +41,21 @@ def is_cash_equivalent(symbol: str) -> bool:
     return symbol.upper() in CASH_EQUIVALENT_SYMBOLS
 
 
-async def sync_positions(session: AsyncSession, broker: BrokerInterface) -> list[Position]:
-    """Pull positions for every active account and upsert into DB.
+async def sync_positions(
+    session: AsyncSession,
+    broker: BrokerInterface,
+    user_id: str = "user_default",
+) -> list[Position]:
+    """Pull positions for every active account of this user and upsert into DB.
 
     Stale rows (positions that no longer exist at the broker) are deleted so
     the cached view matches reality.
     """
     accounts_result = await session.execute(
-        select(Account).where(Account.is_active == True)  # noqa: E712
+        select(Account).where(
+            Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
+        )
     )
     accounts = accounts_result.scalars().all()
 
@@ -103,32 +110,36 @@ async def sync_positions(session: AsyncSession, broker: BrokerInterface) -> list
     return all_positions
 
 
-async def list_positions(session: AsyncSession) -> list[Position]:
+async def list_positions(
+    session: AsyncSession,
+    user_id: str = "user_default",
+) -> list[Position]:
     result = await session.execute(
         select(Position)
         .join(Account)
-        .where(Account.is_active == True)  # noqa: E712
+        .where(
+            Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
+        )
         .order_by(Position.symbol)
     )
     return list(result.scalars().all())
 
 
 async def buying_power_breakdown(
-    session: AsyncSession, *, currency: str
+    session: AsyncSession,
+    *,
+    currency: str,
+    user_id: str = "user_default",
 ) -> dict[str, Decimal]:
-    """Return {cash, cash_equivalents, freeable_total} aggregated across accounts
-    for the given currency.
-
-    - cash: sum of AccountBalance.cash for the currency
-    - cash_equivalents: sum of market_value of positions flagged is_cash_equivalent
-    - freeable_total: cash + cash_equivalents (what could be deployed by EOD)
-    """
+    """Return {cash, cash_equivalents, freeable_total} for this user's accounts."""
     bal_result = await session.execute(
         select(AccountBalance)
         .join(Account)
         .where(
             AccountBalance.currency == currency,
             Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
         )
     )
     cash = sum(
@@ -142,6 +153,7 @@ async def buying_power_breakdown(
         .where(
             Position.currency == currency,
             Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
         )
     )
     cash_equiv = Decimal(0)

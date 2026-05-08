@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.brokers.registry import get_broker
 from app.db.session import get_session
+from app.api.auth import get_user_id
 from app.services.positions_service import (
     buying_power_breakdown,
     is_cash_equivalent,
@@ -68,10 +69,10 @@ def _to_out(p) -> PositionOut:
     )
 
 
-async def _buying_power(session: AsyncSession) -> list[BuyingPowerOut]:
+async def _buying_power(session: AsyncSession, user_id: str = "user_default") -> list[BuyingPowerOut]:
     out: list[BuyingPowerOut] = []
     for currency in ("CAD", "USD"):
-        bp = await buying_power_breakdown(session, currency=currency)
+        bp = await buying_power_breakdown(session, currency=currency, user_id=user_id)
         out.append(
             BuyingPowerOut(
                 currency=currency,
@@ -84,9 +85,12 @@ async def _buying_power(session: AsyncSession) -> list[BuyingPowerOut]:
 
 
 @router.get("", response_model=PositionsOut)
-async def list_all(session: AsyncSession = Depends(get_session)) -> PositionsOut:
-    positions = await list_positions(session)
-    buying_power = await _buying_power(session)
+async def list_all(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> PositionsOut:
+    positions = await list_positions(session, user_id=user_id)
+    buying_power = await _buying_power(session, user_id=user_id)
     return PositionsOut(
         positions=[_to_out(p) for p in positions],
         buying_power=buying_power,
@@ -94,15 +98,18 @@ async def list_all(session: AsyncSession = Depends(get_session)) -> PositionsOut
 
 
 @router.post("/sync", response_model=PositionsOut)
-async def sync(session: AsyncSession = Depends(get_session)) -> PositionsOut:
-    broker = get_broker()
+async def sync(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> PositionsOut:
+    broker = get_broker(user_id=user_id)
     qt_broker = getattr(broker, "_quote_source", broker)
     try:
-        await sync_positions(session, qt_broker)
+        await sync_positions(session, qt_broker, user_id=user_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    positions = await list_positions(session)
-    buying_power = await _buying_power(session)
+    positions = await list_positions(session, user_id=user_id)
+    buying_power = await _buying_power(session, user_id=user_id)
     return PositionsOut(
         positions=[_to_out(p) for p in positions],
         buying_power=buying_power,

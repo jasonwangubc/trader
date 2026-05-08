@@ -209,7 +209,11 @@ class QuestradeBroker(BrokerInterface):
         except Exception:
             pass  # DB not ready yet (e.g. first boot before migration)
 
-        return env_token
+        # Only fall back to the .env token for the default (single-user dev) user.
+        # Real Clerk users must connect via Settings — the global env token is not theirs.
+        if self._user_id == "user_default":
+            return env_token
+        return None
 
     async def _persist_token(self, refresh_token: str, api_server: str) -> None:
         """Write updated token + api_server back to the settings table (per user)."""
@@ -322,21 +326,32 @@ class QuestradeBroker(BrokerInterface):
             )
         return results
 
+    @staticmethod
+    def _dec(value, default=0) -> Decimal:
+        """Safely convert a Questrade numeric field to Decimal.
+        Questrade sometimes returns None for fields like averageEntryPrice
+        on positions with no cost basis (e.g. options, fractional shares).
+        """
+        v = value if value is not None else default
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return Decimal(str(default))
+
     async def get_positions(self, account_id: str) -> list[BrokerPosition]:
         data = await self._get(f"v1/accounts/{account_id}/positions")
         return [
             BrokerPosition(
                 account_id=account_id,
                 symbol=p["symbol"],
-                # Questrade omits currency from position rows; infer from symbol.
                 currency=p.get("currency") or _infer_currency(p["symbol"]),
-                quantity=Decimal(str(p.get("openQuantity", 0))),
-                avg_cost=Decimal(str(p.get("averageEntryPrice", 0))),
-                current_price=Decimal(str(p["currentPrice"]))
+                quantity=self._dec(p.get("openQuantity")),
+                avg_cost=self._dec(p.get("averageEntryPrice")),
+                current_price=self._dec(p["currentPrice"])
                 if p.get("currentPrice") is not None
                 else None,
-                market_value=Decimal(str(p.get("currentMarketValue", 0))),
-                open_pnl=Decimal(str(p.get("openPnl", 0))),
+                market_value=self._dec(p.get("currentMarketValue")),
+                open_pnl=self._dec(p.get("openPnl")),
             )
             for p in data.get("positions", [])
         ]

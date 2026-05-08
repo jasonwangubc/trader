@@ -50,12 +50,16 @@ class Insight:
     data: dict = field(default_factory=dict)
 
 
-async def compute_insights(session: AsyncSession) -> list[Insight]:
-    """Compute all behavioral insights for closed tickets."""
+async def compute_insights(
+    session: AsyncSession,
+    user_id: str = "user_default",
+) -> list[Insight]:
+    """Compute all behavioral insights for closed tickets of this user."""
     result = await session.execute(
         select(Ticket).where(
             Ticket.outcome.isnot(None),
             Ticket.r_multiple.isnot(None),
+            Ticket.user_id == user_id,
         ).order_by(Ticket.closed_at.asc().nullslast())
     )
     tickets = result.scalars().all()
