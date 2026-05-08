@@ -4,6 +4,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api } from "@/lib/api";
 import { type Ticket, fmtMoney, fmtPct } from "@/lib/tickets";
 
+export const metadata = { title: 'Tickets' };
+
+
 const STATUS_VARIANTS: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
   armed:       "default",
   triggered:   "default",

@@ -6,6 +6,9 @@ import { api, ApiError } from "@/lib/api";
 import { StockChart } from "@/components/stock-chart";
 import { WatchlistAdd } from "./watchlist-add";
 
+export const metadata = { title: 'Watchlist' };
+
+
 /**
  * Watchlist — intermediate state between "in screener universe" and "armed ticket".
  * Symbols you're tracking closely but haven't pre-committed to yet.

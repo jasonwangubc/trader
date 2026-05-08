@@ -5,6 +5,9 @@ import { api, ApiError } from "@/lib/api";
 import { fmtMoney } from "@/lib/tickets";
 import { NewOptionForm } from "./new-option-form";
 
+export const metadata = { title: 'Options' };
+
+
 interface OptionTicket {
   id: string;
   account_id: string;

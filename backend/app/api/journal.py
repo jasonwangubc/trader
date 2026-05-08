@@ -8,6 +8,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import csv
+import io
+
+from fastapi.responses import StreamingResponse
+
 from app.db.models import Account, Fill, Order, OrderIntent, Ticket, TicketStatus
 from app.db.session import get_session
 from app.services.accounts_service import get_household_equity
@@ -279,6 +284,48 @@ async def summary(session: AsyncSession = Depends(get_session)) -> JournalSummar
 
 
 # ── Behavioral coach ─────────────────────────────────────────────────────────
+
+@router.get("/export.csv")
+async def export_csv(session: AsyncSession = Depends(get_session)) -> StreamingResponse:
+    """Download all closed trades as a CSV file."""
+    result = await session.execute(
+        select(Ticket)
+        .where(Ticket.outcome.isnot(None))
+        .order_by(Ticket.closed_at.asc().nullslast())
+    )
+    tickets = result.scalars().all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "symbol", "setup_type", "currency", "outcome", "r_multiple",
+        "realized_pnl", "trigger_price", "stop_price", "target_price",
+        "position_size_shares", "risk_pct", "risk_amount",
+        "armed_at", "filled_at", "closed_at", "close_reason_tag", "thesis",
+    ])
+    for t in tickets:
+        writer.writerow([
+            t.symbol, t.setup_type, t.currency, t.outcome,
+            float(t.r_multiple) if t.r_multiple else "",
+            float(t.realized_pnl) if t.realized_pnl else "",
+            float(t.trigger_price), float(t.stop_price),
+            float(t.target_price) if t.target_price else "",
+            t.position_size_shares,
+            float(t.risk_pct), float(t.risk_amount),
+            t.armed_at.isoformat() if t.armed_at else "",
+            t.filled_at.isoformat() if t.filled_at else "",
+            t.closed_at.isoformat() if t.closed_at else "",
+            t.close_reason_tag or "",
+            (t.thesis or "").replace("\n", " "),
+        ])
+
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=trade-journal.csv"},
+    )
+
 
 class InsightOut(BaseModel):
     category: str

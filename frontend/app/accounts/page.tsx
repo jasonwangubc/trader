@@ -4,6 +4,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api, ApiError } from "@/lib/api";
 import { LiveToggle } from "./live-toggle";
 
+export const metadata = { title: 'Accounts' };
+
+
 interface Balance {
   currency: string;
   cash: string;

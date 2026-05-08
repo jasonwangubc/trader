@@ -3,6 +3,9 @@ import { api, ApiError } from "@/lib/api";
 import { type JournalSummary } from "@/lib/screener";
 import { fmtMoney } from "@/lib/tickets";
 
+export const metadata = { title: 'Journal' };
+
+
 interface Insight {
   category: string;
   severity: string;
@@ -41,11 +44,20 @@ export default async function JournalPage() {
 
   return (
     <main className="container mx-auto max-w-5xl p-6 sm:p-10">
-      <header className="mb-8">
-        <h1 className="text-3xl font-semibold tracking-tight">Journal</h1>
-        <p className="text-muted-foreground mt-1 text-sm">
-          Closed trade performance — win rate, expectancy, equity curve.
-        </p>
+      <header className="mb-8 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-3xl font-semibold tracking-tight">Journal</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Closed trade performance — win rate, expectancy, equity curve.
+          </p>
+        </div>
+        <a
+          href={`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8002"}/api/journal/export.csv`}
+          className="border-input hover:bg-muted inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm font-medium"
+          download
+        >
+          ↓ Export CSV
+        </a>
       </header>
 
       {error && (

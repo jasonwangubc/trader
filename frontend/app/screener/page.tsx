@@ -13,6 +13,9 @@ import {
 import { StockChart } from "@/components/stock-chart";
 import { WatchlistManager } from "./watchlist-manager";
 
+export const metadata = { title: 'Screener' };
+
+
 // ---- Types ----
 
 interface PriceCoverage {

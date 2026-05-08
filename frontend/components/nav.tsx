@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { useTheme } from "next-themes";
 import {
   LayoutDashboard,
   FileText,
@@ -15,10 +16,13 @@ import {
   LineChart,
   Eye,
   FlaskConical,
+  Sun,
+  Moon,
   Menu,
   X,
 } from "lucide-react";
 import { API_URL } from "@/lib/api";
+import { SymbolSearch } from "@/components/symbol-search";
 
 const NAV = [
   { href: "/",           label: "Dashboard",  Icon: LayoutDashboard },
@@ -38,6 +42,7 @@ type RegimeStatus  = { regime: string; spy_price: number | null; spy_ma200: numb
 
 export function Sidebar() {
   const pathname = usePathname();
+  const { theme, setTheme } = useTheme();
   const [open, setOpen] = useState(false);
   const [monitor, setMonitor] = useState<MonitorStatus | null>(null);
   const [regime, setRegime] = useState<RegimeStatus | null>(null);
@@ -67,10 +72,13 @@ export function Sidebar() {
   const content = (
     <nav className="flex h-full flex-col">
       {/* Logo */}
-      <div className="flex items-center gap-2 px-4 py-5">
+      <div className="flex items-center gap-2 px-4 py-4">
         <Shield className="text-primary h-5 w-5" />
         <span className="text-lg font-semibold tracking-tight">trader</span>
       </div>
+
+      {/* Symbol search */}
+      <SymbolSearch />
 
       {/* Links */}
       <div className="flex-1 space-y-0.5 px-2">
@@ -101,6 +109,18 @@ export function Sidebar() {
 
       {/* Bottom section */}
       <div className="border-t px-3 py-4 space-y-3">
+        {/* Dark mode toggle */}
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-muted-foreground">Theme</span>
+          <button
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            className="text-muted-foreground hover:text-foreground rounded p-1 hover:bg-muted transition-colors"
+            title="Toggle dark/light mode"
+          >
+            {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+          </button>
+        </div>
+
         {/* Regime */}
         {regime && (
           <div className="flex items-center justify-between text-xs">

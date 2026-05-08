@@ -6,6 +6,9 @@ import { api, ApiError } from "@/lib/api";
 import { type BuyingPower, type Position, type PositionsData } from "@/lib/positions";
 import { type Account, type HouseholdData, fmtMoney } from "@/lib/tickets";
 
+export const metadata = { title: 'Positions' };
+
+
 export default async function PositionsPage() {
   let data: PositionsData | null = null;
   let accounts: Account[] = [];

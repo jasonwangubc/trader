@@ -6,6 +6,9 @@ import { api, ApiError } from "@/lib/api";
 import { fmtMoney, fmtPct } from "@/lib/tickets";
 import Link from "next/link";
 
+export const metadata = { title: 'Daily Routine' };
+
+
 interface Regime {
   regime: string;
   spy_price: number | null;
