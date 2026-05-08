@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_from: str | None = None
 
+    # SEC EDGAR API user-agent (required by SEC; must include contact email)
+    # Format: "AppName/version contact@example.com"
+    edgar_user_agent: str = "trader-screener/1.0 contact@example.com"
+
 
 @lru_cache
 def get_settings() -> Settings:

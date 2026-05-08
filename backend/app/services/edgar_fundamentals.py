@@ -27,7 +27,13 @@ import httpx
 log = logging.getLogger(__name__)
 
 EDGAR_BASE = "https://data.sec.gov/api/xbrl/companyfacts"
-USER_AGENT = "trader-screener/1.0 contact@example.com"
+def _user_agent() -> str:
+    from app.config import get_settings
+    return get_settings().edgar_user_agent
+
+
+def _get_user_agent() -> str:
+    return _user_agent()
 REQUEST_DELAY = 0.12   # 8 requests/sec — SEC asks for ≤ 10/sec
 
 _REVENUE_TAGS = [
@@ -148,7 +154,7 @@ async def fetch_fundamentals(cik: str, symbol: str) -> FundamentalSnapshot:
     try:
         async with httpx.AsyncClient(
             timeout=20.0,
-            headers={"User-Agent": USER_AGENT},
+            headers={"User-Agent": _user_agent()},
             follow_redirects=True,
         ) as client:
             r = await client.get(url)

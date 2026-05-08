@@ -34,6 +34,10 @@ secrets/
 .DS_Store
 Thumbs.db
 
+# Claude Code — machine-specific settings (may contain local paths)
+.claude/settings.local.json
+.claude/projects/
+
 # Logs / runtime
 *.log
 logs/

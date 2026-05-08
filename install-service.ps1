@@ -1,17 +1,21 @@
 # Install trader backend as a Windows Task Scheduler job.
-# Run this once as Administrator.
-# The task starts the backend automatically when you log in.
+# Run this ONCE as Administrator from the repo root.
+# The task auto-starts the backend whenever you log in.
 
-$taskName    = "TraderBackend"
-$pythonExe   = "C:\Users\wyc_j\dev\trader\backend\.venv\Scripts\python.exe"
+# Detect repo root dynamically (the directory this script lives in)
+$repoRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$pythonExe   = Join-Path $repoRoot "backend\.venv\Scripts\python.exe"
 $args        = "-m uvicorn app.main:app --host 127.0.0.1 --port 8002 --workers 1"
-$workDir     = "C:\Users\wyc_j\dev\trader\backend"
-$logFile     = "C:\Users\wyc_j\dev\trader\backend-service.log"
+$workDir     = Join-Path $repoRoot "backend"
+$taskName    = "TraderBackend"
 
-$action  = New-ScheduledTaskAction -Execute $pythonExe -Argument $args -WorkingDirectory $workDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn
+if (-not (Test-Path $pythonExe)) {
+    Write-Error "Python venv not found at $pythonExe. Run: cd backend && python -m venv .venv && .venv\Scripts\pip install -e '.[dev]'"
+    exit 1
+}
 
-# Start minimised, no window
+$action   = New-ScheduledTaskAction -Execute $pythonExe -Argument $args -WorkingDirectory $workDir
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
     -RestartCount 3 `
@@ -26,7 +30,12 @@ Register-ScheduledTask `
     -RunLevel   Highest `
     -Force
 
-Write-Host "Task '$taskName' registered. It will start the backend at every login."
-Write-Host "To start now: Start-ScheduledTask -TaskName '$taskName'"
-Write-Host "To stop:      Stop-ScheduledTask  -TaskName '$taskName'"
-Write-Host "To remove:    Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false"
+Write-Host ""
+Write-Host "Task '$taskName' registered successfully." -ForegroundColor Green
+Write-Host "Backend will start automatically at every Windows login."
+Write-Host ""
+Write-Host "Useful commands:"
+Write-Host "  Start now:  Start-ScheduledTask -TaskName '$taskName'"
+Write-Host "  Stop:       Stop-ScheduledTask  -TaskName '$taskName'"
+Write-Host "  Remove:     Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false"
+Write-Host "  Status:     Get-ScheduledTask   -TaskName '$taskName' | Select-Object State"

@@ -28,7 +28,9 @@ from app.db.models import ScreenerSymbol
 log = logging.getLogger(__name__)
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_USER_AGENT = "trader-screener/1.0 contact@example.com"
+def _sec_user_agent() -> str:
+    from app.config import get_settings
+    return get_settings().edgar_user_agent
 
 # Wikipedia table indices that hold ticker symbols
 _WIKI_TABLES = {
@@ -101,7 +103,7 @@ def _fetch_wikipedia_tickers(source_key: str) -> list[dict]:
 async def _fetch_sec_cik_map() -> dict[str, str]:
     """Return {ticker_upper: cik} for all SEC-registered companies."""
     try:
-        async with httpx.AsyncClient(timeout=30, headers={"User-Agent": SEC_USER_AGENT}) as client:
+        async with httpx.AsyncClient(timeout=30, headers={"User-Agent": _sec_user_agent()}) as client:
             r = await client.get(SEC_TICKERS_URL)
             r.raise_for_status()
             data = r.json()
