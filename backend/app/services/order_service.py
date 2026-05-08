@@ -43,17 +43,53 @@ async def place_entry_order(
     broker: BrokerInterface,
     last_price: Decimal,
 ) -> Order:
-    """Place a market entry buy. Returns the Order row (pre-commit)."""
+    """Place a stop-limit entry buy.
+
+    For live orders we use a STOP-LIMIT rather than MARKET:
+      stop_price  = trigger price   (order activates when price reaches here)
+      limit_price = trigger × 1.005 (won't pay more than 0.5% above — prevents
+                                     chasing gaps; if stock opens above limit
+                                     the order simply doesn't fill)
+
+    For paper orders the broker simulates an instant fill at last_price.
+    """
     account = await session.get(Account, ticket.account_id)
     if account is None:
         raise RuntimeError(f"Account {ticket.account_id} not found")
+
+    # ── Buying-power pre-flight check for live accounts ───────────────────
+    if not ticket.is_paper:
+        from sqlalchemy import select as _select
+        from app.db.models import AccountBalance as _AB
+        bp_result = await session.execute(
+            _select(_AB).where(
+                _AB.account_id == ticket.account_id,
+                _AB.currency == ticket.currency,
+            )
+        )
+        balance = bp_result.scalar_one_or_none()
+        required = ticket.position_size_value
+        available = balance.buying_power if balance else Decimal(0)
+        if available < required:
+            raise RuntimeError(
+                f"Insufficient buying power for {ticket.symbol}: "
+                f"need {ticket.currency} {float(required):.0f}, "
+                f"have {float(available):.0f}. "
+                f"Sell TBIL or other cash-equivalents first (T+1 settlement)."
+            )
+
+    # Use stop-limit for live; paper broker handles market-style simulation internally
+    trigger = ticket.trigger_price
+    limit   = (trigger * Decimal("1.005")).quantize(Decimal("0.01"))  # 0.5% ceiling
 
     req = BrokerOrderRequest(
         account_id=account.questrade_account_id,
         symbol=ticket.symbol,
         side="buy",
-        order_type="market",
+        order_type="stop_limit" if not ticket.is_paper else "market",
         quantity=ticket.position_size_shares,
+        stop_price=trigger if not ticket.is_paper else None,
+        limit_price=limit if not ticket.is_paper else None,
         time_in_force="Day",
     )
     ack = await broker.place_order(req)
@@ -68,9 +104,11 @@ async def place_entry_order(
         symbol=ticket.symbol,
         currency=ticket.currency,
         side=OrderSide.BUY.value,
-        order_type=OrderType.MARKET.value,
+        order_type=OrderType.STOP_LIMIT.value if not ticket.is_paper else OrderType.MARKET.value,
         intent=OrderIntent.ENTRY.value,
         quantity=ticket.position_size_shares,
+        limit_price=limit if not ticket.is_paper else None,
+        stop_price=trigger if not ticket.is_paper else None,
         status=OrderStatus.SUBMITTED.value,
         is_paper=ticket.is_paper,
         submitted_at=ack.submitted_at,

@@ -392,9 +392,9 @@ class QuestradeBroker(BrokerInterface):
     # ------------------------------------------------------------------
 
     _ORDER_TYPE_MAP = {
-        "market": "Market",
-        "limit": "Limit",
-        "stop_market": "StopMarket",
+        "market":     "Market",
+        "limit":      "Limit",
+        "stop_market":"StopMarket",
         "stop_limit": "StopLimit",
     }
     _QT_STATE_MAP = {
