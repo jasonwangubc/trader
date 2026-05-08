@@ -34,9 +34,13 @@ SEC_USER_AGENT = "trader-screener/1.0 contact@example.com"
 _WIKI_TABLES = {
     "sp500":    ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",    0, "Symbol"),
     "sp400":    ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",    0, "Symbol"),
+    "sp600":    ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",    0, "Symbol"),
     "nasdaq100":("https://en.wikipedia.org/wiki/Nasdaq-100",                      5, "Ticker"),
     "tsx60":    ("https://en.wikipedia.org/wiki/S%26P/TSX_60",                    1, "Symbol"),
 }
+# Note: S&P 600 is the SmallCap 600 — the highest-quality small-cap index.
+# Minervini's biggest winners were typically stocks in this market-cap range
+# ($300M–$3B) that had not yet been fully discovered by institutions.
 
 # TSX-listed symbols need the .TO suffix for yfinance.
 # We add it here so price downloads and info fetches work correctly.
@@ -115,28 +119,31 @@ async def _fetch_sec_cik_map() -> dict[str, str]:
 
 
 async def build_universe(session: AsyncSession) -> dict[str, int]:
-    """Fetch all sources, merge, enrich with CIK, upsert into screener_symbols.
-    Returns {source: count}.
+    """Fetch all configured sources, merge, enrich with CIK, upsert into screener_symbols.
+    Returns {source: count}. Adding a new index to _WIKI_TABLES is sufficient to include it.
     """
-    # 1. Pull ticker lists from Wikipedia (run sync in thread to avoid blocking)
     import asyncio
     loop = asyncio.get_event_loop()
 
-    sp500 = await loop.run_in_executor(None, _fetch_wikipedia_tickers, "sp500")
-    nasdaq = await loop.run_in_executor(None, _fetch_wikipedia_tickers, "nasdaq100")
-    tsx60  = await loop.run_in_executor(None, _fetch_wikipedia_tickers, "tsx60")
+    # 1. Fetch all configured sources in parallel
+    source_results = await asyncio.gather(*[
+        loop.run_in_executor(None, _fetch_wikipedia_tickers, source_key)
+        for source_key in _WIKI_TABLES
+    ])
 
-    # Merge — first-seen source wins for deduplication
+    # Merge — first-seen source wins for deduplication (order of _WIKI_TABLES matters)
     seen: dict[str, str] = {}
     all_rows: list[dict] = []
-    for row in sp500 + nasdaq + tsx60:
-        sym = row["symbol"]
-        if sym not in seen:
-            seen[sym] = row["source"]
-            all_rows.append(row)
+    per_source: dict[str, int] = {}
+    for source_key, rows in zip(_WIKI_TABLES.keys(), source_results):
+        per_source[source_key] = len(rows)
+        for row in rows:
+            sym = row["symbol"]
+            if sym not in seen:
+                seen[sym] = source_key
+                all_rows.append(row)
 
-    log.info("Universe: %d from S&P 500, %d from NASDAQ 100, %d from TSX 60 → %d unique",
-             len(sp500), len(nasdaq), len(tsx60), len(all_rows))
+    log.info("Universe fetched: %s → %d unique symbols", per_source, len(all_rows))
 
     # 2. CIK enrichment from SEC
     cik_map = await _fetch_sec_cik_map()

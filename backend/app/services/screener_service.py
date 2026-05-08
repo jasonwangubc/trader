@@ -1,7 +1,7 @@
 """Screener pipeline orchestrator.
 
 Two modes:
-  auto   — pulls S&P 500 + S&P 400 + NASDAQ 100 + TSX 60, runs full pipeline
+  auto   — pulls S&P 500 + S&P 400 + S&P 600 + NASDAQ 100 + TSX 60
   manual — only scores symbols explicitly in the watchlist
 
 Pipeline (auto mode):
@@ -82,6 +82,7 @@ async def _fetch_yf_fundamentals_batch(symbols: list[str]) -> dict[str, dict]:
 class PipelineStats:
     universe_size: int = 0
     eod_downloaded: int = 0
+    liquidity_filtered: int = 0   # skipped due to avg volume < 100k
     tt_passing: int = 0
     scored: int = 0
     with_fundamentals: int = 0
@@ -118,13 +119,21 @@ async def run_screener(
     stats.eod_downloaded = sum(v for v in counts.values() if v > 0)
     log.info("EOD download: %d symbols, %d bars upserted", len(counts), stats.eod_downloaded)
 
-    # ── Step 3: TT pre-filter ─────────────────────────────────────────────────
+    # ── Step 3: TT pre-filter + liquidity screen ─────────────────────────────
+    # Minervini requires stocks to be liquid enough to trade without moving the
+    # market. We filter out names with <100k shares/day avg volume.
+    MIN_AVG_VOLUME = 100_000
     spy_df = await get_bars_df(session, "SPY", days=504)
 
     tt_results = {}
     for sym in all_symbols:
         df = await get_bars_df(session, sym, days=MIN_BARS + 30)
         if df.empty or len(df) < MIN_BARS:
+            continue
+        # Liquidity check: 20-day average volume
+        avg_vol = df["volume"].tail(20).mean()
+        if avg_vol < MIN_AVG_VOLUME:
+            log.debug("%s avg vol %.0f < %d — skipped (illiquid)", sym, avg_vol, MIN_AVG_VOLUME)
             continue
         tt = score_trend_template(df, benchmark_df=spy_df if not spy_df.empty else None)
         tt_results[sym] = (df, tt)
