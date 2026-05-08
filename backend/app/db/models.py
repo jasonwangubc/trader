@@ -121,11 +121,15 @@ _qty = Numeric(18, 4)
 
 # ---------- Models ----------
 
+USER_DEFAULT = "user_default"   # placeholder for data created before multi-tenancy
+
+
 class Account(Base, TimestampMixin):
     __tablename__ = "accounts"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    questrade_account_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    questrade_account_id: Mapped[str] = mapped_column(String(64), index=True)
     type: Mapped[str] = mapped_column(String(32))  # AccountType
     primary_currency: Mapped[str] = mapped_column(String(3))  # Currency
     nickname: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -200,6 +204,7 @@ class Ticket(Base, TimestampMixin):
     __tablename__ = "tickets"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
     account_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id"), index=True
     )
@@ -256,6 +261,7 @@ class Order(Base, TimestampMixin):
     __tablename__ = "orders"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
     ticket_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tickets.id", ondelete="SET NULL"), index=True, nullable=True
     )
@@ -317,10 +323,13 @@ class Setting(Base):
 
 
 class StreakState(Base):
-    """Singleton row tracking current win/loss streak for risk-multiplier scaling."""
+    """Win/loss streak per user for risk-multiplier scaling.
+    Primary key is user_id (one row per user, previously singleton id=1).
+    """
     __tablename__ = "streak_state"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, default=USER_DEFAULT)
     consecutive_wins: Mapped[int] = mapped_column(Integer, default=0)
     consecutive_losses: Mapped[int] = mapped_column(Integer, default=0)
     last_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -349,6 +358,7 @@ class OptionTicket(Base, TimestampMixin):
     __tablename__ = "option_tickets"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
     account_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id"), index=True
     )
@@ -418,7 +428,8 @@ class ScreenerSymbol(Base, TimestampMixin):
     __tablename__ = "screener_symbols"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -473,6 +484,7 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )

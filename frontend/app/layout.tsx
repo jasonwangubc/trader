@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { ClerkProvider } from "@clerk/nextjs";
 import { ThemeProvider } from "next-themes";
 import { Toaster } from "sonner";
 import "./globals.css";
@@ -33,13 +34,15 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full bg-background">
-        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
-          <Sidebar />
-          <div className="lg:pl-56 min-h-screen">
-            {children}
-          </div>
-          <Toaster richColors position="bottom-right" closeButton />
-        </ThemeProvider>
+        <ClerkProvider>
+          <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+            <Sidebar />
+            <div className="lg:pl-56 min-h-screen">
+              {children}
+            </div>
+            <Toaster richColors position="bottom-right" closeButton />
+          </ThemeProvider>
+        </ClerkProvider>
       </body>
     </html>
   );

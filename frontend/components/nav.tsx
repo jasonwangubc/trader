@@ -16,11 +16,13 @@ import {
   LineChart,
   Eye,
   FlaskConical,
+  Settings,
   Sun,
   Moon,
   Menu,
   X,
 } from "lucide-react";
+import { UserButton } from "@clerk/nextjs";
 import { API_URL } from "@/lib/api";
 import { SymbolSearch } from "@/components/symbol-search";
 
@@ -35,6 +37,7 @@ const NAV = [
   { href: "/accounts",   label: "Accounts",   Icon: Wallet },
   { href: "/journal",    label: "Journal",    Icon: BookOpen },
   { href: "/backtest",   label: "Backtest",   Icon: FlaskConical },
+  { href: "/settings",   label: "Settings",   Icon: Settings },
 ];
 
 type MonitorStatus = { running: boolean; armed_tickets: number; kill_switch: boolean; market_open: boolean };
@@ -109,6 +112,12 @@ export function Sidebar() {
 
       {/* Bottom section */}
       <div className="border-t px-3 py-4 space-y-3">
+        {/* User account */}
+        <div className="flex items-center gap-2">
+          <UserButton afterSignOutUrl="/sign-in" />
+          <span className="text-muted-foreground text-xs">Account</span>
+        </div>
+
         {/* Dark mode toggle */}
         <div className="flex items-center justify-between text-xs">
           <span className="text-muted-foreground">Theme</span>

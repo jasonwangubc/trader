@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import accounts, backtest, chart, earnings, fundamentals, health, journal, monitor, options, positions, regime, screener, tickets
+from app.api import settings as user_settings
 from app.config import get_settings
 
 
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
     app.include_router(earnings.router)
     app.include_router(fundamentals.router)
     app.include_router(backtest.router)
+    app.include_router(user_settings.router)
     return app
 
 

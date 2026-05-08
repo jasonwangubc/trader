@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.brokers.registry import get_broker
 from app.db.models import Account, AccountBalance
 from app.db.session import get_session
+from app.api.auth import get_user_id
 from app.services.accounts_service import get_household_equity, sync_accounts
 from app.services.audit_service import log_event
 from app.services.positions_service import sync_positions
@@ -46,18 +47,20 @@ class HouseholdOut(BaseModel):
 
 
 @router.get("/sync", response_model=HouseholdOut)
-async def sync(session: AsyncSession = Depends(get_session)) -> HouseholdOut:
+async def sync(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> HouseholdOut:
     """Pull latest accounts, balances, and positions from Questrade."""
-    broker = get_broker()
+    broker = get_broker(user_id=user_id, session=session)
     try:
-        # Paper mode wraps Questrade; live data still comes from the QT broker.
         qt_broker = getattr(broker, "_quote_source", broker)
-        accounts = await sync_accounts(session, qt_broker)
-        await sync_positions(session, qt_broker)
+        accounts = await sync_accounts(session, qt_broker, user_id=user_id)
+        await sync_positions(session, qt_broker, user_id=user_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    equity = await get_household_equity(session)
+    equity = await get_household_equity(session, user_id=user_id)
     return HouseholdOut(
         accounts=[_account_to_out(a) for a in accounts],
         household_equity=equity,
@@ -65,16 +68,22 @@ async def sync(session: AsyncSession = Depends(get_session)) -> HouseholdOut:
 
 
 @router.get("", response_model=HouseholdOut)
-async def list_accounts(session: AsyncSession = Depends(get_session)) -> HouseholdOut:
+async def list_accounts(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> HouseholdOut:
     """Return cached accounts from DB (no broker call)."""
     result = await session.execute(
-        select(Account).where(Account.is_active == True).order_by(Account.created_at)  # noqa: E712
+        select(Account).where(
+            Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
+        ).order_by(Account.created_at)
     )
     accounts = result.scalars().all()
     for a in accounts:
         await session.refresh(a, ["balances"])
 
-    equity = await get_household_equity(session)
+    equity = await get_household_equity(session, user_id=user_id)
     return HouseholdOut(
         accounts=[_account_to_out(a) for a in accounts],
         household_equity=equity,

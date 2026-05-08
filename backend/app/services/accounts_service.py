@@ -11,19 +11,28 @@ from app.brokers.base import BrokerInterface
 from app.db.models import Account, AccountBalance
 
 
-async def sync_accounts(session: AsyncSession, broker: BrokerInterface) -> list[Account]:
+async def sync_accounts(
+    session: AsyncSession,
+    broker: BrokerInterface,
+    user_id: str = "user_default",
+) -> list[Account]:
     """Pull accounts + balances from broker and upsert into DB."""
+    from app.db.models import USER_DEFAULT
     broker_accounts = await broker.list_accounts()
 
     synced: list[Account] = []
     for ba in broker_accounts:
-        # Upsert account row
+        # Upsert account row — scoped to this user
         result = await session.execute(
-            select(Account).where(Account.questrade_account_id == ba.broker_account_id)
+            select(Account).where(
+                Account.questrade_account_id == ba.broker_account_id,
+                Account.user_id == user_id,
+            )
         )
         account = result.scalar_one_or_none()
         if account is None:
             account = Account(
+                user_id=user_id,
                 questrade_account_id=ba.broker_account_id,
                 type=ba.type,
                 primary_currency=ba.primary_currency,
@@ -63,10 +72,16 @@ async def sync_accounts(session: AsyncSession, broker: BrokerInterface) -> list[
     return synced
 
 
-async def get_household_equity(session: AsyncSession) -> dict[str, Decimal]:
-    """Sum total_equity across all active accounts, by currency."""
+async def get_household_equity(
+    session: AsyncSession,
+    user_id: str = "user_default",
+) -> dict[str, Decimal]:
+    """Sum total_equity across all active accounts for a user, by currency."""
     result = await session.execute(
-        select(AccountBalance).join(Account).where(Account.is_active == True)  # noqa: E712
+        select(AccountBalance).join(Account).where(
+            Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
+        )
     )
     balances = result.scalars().all()
     totals: dict[str, Decimal] = {}

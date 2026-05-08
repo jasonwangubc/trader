@@ -77,16 +77,16 @@ class _TokenState:
 
 
 class QuestradeBroker(BrokerInterface):
-    """Live Questrade broker. One instance per process; token state is shared."""
+    """Live Questrade broker. One instance per user; token state is per-user."""
 
     name = "questrade"
 
-    def __init__(self) -> None:
+    def __init__(self, user_id: str = "user_default") -> None:
+        self._user_id = user_id
         self._settings = get_settings()
         self._token: _TokenState | None = None
         self._lock = asyncio.Lock()
         self._http: httpx.AsyncClient | None = None
-        # symbol name → Questrade symbolId; populated lazily, lives for process lifetime.
         self._symbol_id_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------
@@ -162,6 +162,19 @@ class QuestradeBroker(BrokerInterface):
         )
         log.info("Questrade token refreshed; api_server=%s", self._token.api_server)
 
+    def _token_key(self) -> str:
+        """DB settings key for this user's Questrade refresh token."""
+        uid = self._user_id
+        if uid == "user_default":
+            return "questrade_refresh_token"
+        return f"{uid}:questrade_refresh_token"
+
+    def _api_server_key(self) -> str:
+        uid = self._user_id
+        if uid == "user_default":
+            return "questrade_api_server"
+        return f"{uid}:questrade_api_server"
+
     async def _get_stored_refresh_token(self, *, env_fallback: bool = False) -> str | None:
         """Return the best available refresh token.
 
@@ -190,7 +203,7 @@ class QuestradeBroker(BrokerInterface):
 
         try:
             async with SessionLocal() as session:
-                stored = await get_setting(session, "questrade_refresh_token")
+                stored = await get_setting(session, self._token_key())
                 if stored:
                     return stored
         except Exception:
@@ -199,14 +212,14 @@ class QuestradeBroker(BrokerInterface):
         return env_token
 
     async def _persist_token(self, refresh_token: str, api_server: str) -> None:
-        """Write updated token + api_server back to the settings table."""
+        """Write updated token + api_server back to the settings table (per user)."""
         from app.db.session import SessionLocal
         from app.services.settings_service import set_setting
 
         try:
             async with SessionLocal() as session:
-                await set_setting(session, "questrade_refresh_token", refresh_token)
-                await set_setting(session, "questrade_api_server", api_server)
+                await set_setting(session, self._token_key(), refresh_token)
+                await set_setting(session, self._api_server_key(), api_server)
                 await session.commit()
         except Exception as exc:
             log.warning("Could not persist Questrade token to DB: %s", exc)

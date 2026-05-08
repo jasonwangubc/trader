@@ -35,12 +35,19 @@ def _multiplier_for(wins: int, losses: int) -> tuple[Decimal, bool]:
     return Decimal("1.00"), False
 
 
-async def get_or_create_streak(session: AsyncSession) -> StreakState:
-    """Return the singleton streak row; create with defaults if missing."""
-    row = await session.get(StreakState, 1)
+async def get_or_create_streak(
+    session: AsyncSession,
+    user_id: str = "user_default",
+) -> StreakState:
+    """Return the streak row for this user; create with defaults if missing."""
+    from sqlalchemy import select
+    result = await session.execute(
+        select(StreakState).where(StreakState.user_id == user_id)
+    )
+    row = result.scalar_one_or_none()
     if row is None:
         row = StreakState(
-            id=1,
+            user_id=user_id,
             consecutive_wins=0,
             consecutive_losses=0,
             current_multiplier=Decimal("1.00"),
@@ -50,8 +57,11 @@ async def get_or_create_streak(session: AsyncSession) -> StreakState:
     return row
 
 
-async def get_snapshot(session: AsyncSession) -> StreakSnapshot:
-    row = await get_or_create_streak(session)
+async def get_snapshot(
+    session: AsyncSession,
+    user_id: str = "user_default",
+) -> StreakSnapshot:
+    row = await get_or_create_streak(session, user_id=user_id)
     mult, cooldown = _multiplier_for(row.consecutive_wins, row.consecutive_losses)
     # Lazily heal the persisted multiplier if it drifted.
     if row.current_multiplier != mult:
@@ -70,9 +80,10 @@ async def record_outcome(
     *,
     outcome: TradeOutcome,
     ticket_id,
+    user_id: str = "user_default",
 ) -> StreakSnapshot:
     """Update streak after a trade closes. Called from Sprint 2 fill/exit logic."""
-    row = await get_or_create_streak(session)
+    row = await get_or_create_streak(session, user_id=user_id)
     if outcome == TradeOutcome.WIN:
         row.consecutive_wins += 1
         row.consecutive_losses = 0
