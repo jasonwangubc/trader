@@ -27,7 +27,13 @@ from app.db.models import ScreenerSymbol
 
 log = logging.getLogger(__name__)
 
-SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_TICKERS_URL          = "https://www.sec.gov/files/company_tickers.json"
+SEC_EXCHANGE_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+
+# Exchanges we treat as real US markets (exclude OTC / Pink Sheets)
+_VALID_US_EXCHANGES = {"Nasdaq", "NYSE", "CBOE", "NYSEArca", "NYSE Arca", "NASDAQ"}
+
+
 def _sec_user_agent() -> str:
     from app.config import get_settings
     return get_settings().edgar_user_agent
@@ -100,8 +106,47 @@ def _fetch_wikipedia_tickers(source_key: str) -> list[dict]:
         return []
 
 
+async def _fetch_sec_exchange_universe() -> list[dict]:
+    """Fetch ALL NYSE/Nasdaq/CBOE listed stocks from SEC exchange JSON.
+
+    Returns rows with symbol, cik, and source='sec_all'. This covers ~7,500
+    US-listed stocks including ETFs, small-caps, and anything not in the
+    curated S&P indices. CIKs are pre-attached so EDGAR fetch is instant.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=30, headers={"User-Agent": _sec_user_agent()}
+        ) as client:
+            r = await client.get(SEC_EXCHANGE_TICKERS_URL)
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        log.warning("Could not fetch SEC exchange universe")
+        return []
+
+    fields = data.get("fields", [])
+    rows: list[dict] = []
+    for item in data.get("data", []):
+        d = dict(zip(fields, item))
+        exchange = d.get("exchange") or ""
+        if exchange not in _VALID_US_EXCHANGES:
+            continue
+        ticker = (d.get("ticker") or "").strip().upper().replace(".", "-")
+        cik_num = d.get("cik")
+        if not ticker or not cik_num:
+            continue
+        rows.append({
+            "symbol": ticker,
+            "cik": str(cik_num).zfill(10),
+            "source": "sec_all",
+        })
+
+    log.info("SEC exchange universe: %d valid US-listed stocks", len(rows))
+    return rows
+
+
 async def _fetch_sec_cik_map() -> dict[str, str]:
-    """Return {ticker_upper: cik} for all SEC-registered companies."""
+    """Return {ticker_upper: cik} for all SEC-registered companies (fallback)."""
     try:
         async with httpx.AsyncClient(timeout=30, headers={"User-Agent": _sec_user_agent()}) as client:
             r = await client.get(SEC_TICKERS_URL)
@@ -121,23 +166,36 @@ async def _fetch_sec_cik_map() -> dict[str, str]:
 
 
 async def build_universe(session: AsyncSession) -> dict[str, int]:
-    """Fetch all configured sources, merge, enrich with CIK, upsert into screener_symbols.
-    Returns {source: count}. Adding a new index to _WIKI_TABLES is sufficient to include it.
+    """Fetch all configured sources, merge, upsert into screener_symbols.
+
+    Sources (priority order for dedup):
+      1. Wikipedia curated indices (S&P 500/400/600, NASDAQ 100, TSX 60)
+         — high-quality, index-member stocks with known sector/weight
+      2. SEC exchange JSON (all NYSE/Nasdaq/CBOE listed stocks, ~7,500)
+         — catches everything outside the indices: ETFs, small-caps, etc.
+         CIKs pre-attached so EDGAR fundamentals fetch is instant.
+
+    Returns {source: count}.
     """
     import asyncio
     loop = asyncio.get_event_loop()
 
-    # 1. Fetch all configured sources in parallel
-    source_results = await asyncio.gather(*[
+    # 1. Fetch Wikipedia curated indices in parallel
+    wiki_results = await asyncio.gather(*[
         loop.run_in_executor(None, _fetch_wikipedia_tickers, source_key)
         for source_key in _WIKI_TABLES
     ])
 
-    # Merge — first-seen source wins for deduplication (order of _WIKI_TABLES matters)
+    # 2. Fetch full SEC exchange universe (all US stocks with CIK)
+    sec_rows = await _fetch_sec_exchange_universe()
+
+    # Merge: curated indices first (they win dedup), then SEC for broader coverage
     seen: dict[str, str] = {}
     all_rows: list[dict] = []
     per_source: dict[str, int] = {}
-    for source_key, rows in zip(_WIKI_TABLES.keys(), source_results):
+
+    # Wikipedia rows go first — they override if symbol also in SEC
+    for source_key, rows in zip(_WIKI_TABLES.keys(), wiki_results):
         per_source[source_key] = len(rows)
         for row in rows:
             sym = row["symbol"]
@@ -145,9 +203,18 @@ async def build_universe(session: AsyncSession) -> dict[str, int]:
                 seen[sym] = source_key
                 all_rows.append(row)
 
-    log.info("Universe fetched: %s → %d unique symbols", per_source, len(all_rows))
+    # SEC rows fill in everything not already covered
+    per_source["sec_all"] = 0
+    for row in sec_rows:
+        sym = row["symbol"]
+        if sym not in seen:
+            seen[sym] = "sec_all"
+            all_rows.append(row)
+            per_source["sec_all"] += 1
 
-    # 2. CIK enrichment from SEC
+    log.info("Universe: %s → %d unique symbols total", per_source, len(all_rows))
+
+    # CIK map for symbols that came from Wikipedia (sec_all already has CIKs)
     cik_map = await _fetch_sec_cik_map()
 
     # 3. Upsert into screener_symbols
@@ -159,15 +226,16 @@ async def build_universe(session: AsyncSession) -> dict[str, int]:
     for row in all_rows:
         sym = row["symbol"]
         source = row["source"]
-        # Strip .TO for CIK lookup — SEC doesn't use exchange suffixes.
-        bare_sym = sym.removesuffix(".TO").removesuffix(".V")
-        cik = cik_map.get(sym) or cik_map.get(bare_sym)
+        # SEC exchange rows carry CIK directly; Wikipedia rows use the cik_map.
+        cik = row.get("cik")
+        if not cik:
+            bare_sym = sym.removesuffix(".TO").removesuffix(".V")
+            cik = cik_map.get(sym) or cik_map.get(bare_sym)
         counts[source] = counts.get(source, 0) + 1
 
         if sym in existing:
             s = existing[sym]
             s.is_active = True
-            # Update CIK if we found it and didn't have it
             if cik and not s.notes:
                 s.notes = f"cik:{cik}"
         else:
@@ -176,13 +244,8 @@ async def build_universe(session: AsyncSession) -> dict[str, int]:
             session.add(s)
             existing[sym] = s
 
-    # Keep existing manually-added symbols active (don't deactivate them)
-    # Only deactivate auto-discovered symbols that are no longer in any index
-    auto_sources = {"sp500", "nasdaq100", "tsx60"}
-    auto_syms = {r["symbol"] for r in all_rows}
-    for sym, s in existing.items():
-        if sym not in auto_syms and s.notes and any(src in (s.notes or "") for src in auto_sources):
-            s.is_active = False
+    # Never deactivate — the full SEC list is the ground truth now
+    # (all rows come from authoritative sources)
 
     await session.commit()
     return counts

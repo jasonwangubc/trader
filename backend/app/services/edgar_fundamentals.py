@@ -42,16 +42,26 @@ _REVENUE_TAGS = [
     "SalesRevenueNet",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
     "SalesRevenueGoodsNet",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenuesNetOfInterestExpense",
+    "InterestAndDividendIncomeOperating",  # banks
+    "BrokerageCommissionsRevenue",
+    "HealthCareOrganizationRevenue",
+    "OilAndGasRevenue",
 ]
 _NET_INCOME_TAGS = [
     "NetIncomeLoss",
     "NetIncome",
     "ProfitLoss",
     "NetIncomeLossAvailableToCommonStockholdersBasic",
+    "NetIncomeLossAvailableToCommonStockholdersDiluted",
+    "IncomeLossFromContinuingOperations",
 ]
 _EPS_TAGS = [
     "EarningsPerShareBasic",
     "EarningsPerShareDiluted",
+    "EarningsPerShareBasicAndDiluted",
+    "IncomeLossFromContinuingOperationsPerBasicShare",
 ]
 
 
@@ -74,66 +84,158 @@ class FundamentalSnapshot:
     error: str | None = None
 
 
-def _extract_annual_series(facts: dict, tags: list[str]) -> list[tuple[date, float]]:
-    """Pull annual (10-K) values for the first matching tag."""
+def _extract_all_entries(facts: dict, tags: list[str]) -> list[dict]:
+    """Pull all USD entries for the first matching tag (both annual and quarterly)."""
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
     for tag in tags:
-        node = us_gaap.get(tag, {})
-        units = node.get("units", {})
-        # Revenue/net income are in USD
-        entries = units.get("USD", units.get("shares", []))
-        annual = [
-            e for e in entries
-            if e.get("form") in ("10-K", "20-F", "40-F")
-            and e.get("val") is not None
-            and e.get("end")
-        ]
-        if annual:
-            # Sort and deduplicate by end date (keep max val for ties)
-            by_date: dict[date, float] = {}
-            for e in annual:
-                try:
-                    d = date.fromisoformat(e["end"])
-                    val = float(e["val"])
-                    if d not in by_date or abs(val) > abs(by_date[d]):
-                        by_date[d] = val
-                except (ValueError, TypeError):
-                    continue
-            series = sorted(by_date.items())
-            if series:
-                return series
+        entries = (
+            us_gaap.get(tag, {}).get("units", {}).get("USD", [])
+            or us_gaap.get(tag, {}).get("units", {}).get("shares", [])
+        )
+        valid = [e for e in entries if e.get("val") is not None and e.get("end") and e.get("start")]
+        if valid:
+            return valid
     return []
+
+
+def _extract_annual_series(facts: dict, tags: list[str]) -> list[tuple[date, float]]:
+    """Pull annual (10-K) values — most recent available per fiscal year."""
+    entries = _extract_all_entries(facts, tags)
+    annual = [e for e in entries if e.get("form") in ("10-K", "20-F", "40-F")]
+    if not annual:
+        return []
+    by_date: dict[date, float] = {}
+    for e in annual:
+        try:
+            d = date.fromisoformat(e["end"])
+            val = float(e["val"])
+            if d not in by_date or abs(val) > abs(by_date[d]):
+                by_date[d] = val
+        except (ValueError, TypeError):
+            continue
+    return sorted(by_date.items())
+
+
+def _extract_quarterly_series(facts: dict, tags: list[str]) -> list[tuple[date, float]]:
+    """Extract individual quarterly values from EDGAR, handling YTD reporting.
+
+    10-Q filings often report YTD (year-to-date) values rather than single quarters:
+      Q1 10-Q: period ~90 days  → already a single quarter
+      Q2 10-Q: period ~180 days → H1, derive Q2 = H1 - Q1
+      Q3 10-Q: period ~270 days → 9M, derive Q3 = 9M - H1
+      10-K:    period ~365 days → Annual, derive Q4 = Annual - 9M
+
+    Returns: list of (quarter_end_date, value) sorted oldest-first.
+    """
+    entries = _extract_all_entries(facts, tags)
+    if not entries:
+        return []
+
+    # Build a lookup: (start, end) → value
+    by_period: dict[tuple[date, date], float] = {}
+    for e in entries:
+        try:
+            s = date.fromisoformat(e["start"])
+            d = date.fromisoformat(e["end"])
+            val = float(e["val"])
+            key = (s, d)
+            if key not in by_period or abs(val) > abs(by_period[key]):
+                by_period[key] = val
+        except (ValueError, TypeError):
+            continue
+
+    # Sort by end date
+    periods = sorted(by_period.items(), key=lambda x: x[0][1])
+
+    # Find single-quarter entries (period ≈ 85-95 days)
+    quarters: dict[date, float] = {}
+
+    for (start, end), val in periods:
+        days = (end - start).days
+        if 75 <= days <= 105:
+            # Single quarter (Q1 or standalone quarterly filing)
+            quarters[end] = val
+        elif 165 <= days <= 200:
+            # H1 (Q1+Q2) — derive Q2 = H1 - Q1
+            # Find the matching Q1 (end ~90 days before H1-end)
+            for (qs, qe), qv in by_period.items():
+                if abs((end - qe).days - 90) < 20 and qs.year == start.year:
+                    quarters[end] = val - qv
+                    break
+        elif 255 <= days <= 290:
+            # 9M (Q1+Q2+Q3) — derive Q3 = 9M - H1
+            for (hs, he), hv in by_period.items():
+                if abs((end - he).days - 90) < 20 and hs.year == start.year:
+                    quarters[end] = val - hv
+                    break
+        elif 340 <= days <= 390:
+            # Annual 10-K — derive Q4 = Annual - 9M
+            for (ns, ne), nv in by_period.items():
+                if abs((end - ne).days - 90) < 20 and ns.year == start.year:
+                    quarters[end] = val - nv
+                    break
+
+    # Return sorted with at most 12 quarters
+    result = sorted(quarters.items())
+    return result[-12:]  # last 3 years
 
 
 def _compute_snapshot(symbol: str, cik: str, facts: dict) -> FundamentalSnapshot:
     snap = FundamentalSnapshot(symbol=symbol, cik=cik)
 
-    rev_series = _extract_annual_series(facts, _REVENUE_TAGS)
-    ni_series  = _extract_annual_series(facts, _NET_INCOME_TAGS)
-    eps_series = _extract_annual_series(facts, _EPS_TAGS)
+    # Try quarterly first (more current + Minervini cares about quarterly acceleration)
+    rev_q  = _extract_quarterly_series(facts, _REVENUE_TAGS)
+    ni_q   = _extract_quarterly_series(facts, _NET_INCOME_TAGS)
+    eps_q  = _extract_quarterly_series(facts, _EPS_TAGS)
 
-    # TTM = most recent annual value (10-K gives the full year)
-    if rev_series:
-        snap.revenue_ttm = rev_series[-1][1]
-        if len(rev_series) >= 2:
-            prev = rev_series[-2][1]
-            if prev and prev != 0:
-                snap.revenue_growth = (snap.revenue_ttm - prev) / abs(prev)
+    # Fall back to annual if quarterly extraction fails
+    rev_a  = _extract_annual_series(facts, _REVENUE_TAGS)
+    ni_a   = _extract_annual_series(facts, _NET_INCOME_TAGS)
+    eps_a  = _extract_annual_series(facts, _EPS_TAGS)
 
-    if ni_series:
-        snap.net_income_ttm = ni_series[-1][1]
-        if len(ni_series) >= 2:
-            prev = ni_series[-2][1]
-            if prev and prev != 0:
-                snap.net_income_growth = (snap.net_income_ttm - prev) / abs(prev)
+    # -- Revenue --
+    if len(rev_q) >= 2:
+        # Most recent quarter vs same quarter 1 year ago (YoY quarterly growth)
+        snap.revenue_ttm = rev_q[-1][1]
+        # Find matching quarter ~4 quarters back
+        target_date = rev_q[-1][0]
+        year_ago = [v for d, v in rev_q if abs((target_date - d).days - 365) < 60]
+        if year_ago and year_ago[0] and year_ago[0] != 0:
+            snap.revenue_growth = (snap.revenue_ttm - year_ago[-1]) / abs(year_ago[-1])
+    elif len(rev_a) >= 2:
+        snap.revenue_ttm = rev_a[-1][1]
+        prev = rev_a[-2][1]
+        if prev and prev != 0:
+            snap.revenue_growth = (snap.revenue_ttm - prev) / abs(prev)
+    elif rev_a:
+        snap.revenue_ttm = rev_a[-1][1]
 
-    if eps_series:
-        snap.eps_ttm = eps_series[-1][1]
+    # -- Net income --
+    if len(ni_q) >= 2:
+        snap.net_income_ttm = ni_q[-1][1]
+        target_date = ni_q[-1][0]
+        year_ago = [v for d, v in ni_q if abs((target_date - d).days - 365) < 60]
+        if year_ago and year_ago[-1] and year_ago[-1] != 0:
+            snap.net_income_growth = (snap.net_income_ttm - year_ago[-1]) / abs(year_ago[-1])
+    elif len(ni_a) >= 2:
+        snap.net_income_ttm = ni_a[-1][1]
+        prev = ni_a[-2][1]
+        if prev and prev != 0:
+            snap.net_income_growth = (snap.net_income_ttm - prev) / abs(prev)
+    elif ni_a:
+        snap.net_income_ttm = ni_a[-1][1]
 
+    # -- EPS --
+    if eps_q:
+        snap.eps_ttm = eps_q[-1][1]
+    elif eps_a:
+        snap.eps_ttm = eps_a[-1][1]
+
+    # -- Derived --
     if snap.revenue_ttm and snap.revenue_ttm != 0 and snap.net_income_ttm is not None:
         snap.net_margin = snap.net_income_ttm / snap.revenue_ttm
 
-    # Score 0-4 → normalise to 0-1
+    # -- Minervini score 0-4 → 0.0-1.0 --
     score = 0
     if snap.revenue_growth is not None and snap.revenue_growth > 0.10:
         score += 1

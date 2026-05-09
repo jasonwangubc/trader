@@ -160,11 +160,17 @@ async def _upsert_symbol_bars(
 ) -> int:
     """Extract one symbol from the yfinance multi-symbol DataFrame and upsert."""
     try:
-        if len(all_symbols) == 1:
-            df = raw.copy()
+        # yfinance always returns a MultiIndex (field, symbol) even for single-symbol
+        # downloads in newer versions. Handle both cases.
+        if hasattr(raw.columns, "levels"):
+            # MultiIndex columns — extract this symbol's slice
+            if symbol in raw.columns.get_level_values(1):
+                df = raw.xs(symbol, axis=1, level=1).copy()
+            else:
+                df = pd.DataFrame()
         else:
-            # Multi-symbol download uses a MultiIndex: (field, symbol)
-            df = raw.xs(symbol, axis=1, level=1).copy() if symbol in raw.columns.get_level_values(1) else pd.DataFrame()
+            # Flat columns (legacy single-symbol behaviour)
+            df = raw.copy()
     except Exception:
         log.warning("No data in download for %s", symbol)
         return 0

@@ -144,7 +144,10 @@ async def recommendations(
     symbol = symbol.upper()
     df = await get_bars_df(session, symbol, days=252)
     if df.empty:
-        raise HTTPException(status_code=404, detail=f"No price data for {symbol}. Run a scan first.")
+        await _fetch_on_demand(session, symbol)
+        df = await get_bars_df(session, symbol, days=252)
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"No price data for {symbol}.")
     import asyncio
     loop = asyncio.get_event_loop()
     rec = await loop.run_in_executor(None, compute_recommendations, df, symbol)
@@ -162,6 +165,19 @@ async def recommendations(
     )
 
 
+async def _fetch_on_demand(session: AsyncSession, symbol: str) -> None:
+    """Auto-fetch 2yr of price data for any symbol not yet in the DB.
+    Uses sync_eod_incremental which handles all the yfinance edge cases.
+    """
+    from app.services.eod_service import sync_eod_incremental
+    log.info("On-demand price fetch for %s", symbol)
+    try:
+        await sync_eod_incremental(session, [symbol], full_years=2, delta_days=35)
+        log.info("On-demand fetch complete for %s", symbol)
+    except Exception:
+        log.exception("On-demand fetch failed for %s", symbol)
+
+
 @router.get("/{symbol}", response_model=ChartData)
 async def chart(
     symbol: str,
@@ -171,7 +187,11 @@ async def chart(
     symbol = symbol.upper()
     df = await get_bars_df(session, symbol, days=days)
     if df.empty:
-        raise HTTPException(status_code=404, detail=f"No price data for {symbol}. Run a screener scan first.")
+        # Auto-fetch for any symbol not in the DB (e.g. TBIL, CASH.TO, any ticket symbol)
+        await _fetch_on_demand(session, symbol)
+        df = await get_bars_df(session, symbol, days=days)
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"No price data for {symbol}. yfinance returned no data — check the ticker.")
 
     spy_df = await get_bars_df(session, "SPY", days=days)
 
