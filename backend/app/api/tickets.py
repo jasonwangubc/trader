@@ -421,7 +421,7 @@ async def get_ticket(
                 )
 
     base = TicketOut.from_orm_obj(t)
-    return TicketDetailOut(**base.model_dump(), orders=order_outs, exit_plan=t.exit_plan, trailing=trailing_out)
+    return TicketDetailOut(**base.model_dump(), orders=order_outs, trailing=trailing_out)
 
 
 @router.post("/{ticket_id}/cancel", response_model=TicketOut)
