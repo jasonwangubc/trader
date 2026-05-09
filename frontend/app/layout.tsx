@@ -35,7 +35,7 @@ export default function RootLayout({
     >
       <body className="min-h-full bg-background">
         <ClerkProvider>
-          <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+          <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
             <Sidebar />
             <div className="lg:pl-56 min-h-screen">
               {children}

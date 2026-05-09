@@ -427,135 +427,113 @@ function ResultCard({ result: r }: { result: ScoreResult }) {
   const fund = parseFloat(r.fundamental_score);
   const composite = Math.round(parseFloat(r.composite_score) * 100);
 
-  const ttColor  = r.tt_score >= 7 ? "text-emerald-600 dark:text-emerald-400" : r.tt_score >= 5 ? "text-amber-600" : "text-muted-foreground";
-  const vcpColor = vcp >= 0.7 ? "text-emerald-600 dark:text-emerald-400" : vcp >= 0.4 ? "text-amber-600" : "text-muted-foreground";
-  const fundColor = fund >= 0.75 ? "text-emerald-600 dark:text-emerald-400" : fund >= 0.5 ? "text-amber-600" : "text-muted-foreground";
+  // Score colours: emerald = strong, amber = ok, muted = weak
+  const ttColor   = r.tt_score >= 7 ? "text-emerald-400" : r.tt_score >= 5 ? "text-amber-400" : "text-muted-foreground";
+  const vcpColor  = vcp >= 0.7 ? "text-emerald-400" : vcp >= 0.4 ? "text-amber-400" : "text-muted-foreground";
+  const fundColor = fund >= 0.75 ? "text-emerald-400" : fund >= 0.5 ? "text-amber-400" : "text-muted-foreground";
+
+  // Composite score colour
+  const scoreColor = composite >= 70 ? "text-emerald-400" : composite >= 50 ? "text-amber-400" : "text-muted-foreground";
 
   const passing = Object.entries(r.tt_criteria).filter(([,v]) => v).map(([k]) => TT_CRITERIA_LABELS[k] ?? k);
   const failing  = Object.entries(r.tt_criteria).filter(([,v]) => !v).map(([k]) => TT_CRITERIA_LABELS[k] ?? k);
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <span className="font-mono text-xl font-semibold">{r.symbol}</span>
-            {r.sector && <Badge variant="outline" className="text-[10px]">{r.sector}</Badge>}
-            <Link href={`/chart/${r.symbol}`} className="text-muted-foreground hover:text-foreground" title="View chart">
-              <BarChart2 className="h-3.5 w-3.5" />
-            </Link>
-            <Link href={`/tickets/new?symbol=${r.symbol}`} className="text-primary text-xs hover:underline">+ Ticket</Link>
+    <div className="rounded-xl border bg-card hover:border-primary/30 transition-colors overflow-hidden">
+      {/* Card header row */}
+      <div className="flex items-center justify-between gap-3 px-4 pt-4 pb-3">
+        {/* Symbol + meta */}
+        <div className="flex items-center gap-2 min-w-0">
+          <Link href={`/chart/${r.symbol}`} className="font-mono text-lg font-bold hover:text-primary transition-colors">
+            {r.symbol}
+          </Link>
+          {r.sector && (
+            <span className="text-[10px] text-muted-foreground border border-border/60 rounded px-1.5 py-0.5 truncate max-w-25">
+              {r.sector}
+            </span>
+          )}
+          {r.last_close && (
+            <span className="text-sm text-muted-foreground tabular-nums">${parseFloat(r.last_close).toFixed(2)}</span>
+          )}
+        </div>
+
+        {/* Score pills */}
+        <div className="flex items-center gap-3 shrink-0">
+          <ScorePill label="TT" value={`${r.tt_score}/8`} color={ttColor} />
+          <ScorePill label="VCP" value={`${(vcp * 10).toFixed(0)}/10`} color={vcpColor} />
+          {r.rs_rank !== null && <ScorePill label="RS" value={String(r.rs_rank)} />}
+          <div className="text-right">
+            <div className={`text-xl font-bold tabular-nums leading-none ${scoreColor}`}>{composite}</div>
+            <div className="text-[10px] text-muted-foreground mt-0.5">score</div>
           </div>
-          <div className="flex items-center gap-4">
-            <Score label="Trend" value={`${r.tt_score}/8`} color={ttColor} />
-            <Score label="VCP" value={`${(vcp * 10).toFixed(1)}/10`} color={vcpColor} />
-            {r.rs_rank !== null && <Score label="RS rank" value={String(r.rs_rank)} />}
-            {fund > 0 ? (
-              <Score label="Earnings" value={`${(fund * 4).toFixed(1)}/4`} color={fundColor} />
-            ) : (
-              <Score label="Earnings" value="—" color="text-muted-foreground" />
-            )}
-            <div className="text-center">
-              <div className="text-xl font-bold">{composite}</div>
-              <div className="text-muted-foreground text-[10px] uppercase">Score/100</div>
-            </div>
+          <div className="flex flex-col gap-1">
+            <Link
+              href={`/chart/${r.symbol}`}
+              className="text-[10px] border border-border/60 rounded px-2 py-0.5 text-muted-foreground hover:border-primary/50 hover:text-foreground transition-colors"
+            >
+              Chart
+            </Link>
+            <Link
+              href={`/tickets/new?symbol=${r.symbol}`}
+              className="text-[10px] bg-primary/15 text-primary rounded px-2 py-0.5 hover:bg-primary/25 transition-colors"
+            >
+              + Ticket
+            </Link>
           </div>
         </div>
-      </CardHeader>
-      <CardContent className="space-y-3 text-sm">
-        {/* Prices */}
-        {r.last_close && (
-          <div className="grid grid-cols-4 gap-1 text-center text-xs">
-            {[["Price", r.last_close], ["50-day avg", r.ma_50], ["150-day avg", r.ma_150], ["200-day avg", r.ma_200]].map(([label, val]) => (
-              <div key={label as string}>
-                <div className="text-muted-foreground">{label}</div>
-                <div className="tabular-nums font-medium">{val ? `$${parseFloat(val as string).toFixed(2)}` : "—"}</div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Fundamentals — visual bars */}
+      </div>
+      <div className="px-4 pb-4 space-y-3 text-sm">
+        {/* Fundamentals row */}
         {(r.revenue_growth || r.net_income_growth || r.net_margin) ? (
-          <div className="rounded-md bg-muted/30 px-3 py-2 space-y-1.5">
-            <GrowthBar label="Rev growth"  value={r.revenue_growth}     target={0.25} />
-            <GrowthBar label="EPS growth"  value={r.net_income_growth}  target={0.25} />
-            <GrowthBar label="Net margin"  value={r.net_margin}         target={0.10} isMargin />
+          <div className="flex gap-4 text-xs">
+            <FundStat label="Rev" value={r.revenue_growth} target={0.25} />
+            <FundStat label="EPS" value={r.net_income_growth} target={0.25} />
+            <FundStat label="Margin" value={r.net_margin} target={0.10} />
           </div>
         ) : (
-          <p className="text-muted-foreground text-xs">No fundamental data — Canadian (TSX) stocks don't file with SEC.</p>
+          <p className="text-muted-foreground/50 text-[10px]">No SEC data (TSX or pending scan)</p>
         )}
 
-        {/* TT criteria chips */}
+        {/* TT criteria — passing only to keep it scannable */}
         <div className="flex flex-wrap gap-1">
           {passing.map(c => (
-            <span key={c} className="bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 rounded px-1.5 py-0.5 text-[10px]">✓ {c}</span>
+            <span key={c} className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded px-1.5 py-0.5 text-[10px]">
+              {c}
+            </span>
           ))}
-          {failing.map(c => (
-            <span key={c} className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">· {c}</span>
+          {failing.slice(0, 3).map(c => (
+            <span key={c} className="text-muted-foreground/40 text-[10px]">· {c}</span>
           ))}
         </div>
 
-        {/* VCP breakdown */}
-        {r.vcp_details && (
-          <div className="flex gap-2 text-center text-[10px]">
-            {["tightness","compression","volume","pivot","trend"].map(k => {
-              const val = r.vcp_details[k] as number;
-              return (
-                <div key={k} className="flex-1">
-                  <div className={`font-semibold tabular-nums ${val >= 1.5 ? "text-emerald-600 dark:text-emerald-400" : val >= 0.5 ? "text-amber-600" : "text-muted-foreground"}`}>
-                    {val?.toFixed(1) ?? "—"}
-                  </div>
-                  <div className="text-muted-foreground capitalize">{k}</div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Mini chart — 50 SMA (amber) + 150 SMA (violet) overlaid */}
-        <StockChart symbol={r.symbol} height={180} mini showSmas className="rounded-md overflow-hidden" />
-
-        <Link href={`/chart/${r.symbol}`} className="text-primary text-xs flex items-center gap-1 hover:underline">
-          <BarChart2 className="h-3 w-3" /> View full chart with SMA overlays + pivot →
-        </Link>
-      </CardContent>
-    </Card>
-  );
-}
-
-function Score({ label, value, color = "" }: { label: string; value: string; color?: string }) {
-  return (
-    <div className="text-center">
-      <div className={`text-lg font-bold tabular-nums ${color}`}>{value}</div>
-      <div className="text-muted-foreground text-[10px] uppercase">{label}</div>
+        {/* Mini chart */}
+        <StockChart symbol={r.symbol} height={160} mini showSmas className="rounded-lg overflow-hidden opacity-90" />
+      </div>
     </div>
   );
 }
 
-function GrowthBar({
-  label, value, target, isMargin,
-}: {
-  label: string; value: string | null; target: number; isMargin?: boolean;
-}) {
+function ScorePill({ label, value, color = "" }: { label: string; value: string; color?: string }) {
+  return (
+    <div className="text-center min-w-8">
+      <div className={`text-base font-bold tabular-nums leading-none ${color}`}>{value}</div>
+      <div className="text-muted-foreground/60 text-[9px] uppercase tracking-wide mt-0.5">{label}</div>
+    </div>
+  );
+}
+
+function FundStat({ label, value, target }: { label: string; value: string | null; target: number }) {
   if (!value) return null;
   const v = parseFloat(value);
-  const passing = v >= target;
-  const great   = v >= target * 2;
-  // Cap visual bar at 200% of target for display
-  const barPct  = Math.min(Math.max(v / (target * 2), 0), 1) * 100;
-  const color   = great ? "bg-emerald-500" : passing ? "bg-emerald-400" : v > 0 ? "bg-amber-400" : "bg-destructive";
-  const textCls = great ? "text-emerald-600 dark:text-emerald-400" : passing ? "text-emerald-600/70" : v > 0 ? "text-amber-600" : "text-destructive";
-
+  const great = v >= target * 2;
+  const ok    = v >= target;
+  const cls   = great ? "text-emerald-400" : ok ? "text-emerald-400/70" : v > 0 ? "text-amber-400" : "text-destructive";
   return (
-    <div className="flex items-center gap-2 text-[11px]">
-      <span className="text-muted-foreground w-20 shrink-0">{label}</span>
-      <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
-        <div className={`h-full rounded-full ${color}`} style={{ width: `${barPct}%` }} />
-      </div>
-      <span className={`tabular-nums font-medium w-12 text-right ${textCls}`}>
+    <div>
+      <div className="text-muted-foreground/60 text-[9px] uppercase tracking-wide">{label}</div>
+      <div className={`font-semibold tabular-nums text-sm ${cls}`}>
         {v >= 0 ? "+" : ""}{(v * 100).toFixed(0)}%
-      </span>
+      </div>
     </div>
   );
 }

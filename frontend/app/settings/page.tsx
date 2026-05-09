@@ -33,7 +33,7 @@ export default async function SettingsPage() {
             <CardDescription>Manage your login and profile.</CardDescription>
           </CardHeader>
           <CardContent>
-            <UserButton afterSignOutUrl="/sign-in" showName />
+            <UserButton showName />
           </CardContent>
         </Card>
 

@@ -26,18 +26,43 @@ import { UserButton } from "@clerk/nextjs";
 import { API_URL } from "@/lib/api";
 import { SymbolSearch } from "@/components/symbol-search";
 
-const NAV = [
-  { href: "/",           label: "Dashboard",  Icon: LayoutDashboard },
-  { href: "/routine",    label: "Routine",    Icon: ClipboardList },
-  { href: "/screener",   label: "Screener",   Icon: Search },
-  { href: "/watchlist",  label: "Watchlist",  Icon: Eye },
-  { href: "/tickets",    label: "Tickets",    Icon: FileText },
-  { href: "/options",    label: "Options",    Icon: LineChart },
-  { href: "/positions",  label: "Positions",  Icon: TrendingUp },
-  { href: "/accounts",   label: "Accounts",   Icon: Wallet },
-  { href: "/journal",    label: "Journal",    Icon: BookOpen },
-  { href: "/backtest",   label: "Backtest",   Icon: FlaskConical },
-  { href: "/settings",   label: "Settings",   Icon: Settings },
+const NAV_SECTIONS = [
+  {
+    label: "Overview",
+    items: [
+      { href: "/",        label: "Dashboard", Icon: LayoutDashboard },
+      { href: "/routine", label: "Routine",   Icon: ClipboardList },
+    ],
+  },
+  {
+    label: "Research",
+    items: [
+      { href: "/screener",  label: "Screener",  Icon: Search },
+      { href: "/watchlist", label: "Watchlist", Icon: Eye },
+    ],
+  },
+  {
+    label: "Trade",
+    items: [
+      { href: "/tickets",   label: "Tickets",   Icon: FileText },
+      { href: "/options",   label: "Options",   Icon: LineChart },
+      { href: "/positions", label: "Positions", Icon: TrendingUp },
+    ],
+  },
+  {
+    label: "Analyze",
+    items: [
+      { href: "/journal",  label: "Journal",  Icon: BookOpen },
+      { href: "/backtest", label: "Backtest", Icon: FlaskConical },
+    ],
+  },
+  {
+    label: "Account",
+    items: [
+      { href: "/accounts", label: "Accounts", Icon: Wallet },
+      { href: "/settings", label: "Settings", Icon: Settings },
+    ],
+  },
 ];
 
 type MonitorStatus = { running: boolean; armed_tickets: number; kill_switch: boolean; market_open: boolean };
@@ -73,102 +98,112 @@ export function Sidebar() {
     regime?.regime === "bear"    ? "text-destructive" : "text-muted-foreground";
 
   const content = (
-    <nav className="flex h-full flex-col">
+    <nav className="flex h-full flex-col overflow-hidden">
       {/* Logo */}
-      <div className="flex items-center gap-2 px-4 py-4">
-        <Shield className="text-primary h-5 w-5" />
-        <span className="text-lg font-semibold tracking-tight">trader</span>
+      <div className="flex items-center gap-2.5 px-4 pt-5 pb-3">
+        <div className="bg-primary/15 flex h-7 w-7 items-center justify-center rounded-lg">
+          <Shield className="text-primary h-4 w-4" />
+        </div>
+        <span className="text-base font-semibold tracking-tight">trader</span>
+        <button
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          className="text-muted-foreground hover:text-foreground ml-auto rounded-md p-1 hover:bg-muted/60 transition-colors"
+          title="Toggle theme"
+        >
+          {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+        </button>
       </div>
 
       {/* Symbol search */}
       <SymbolSearch />
 
-      {/* Links */}
-      <div className="flex-1 space-y-0.5 px-2">
-        {NAV.map(({ href, label, Icon }) => {
-          const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
-          return (
-            <Link
-              key={href}
-              href={href}
-              onClick={() => setOpen(false)}
-              className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
-                active
-                  ? "bg-primary/10 text-primary"
-                  : "text-muted-foreground hover:bg-muted hover:text-foreground"
-              }`}
-            >
-              <Icon className="h-4 w-4 shrink-0" />
+      {/* Sectioned navigation */}
+      <div className="flex-1 overflow-y-auto px-2 py-1 space-y-4">
+        {NAV_SECTIONS.map(({ label, items }) => (
+          <div key={label}>
+            <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60">
               {label}
-              {label === "Tickets" && monitor && monitor.armed_tickets > 0 && (
-                <span className="bg-primary text-primary-foreground ml-auto rounded-full px-1.5 py-0.5 text-[10px] font-semibold">
-                  {monitor.armed_tickets}
-                </span>
-              )}
-            </Link>
-          );
-        })}
+            </p>
+            <div className="space-y-0.5">
+              {items.map(({ href, label: itemLabel, Icon }) => {
+                const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
+                return (
+                  <Link
+                    key={href}
+                    href={href}
+                    onClick={() => setOpen(false)}
+                    className={`group flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-sm transition-all ${
+                      active
+                        ? "bg-primary/12 text-primary font-medium"
+                        : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                    }`}
+                  >
+                    <Icon className={`h-3.5 w-3.5 shrink-0 ${active ? "text-primary" : "text-muted-foreground group-hover:text-foreground"}`} />
+                    {itemLabel}
+                    {itemLabel === "Tickets" && monitor && monitor.armed_tickets > 0 && (
+                      <span className="bg-primary text-primary-foreground ml-auto rounded-full px-1.5 py-0.5 text-[10px] font-bold tabular-nums">
+                        {monitor.armed_tickets}
+                      </span>
+                    )}
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        ))}
       </div>
 
-      {/* Bottom section */}
-      <div className="border-t px-3 py-4 space-y-3">
-        {/* User account */}
-        <div className="flex items-center gap-2">
-          <UserButton afterSignOutUrl="/sign-in" />
-          <span className="text-muted-foreground text-xs">Account</span>
-        </div>
-
-        {/* Dark mode toggle */}
-        <div className="flex items-center justify-between text-xs">
-          <span className="text-muted-foreground">Theme</span>
-          <button
-            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-            className="text-muted-foreground hover:text-foreground rounded p-1 hover:bg-muted transition-colors"
-            title="Toggle dark/light mode"
-          >
-            {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-          </button>
-        </div>
-
-        {/* Regime */}
+      {/* Status footer */}
+      <div className="border-t border-border/50 px-3 py-3 space-y-2">
+        {/* Regime pill */}
         {regime && (
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-muted-foreground">Market regime</span>
-            <span className={`font-semibold uppercase ${regimeColor}`}>
+          <div className={`flex items-center justify-between rounded-lg px-2.5 py-1.5 text-xs ${
+            regime.regime === "bull"    ? "bg-emerald-500/10" :
+            regime.regime === "caution" ? "bg-amber-500/10"   :
+            "bg-destructive/10"
+          }`}>
+            <span className="text-muted-foreground">Regime</span>
+            <span className={`font-semibold uppercase tracking-wide ${regimeColor}`}>
               {regime.regime}
             </span>
           </div>
         )}
 
-        {/* Monitor status */}
+        {/* Monitor row */}
         {monitor && (
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-muted-foreground">
-              {monitor.market_open ? "Monitor active" : "Monitor idle"}
-            </span>
-            <span className={`h-2 w-2 rounded-full ${
-              monitor.kill_switch ? "bg-destructive" :
-              monitor.market_open ? "bg-emerald-500 animate-pulse" : "bg-muted-foreground"
-            }`} />
+          <div className="flex items-center justify-between px-0.5">
+            <button
+              onClick={toggleKillSwitch}
+              className={`text-xs px-2 py-1 rounded-md font-medium transition-colors ${
+                monitor.kill_switch
+                  ? "bg-primary/15 text-primary hover:bg-primary/25"
+                  : "text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+              }`}
+            >
+              {monitor.kill_switch ? "Re-arm" : "Kill switch"}
+            </button>
+            <div className="flex items-center gap-1.5">
+              <span className={`h-1.5 w-1.5 rounded-full ${
+                monitor.kill_switch ? "bg-destructive" :
+                monitor.market_open ? "bg-emerald-500 animate-pulse" :
+                "bg-muted-foreground/40"
+              }`} />
+              <span className="text-[10px] text-muted-foreground">
+                {monitor.kill_switch ? "halted" : monitor.market_open ? "watching" : "closed"}
+              </span>
+            </div>
           </div>
         )}
 
-        {/* Kill switch */}
-        {monitor && (
-          <button
-            onClick={toggleKillSwitch}
-            className={`w-full rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-              monitor.kill_switch
-                ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                : "border border-destructive/40 text-destructive hover:bg-destructive/10"
-            }`}
-          >
-            {monitor.kill_switch ? "Re-arm monitor" : "Kill switch"}
-          </button>
-        )}
+        {/* User */}
+        <div className="flex items-center gap-2 pt-0.5">
+          <UserButton />
+          <span className="text-xs text-muted-foreground truncate">Account</span>
+        </div>
       </div>
     </nav>
   );
+
 
   return (
     <>
