@@ -1,20 +1,13 @@
 import Link from "next/link";
-import { CheckCircle, AlertTriangle, RefreshCw, Clock, BarChart2 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { RefreshCw } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
-import {
-  type ResultsPage,
-  type ScoreResult,
-  type ScreenerSymbol,
-  TT_CRITERIA_LABELS,
-  fmtPct,
-} from "@/lib/screener";
-import { StockChart } from "@/components/stock-chart";
-import { WatchlistManager } from "./watchlist-manager";
+import { type ResultsPage } from "@/lib/screener";
+import { ResultsTable } from "./results-table";
+import { DataStatusPanel } from "./data-status-panel";
+import { AddSymbolButton } from "./add-symbol-button";
+import { ScanProgress } from "./scan-progress";
 
-export const metadata = { title: 'Screener' };
-
+export const metadata = { title: "Screener" };
 
 // ---- Types ----
 
@@ -41,46 +34,100 @@ interface ScoreCoverage {
   tt_distribution: Record<string, number>;
 }
 
-interface ScreenerHealth {
+export interface ScreenerHealth {
   universe_total: number;
   price: PriceCoverage;
   fundamentals: FundamentalCoverage;
   scores: ScoreCoverage;
 }
 
-interface SyncStatus { running: boolean; message: string }
+interface ScanProgressData {
+  stage: string;
+  stage_label: string;
+  stage_index: number;
+  total_stages: number;
+  processed: number;
+  total: number;
+  pct: number;
+  started_at: string | null;
+  updated_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+}
+
+interface SyncStatus {
+  running: boolean;
+  message: string;
+  progress?: ScanProgressData | null;
+}
+
+// Quick-filter chip definitions (preset combos that match common screening intents)
+interface ChipDef {
+  label: string;
+  hint: string;
+  params: Record<string, string>;
+}
+
+const CHIPS: ChipDef[] = [
+  { label: "All",         hint: "No filters",                                            params: {} },
+  { label: "Setting up",  hint: "At pivot or in base — actionable now (Recommended)",   params: { buyability: "at_pivot,in_base" } },
+  { label: "At pivot",    hint: "Within ±5% of pivot — buyable today",                  params: { buyability: "at_pivot" } },
+  { label: "VCP",         hint: "Volatility Contraction Pattern setups only",           params: { pattern: "vcp", buyability: "at_pivot,in_base" } },
+  { label: "Cup & Handle",hint: "Cup with Handle setups only",                          params: { pattern: "cwh", buyability: "at_pivot,in_base" } },
+  { label: "Flat Base",   hint: "Flat base setups only",                                params: { pattern: "flat_base", buyability: "at_pivot,in_base" } },
+  { label: "Leaders",     hint: "Composite ≥ 70 (includes extended)",                   params: { min_composite: "70" } },
+  { label: "EPS ≥ 80",    hint: "Top quintile of earnings strength",                    params: { min_eps: "80" } },
+  { label: "RS ≥ 80",     hint: "Top quintile of relative strength",                    params: { min_rs: "80" } },
+  { label: "CANSLIM",     hint: "EPS+RS top quartile + clean setup",                    params: { min_eps: "75", min_rs: "75", buyability: "at_pivot,in_base" } },
+];
+
+const PAGE_SIZE = 50;
 
 // ---- Page ----
-
-const PAGE_SIZE = 20;
 
 export default async function ScreenerPage({
   searchParams,
 }: {
-  searchParams: Promise<{ min_tt?: string; min_vcp?: string; page?: string }>;
+  searchParams: Promise<{
+    min_tt?: string;
+    min_vcp?: string;
+    min_eps?: string;
+    min_rs?: string;
+    min_composite?: string;
+    buyability?: string;
+    pattern?: string;
+    page?: string;
+  }>;
 }) {
   const params = await searchParams;
-  const minTT  = parseInt(params.min_tt  ?? "0") || 0;
-  const minVCP = parseFloat(params.min_vcp ?? "0") || 0;
-  const page   = Math.max(1, parseInt(params.page ?? "1") || 1);
+  const minTT        = parseInt(params.min_tt        ?? "0") || 0;
+  const minVCP       = parseFloat(params.min_vcp     ?? "0") || 0;
+  const minEPS       = parseInt(params.min_eps       ?? "0") || 0;
+  const minRS        = parseInt(params.min_rs        ?? "0") || 0;
+  const minComposite = parseInt(params.min_composite ?? "0") || 0;
+  const buyabilityParam = params.buyability ?? "";
+  const patternParam    = params.pattern ?? "";
+  const page         = Math.max(1, parseInt(params.page ?? "1") || 1);
+
+  const qp = new URLSearchParams();
+  if (minTT)        qp.set("min_tt",        String(minTT));
+  if (minVCP)       qp.set("min_vcp",       String(minVCP));
+  if (minEPS)       qp.set("min_eps",       String(minEPS));
+  if (minRS)        qp.set("min_rs",        String(minRS));
+  if (minComposite) qp.set("min_composite", String(minComposite));
+  if (buyabilityParam) qp.set("buyability", buyabilityParam);
+  if (patternParam)    qp.set("pattern",    patternParam);
+  qp.set("page",      String(page));
+  qp.set("page_size", String(PAGE_SIZE));
 
   let resultsPage: ResultsPage | null = null;
-  let watchlist: ScreenerSymbol[] = [];
   let health: ScreenerHealth | null = null;
   let syncStatus: SyncStatus = { running: false, message: "" };
   let error: string | null = null;
 
-  const qp = new URLSearchParams();
-  if (minTT)  qp.set("min_tt",   String(minTT));
-  if (minVCP) qp.set("min_vcp",  String(minVCP));
-  qp.set("page",      String(page));
-  qp.set("page_size", String(PAGE_SIZE));
-  const resultPath = `/api/screener/results?${qp}`;
-
   try {
-    [resultsPage, watchlist, health, syncStatus] = await Promise.all([
-      api<ResultsPage>(resultPath),
-      api<ScreenerSymbol[]>("/api/screener/watchlist"),
+    [resultsPage, health, syncStatus] = await Promise.all([
+      api<ResultsPage>(`/api/screener/results?${qp}`),
       api<ScreenerHealth>("/api/screener/health"),
       api<SyncStatus>("/api/screener/sync/status"),
     ]);
@@ -89,69 +136,181 @@ export default async function ScreenerPage({
   }
 
   const results = resultsPage?.items ?? [];
+  const lastRun = health?.scores.last_run_at ? new Date(health.scores.last_run_at) : null;
+  const activeFilters = { minTT, minVCP, minEPS, minRS, minComposite, buyability: buyabilityParam, pattern: patternParam };
+  const anyFilter = minTT || minVCP || minEPS || minRS || minComposite || buyabilityParam || patternParam;
 
   return (
-    <main className="container mx-auto max-w-7xl p-6 sm:p-10">
-      <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
+    <main className="container mx-auto max-w-[88rem] p-6 sm:p-8">
+      {/* Header — title + scan button + last-run timestamp */}
+      <header className="mb-5 flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-3xl font-semibold tracking-tight">Screener</h1>
-          <p className="text-muted-foreground mt-1 text-sm">
-            S&P 500 · NASDAQ 100 · TSX 60 — scored daily on technical + fundamental criteria
+          <h1 className="text-2xl font-semibold tracking-tight">Screener</h1>
+          <p className="text-muted-foreground mt-0.5 text-xs">
+            {health ? (
+              <>
+                {health.scores.total_scored.toLocaleString()} scored ·{" "}
+                {lastRun ? `last ${timeAgo(lastRun)}` : "never run"}
+                {health.price.is_stale && <span className="text-amber-500"> · price data stale</span>}
+              </>
+            ) : (
+              "S&P 500 + 400 + 600 + NASDAQ 100 + TSX 60"
+            )}
           </p>
         </div>
-        <ScanButton running={syncStatus.running} />
+        <div className="flex items-center gap-2">
+          <AddSymbolButton />
+          <ScanButton running={syncStatus.running} />
+        </div>
       </header>
 
       {error && (
-        <div className="border-destructive/50 bg-destructive/10 text-destructive mb-6 rounded-md border p-4 text-sm">{error}</div>
+        <div className="border-destructive/50 bg-destructive/10 text-destructive mb-5 rounded-md border p-4 text-sm">{error}</div>
       )}
 
-      {/* Data health */}
-      {health ? (
-        <HealthDashboard health={health} syncRunning={syncStatus.running} />
-      ) : (
-        <div className="mb-6 rounded-lg border bg-muted/30 p-4 text-sm text-muted-foreground">
-          No data yet. Click "Run scan" to download the universe and score all stocks.
-        </div>
-      )}
-
-      {/* Results */}
-      <div className="mt-6 grid gap-6 lg:grid-cols-[1fr_18rem]">
-        <div className="space-y-4">
-          <FilterBar
-            currentMinTT={minTT}
-            currentMinVCP={minVCP}
-            totalResults={resultsPage?.total ?? 0}
-            page={page}
-            pages={resultsPage?.pages ?? 1}
-          />
-          {results.length === 0 ? (
-            <Card>
-              <CardContent className="py-12 text-center text-sm text-muted-foreground">
-                {health && health.scores.total_scored === 0
-                  ? "No results yet — run a scan to score the full universe."
-                  : "No stocks match the current filters. Try lowering the minimum scores."}
-              </CardContent>
-            </Card>
-          ) : (
-            results.map(r => <ResultCard key={r.symbol} result={r} />)
-          )}
-        </div>
-        <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-          <WatchlistManager initialSymbols={watchlist} />
-        </aside>
+      {/* Live scan progress (visible only while scanning, plus briefly after) */}
+      <div className="mb-3">
+        <ScanProgress
+          initialRunning={syncStatus.running}
+          initialProgress={syncStatus.progress ?? null}
+        />
       </div>
+
+      <div className="space-y-3 min-w-0">
+        {/* Quick filter chips */}
+        <FilterChips active={activeFilters} totalResults={resultsPage?.total ?? 0} />
+
+        {/* Results table */}
+        <ResultsTable results={results} />
+
+        {/* Pagination */}
+        {resultsPage && resultsPage.pages > 1 && (
+          <Pagination
+            page={page}
+            pages={resultsPage.pages}
+            total={resultsPage.total}
+            activeFilters={activeFilters}
+          />
+        )}
+
+        {/* Data status — collapsed by default */}
+        {health && <DataStatusPanel health={health} />}
+      </div>
+
+      {!anyFilter && results.length === 0 && health && health.scores.total_scored === 0 && (
+        <div className="mt-6 rounded-lg border bg-muted/30 p-4 text-sm text-muted-foreground">
+          No data yet. Click <span className="font-medium text-foreground">Run scan</span> to download the universe and score all stocks.
+        </div>
+      )}
     </main>
   );
 }
 
-// ---- Scan button (server-side link, triggers background task) ----
+// ---- Quick filter chips ----
+
+function FilterChips({
+  active, totalResults,
+}: {
+  active: { minTT: number; minVCP: number; minEPS: number; minRS: number; minComposite: number; buyability: string; pattern: string };
+  totalResults: number;
+}) {
+  const isActive = (chip: ChipDef): boolean => {
+    const want = chip.params;
+    const has = (k: string, v: number | string) => {
+      const wv = want[k];
+      if (wv === undefined) return v === 0 || v === "0" || v === "";
+      return String(v) === wv;
+    };
+    return (
+      has("min_tt", active.minTT) &&
+      has("min_vcp", active.minVCP) &&
+      has("min_eps", active.minEPS) &&
+      has("min_rs", active.minRS) &&
+      has("min_composite", active.minComposite) &&
+      has("buyability", active.buyability) &&
+      has("pattern", active.pattern)
+    );
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-muted-foreground text-xs font-medium pr-1">
+        {totalResults.toLocaleString()} {totalResults === 1 ? "stock" : "stocks"}
+      </span>
+      <div className="flex flex-wrap gap-1.5">
+        {CHIPS.map(chip => {
+          const active_ = isActive(chip);
+          const qs = new URLSearchParams(chip.params).toString();
+          const href = qs ? `/screener?${qs}` : "/screener";
+          return (
+            <Link
+              key={chip.label}
+              href={href}
+              title={chip.hint}
+              className={`inline-flex h-7 items-center rounded-full border px-3 text-xs font-medium transition-colors ${
+                active_
+                  ? "border-primary/50 bg-primary/15 text-primary"
+                  : "border-border/60 text-muted-foreground hover:border-border hover:text-foreground"
+              }`}
+            >
+              {chip.label}
+            </Link>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---- Pagination ----
+
+function Pagination({
+  page, pages, total, activeFilters,
+}: {
+  page: number; pages: number; total: number;
+  activeFilters: { minTT: number; minVCP: number; minEPS: number; minRS: number; minComposite: number; buyability: string; pattern: string };
+}) {
+  const buildUrl = (p: number) => {
+    const q = new URLSearchParams();
+    if (activeFilters.minTT)        q.set("min_tt",        String(activeFilters.minTT));
+    if (activeFilters.minVCP)       q.set("min_vcp",       String(activeFilters.minVCP));
+    if (activeFilters.minEPS)       q.set("min_eps",       String(activeFilters.minEPS));
+    if (activeFilters.minRS)        q.set("min_rs",        String(activeFilters.minRS));
+    if (activeFilters.minComposite) q.set("min_composite", String(activeFilters.minComposite));
+    if (activeFilters.buyability)   q.set("buyability",    activeFilters.buyability);
+    if (activeFilters.pattern)      q.set("pattern",       activeFilters.pattern);
+    if (p > 1) q.set("page", String(p));
+    return `/screener${q.size ? "?" + q : ""}`;
+  };
+
+  return (
+    <div className="flex items-center justify-between px-1 pt-1">
+      <span className="text-muted-foreground text-xs">
+        Page {page} of {pages} · {total.toLocaleString()} total
+      </span>
+      <div className="flex items-center gap-1">
+        {page > 1 && (
+          <Link href={buildUrl(page - 1)} className="border-border/60 hover:bg-muted inline-flex h-7 items-center rounded border px-2.5 text-xs">
+            ← Prev
+          </Link>
+        )}
+        {page < pages && (
+          <Link href={buildUrl(page + 1)} className="border-border/60 hover:bg-muted inline-flex h-7 items-center rounded border px-2.5 text-xs">
+            Next →
+          </Link>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---- Scan button ----
 
 function ScanButton({ running }: { running: boolean }) {
   return (
     <div className="flex items-center gap-2">
       {running && (
-        <span className="text-muted-foreground flex items-center gap-1.5 text-sm">
+        <span className="text-muted-foreground flex items-center gap-1.5 text-xs">
           <RefreshCw className="h-3.5 w-3.5 animate-spin" />
           Scanning…
         </span>
@@ -171,381 +330,7 @@ function ScanButton({ running }: { running: boolean }) {
   );
 }
 
-// ---- Health dashboard ----
-
-function HealthDashboard({ health, syncRunning }: { health: ScreenerHealth; syncRunning: boolean }) {
-  const { price, fundamentals, scores, universe_total } = health;
-
-  const lastRun = scores.last_run_at ? new Date(scores.last_run_at) : null;
-  const latestBar = price.latest_bar_date ? new Date(price.latest_bar_date + "T00:00:00") : null;
-
-  const priceStale = health?.price.is_stale ?? true;
-  const scoresStale = lastRun ? (Date.now() - lastRun.getTime()) > 3 * 86_400_000 : true;
-
-  return (
-    <div className="space-y-4">
-      {/* 3-panel summary */}
-      <div className="grid gap-3 sm:grid-cols-3">
-        {/* Price data */}
-        <StatusCard
-          title="Price data"
-          subtitle="Daily closing prices (adjusted)"
-          good={price.symbols_with_recent_bars}
-          total={universe_total}
-          detail={latestBar ? `Last close: ${latestBar.toLocaleDateString("en-CA")}` : "No data yet"}
-          stale={price.is_stale}
-          staleness={
-            price.is_stale
-              ? latestBar
-                ? `Data is ${daysSince(latestBar)} old — auto-refresh runs at 5:30 PM ET weekdays`
-                : "No data yet"
-              : undefined
-          }
-        />
-
-        {/* Fundamentals */}
-        <StatusCard
-          title="Fundamental data"
-          subtitle="Revenue, earnings, margins (SEC EDGAR)"
-          good={fundamentals.symbols_with_fundamentals}
-          total={scores.total_scored}
-          detail={`${scores.total_scored - fundamentals.symbols_with_fundamentals} missing — many are Canadian (TSX-listed) and don't file with SEC`}
-          stale={false}
-          warn={fundamentals.pct_covered < 60}
-        />
-
-        {/* Scores */}
-        <StatusCard
-          title="Screener scores"
-          subtitle="Trend Template + VCP + fundamentals ranked"
-          good={scores.total_scored}
-          total={universe_total}
-          detail={lastRun ? `Scored ${timeAgo(lastRun)}` : "Never scored"}
-          stale={scoresStale}
-          staleness={lastRun ? `Run ${daysSince(lastRun)} day(s) ago` : undefined}
-        />
-      </div>
-
-      {/* TT breakdown */}
-      {Object.keys(scores.tt_distribution).length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Trend Template breakdown</CardTitle>
-            <CardDescription className="text-xs">
-              How many stocks pass each number of criteria (0-8). Aim for TT ≥ 6 for quality setups.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <TTBar distribution={scores.tt_distribution} total={scores.total_scored} />
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Missing fundamentals */}
-      {fundamentals.top_missing.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">
-              High-scoring stocks without fundamental data ({fundamentals.symbols_scored - fundamentals.symbols_with_fundamentals} total)
-            </CardTitle>
-            <CardDescription className="text-xs">{fundamentals.note}</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-1.5">
-              {fundamentals.top_missing.map(s => (
-                <span key={s.symbol} className="bg-muted rounded px-2 py-1 text-xs font-mono">
-                  {s.symbol}
-                  <span className="text-muted-foreground ml-1">TT{s.tt_score}</span>
-                </span>
-              ))}
-            </div>
-            <p className="text-muted-foreground mt-3 text-xs">
-              Run another scan to attempt fetching missing EDGAR data.
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Missing price data */}
-      {price.missing_symbols.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">
-              Stocks with no recent price data ({price.missing_symbols.length})
-            </CardTitle>
-            <CardDescription className="text-xs">
-              These are in your watchlist but yfinance returned no data. Likely delisted, renamed, or wrong ticker format.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-1.5">
-              {price.missing_symbols.map(s => (
-                <span key={s} className="bg-muted text-muted-foreground rounded px-2 py-1 text-xs font-mono">{s}</span>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-    </div>
-  );
-}
-
-function StatusCard({
-  title, subtitle, good, total, detail, stale, staleness, warn,
-}: {
-  title: string; subtitle: string;
-  good: number; total: number;
-  detail: string; stale?: boolean; staleness?: string; warn?: boolean;
-}) {
-  const pct = total > 0 ? Math.round(good / total * 100) : 0;
-  const Icon = stale ? AlertTriangle : warn ? AlertTriangle : CheckCircle;
-  const iconCls = stale ? "text-amber-500" : warn ? "text-amber-500" : good === total ? "text-emerald-500" : "text-emerald-500";
-
-  return (
-    <Card className={stale ? "border-amber-200 dark:border-amber-800" : ""}>
-      <CardContent className="pt-4 pb-3 space-y-1.5">
-        <div className="flex items-start justify-between gap-2">
-          <div>
-            <p className="text-sm font-semibold">{title}</p>
-            <p className="text-muted-foreground text-xs">{subtitle}</p>
-          </div>
-          <Icon className={`h-4 w-4 shrink-0 mt-0.5 ${iconCls}`} />
-        </div>
-        <div className="flex items-end gap-2">
-          <span className="text-2xl font-bold tabular-nums">{good.toLocaleString()}</span>
-          <span className="text-muted-foreground text-sm pb-0.5">/ {total.toLocaleString()}</span>
-          <span className="text-muted-foreground text-xs pb-0.5 ml-auto">{pct}%</span>
-        </div>
-        {/* Progress bar */}
-        <div className="h-1.5 rounded-full bg-muted overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all ${stale ? "bg-amber-400" : "bg-emerald-500"}`}
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-        <p className="text-muted-foreground text-xs">{detail}</p>
-        {stale && staleness && (
-          <p className="text-amber-600 dark:text-amber-400 text-xs font-medium">⚠ {staleness} — run a scan to refresh</p>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function TTBar({ distribution, total }: { distribution: Record<string, number>; total: number }) {
-  const scores = [8,7,6,5,4,3,2,1,0];
-  const colors = ["bg-emerald-600","bg-emerald-500","bg-emerald-400","bg-amber-400","bg-amber-300","bg-amber-200","bg-muted","bg-muted","bg-muted"];
-
-  return (
-    <div className="space-y-1">
-      {scores.map((s, i) => {
-        const count = distribution[String(s)] ?? 0;
-        if (count === 0) return null;
-        const pct = total > 0 ? (count / total * 100) : 0;
-        return (
-          <div key={s} className="flex items-center gap-2 text-xs">
-            <span className="w-10 text-right tabular-nums font-medium text-muted-foreground">{s}/8</span>
-            <div className="flex-1 h-4 rounded bg-muted overflow-hidden">
-              <div className={`h-full rounded ${colors[i]}`} style={{ width: `${Math.max(pct, 0.5)}%` }} />
-            </div>
-            <span className="w-16 tabular-nums text-muted-foreground">{count} ({pct.toFixed(0)}%)</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ---- Filters ----
-
-function FilterBar({
-  currentMinTT, currentMinVCP, totalResults, page, pages,
-}: {
-  currentMinTT: number; currentMinVCP: number; totalResults: number; page: number; pages: number;
-}) {
-  const buildUrl = (p: number) => {
-    const q = new URLSearchParams();
-    if (currentMinTT)  q.set("min_tt",  String(currentMinTT));
-    if (currentMinVCP) q.set("min_vcp", String(currentMinVCP));
-    if (p > 1)         q.set("page",    String(p));
-    return `/screener${q.size ? "?" + q : ""}`;
-  };
-
-  return (
-    <div className="flex flex-wrap items-center gap-3">
-      <span className="text-muted-foreground text-sm font-medium">
-        {totalResults} candidates
-        {pages > 1 && ` · page ${page}/${pages}`}
-      </span>
-      <form method="get" className="flex items-center gap-2 ml-auto">
-        <label className="flex items-center gap-1.5 text-xs">
-          <span className="text-muted-foreground">Min Trend Template</span>
-          <select name="min_tt" defaultValue={String(currentMinTT)}
-            className="border-input bg-background h-7 rounded border px-2 text-xs">
-            {[0,3,4,5,6,7,8].map(v => <option key={v} value={v}>{v}+/8</option>)}
-          </select>
-        </label>
-        <label className="flex items-center gap-1.5 text-xs">
-          <span className="text-muted-foreground">Min VCP</span>
-          <select name="min_vcp" defaultValue={String(currentMinVCP)}
-            className="border-input bg-background h-7 rounded border px-2 text-xs">
-            {[[0,"Any"],[0.3,"3/10+"],[0.5,"5/10+"],[0.7,"7/10+"]].map(([v,l]) =>
-              <option key={v} value={v}>{l}</option>
-            )}
-          </select>
-        </label>
-        <button type="submit" className="bg-muted hover:bg-muted/80 h-7 rounded px-3 text-xs font-medium">Apply</button>
-        {(currentMinTT > 0 || currentMinVCP > 0) && (
-          <Link href="/screener" className="text-muted-foreground text-xs hover:underline">Clear</Link>
-        )}
-      </form>
-
-      {/* Pagination */}
-      {pages > 1 && (
-        <div className="flex items-center gap-1 ml-auto">
-          {page > 1 && (
-            <Link href={buildUrl(page - 1)} className="border-input hover:bg-muted inline-flex h-7 items-center rounded border px-2 text-xs">
-              ← Prev
-            </Link>
-          )}
-          <span className="text-muted-foreground text-xs px-1">{page} / {pages}</span>
-          {page < pages && (
-            <Link href={buildUrl(page + 1)} className="border-input hover:bg-muted inline-flex h-7 items-center rounded border px-2 text-xs">
-              Next →
-            </Link>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---- Result card ----
-
-function ResultCard({ result: r }: { result: ScoreResult }) {
-  const vcp = parseFloat(r.vcp_score);
-  const fund = parseFloat(r.fundamental_score);
-  const composite = Math.round(parseFloat(r.composite_score) * 100);
-
-  // Score colours: emerald = strong, amber = ok, muted = weak
-  const ttColor   = r.tt_score >= 7 ? "text-emerald-400" : r.tt_score >= 5 ? "text-amber-400" : "text-muted-foreground";
-  const vcpColor  = vcp >= 0.7 ? "text-emerald-400" : vcp >= 0.4 ? "text-amber-400" : "text-muted-foreground";
-  const fundColor = fund >= 0.75 ? "text-emerald-400" : fund >= 0.5 ? "text-amber-400" : "text-muted-foreground";
-
-  // Composite score colour
-  const scoreColor = composite >= 70 ? "text-emerald-400" : composite >= 50 ? "text-amber-400" : "text-muted-foreground";
-
-  const passing = Object.entries(r.tt_criteria).filter(([,v]) => v).map(([k]) => TT_CRITERIA_LABELS[k] ?? k);
-  const failing  = Object.entries(r.tt_criteria).filter(([,v]) => !v).map(([k]) => TT_CRITERIA_LABELS[k] ?? k);
-
-  return (
-    <div className="rounded-xl border bg-card hover:border-primary/30 transition-colors overflow-hidden">
-      {/* Card header row */}
-      <div className="flex items-center justify-between gap-3 px-4 pt-4 pb-3">
-        {/* Symbol + meta */}
-        <div className="flex items-center gap-2 min-w-0">
-          <Link href={`/chart/${r.symbol}`} className="font-mono text-lg font-bold hover:text-primary transition-colors">
-            {r.symbol}
-          </Link>
-          {r.sector && (
-            <span className="text-[10px] text-muted-foreground border border-border/60 rounded px-1.5 py-0.5 truncate max-w-25">
-              {r.sector}
-            </span>
-          )}
-          {r.last_close && (
-            <span className="text-sm text-muted-foreground tabular-nums">${parseFloat(r.last_close).toFixed(2)}</span>
-          )}
-        </div>
-
-        {/* Score pills */}
-        <div className="flex items-center gap-3 shrink-0">
-          <ScorePill label="TT" value={`${r.tt_score}/8`} color={ttColor} />
-          <ScorePill label="VCP" value={`${(vcp * 10).toFixed(0)}/10`} color={vcpColor} />
-          {r.rs_rank !== null && <ScorePill label="RS" value={String(r.rs_rank)} />}
-          <div className="text-right">
-            <div className={`text-xl font-bold tabular-nums leading-none ${scoreColor}`}>{composite}</div>
-            <div className="text-[10px] text-muted-foreground mt-0.5">score</div>
-          </div>
-          <div className="flex flex-col gap-1">
-            <Link
-              href={`/chart/${r.symbol}`}
-              className="text-[10px] border border-border/60 rounded px-2 py-0.5 text-muted-foreground hover:border-primary/50 hover:text-foreground transition-colors"
-            >
-              Chart
-            </Link>
-            <Link
-              href={`/tickets/new?symbol=${r.symbol}`}
-              className="text-[10px] bg-primary/15 text-primary rounded px-2 py-0.5 hover:bg-primary/25 transition-colors"
-            >
-              + Ticket
-            </Link>
-          </div>
-        </div>
-      </div>
-      <div className="px-4 pb-4 space-y-3 text-sm">
-        {/* Fundamentals row */}
-        {(r.revenue_growth || r.net_income_growth || r.net_margin) ? (
-          <div className="flex gap-4 text-xs">
-            <FundStat label="Rev" value={r.revenue_growth} target={0.25} />
-            <FundStat label="EPS" value={r.net_income_growth} target={0.25} />
-            <FundStat label="Margin" value={r.net_margin} target={0.10} />
-          </div>
-        ) : (
-          <p className="text-muted-foreground/50 text-[10px]">No SEC data (TSX or pending scan)</p>
-        )}
-
-        {/* TT criteria — passing only to keep it scannable */}
-        <div className="flex flex-wrap gap-1">
-          {passing.map(c => (
-            <span key={c} className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded px-1.5 py-0.5 text-[10px]">
-              {c}
-            </span>
-          ))}
-          {failing.slice(0, 3).map(c => (
-            <span key={c} className="text-muted-foreground/40 text-[10px]">· {c}</span>
-          ))}
-        </div>
-
-        {/* Mini chart */}
-        <StockChart symbol={r.symbol} height={160} mini showSmas className="rounded-lg overflow-hidden opacity-90" />
-      </div>
-    </div>
-  );
-}
-
-function ScorePill({ label, value, color = "" }: { label: string; value: string; color?: string }) {
-  return (
-    <div className="text-center min-w-8">
-      <div className={`text-base font-bold tabular-nums leading-none ${color}`}>{value}</div>
-      <div className="text-muted-foreground/60 text-[9px] uppercase tracking-wide mt-0.5">{label}</div>
-    </div>
-  );
-}
-
-function FundStat({ label, value, target }: { label: string; value: string | null; target: number }) {
-  if (!value) return null;
-  const v = parseFloat(value);
-  const great = v >= target * 2;
-  const ok    = v >= target;
-  const cls   = great ? "text-emerald-400" : ok ? "text-emerald-400/70" : v > 0 ? "text-amber-400" : "text-destructive";
-  return (
-    <div>
-      <div className="text-muted-foreground/60 text-[9px] uppercase tracking-wide">{label}</div>
-      <div className={`font-semibold tabular-nums text-sm ${cls}`}>
-        {v >= 0 ? "+" : ""}{(v * 100).toFixed(0)}%
-      </div>
-    </div>
-  );
-}
-
 // ---- Helpers ----
-
-function daysSince(d: Date): string {
-  const days = Math.floor((Date.now() - d.getTime()) / 86_400_000);
-  if (days === 0) return "today";
-  if (days === 1) return "1 day";
-  return `${days} days`;
-}
 
 function timeAgo(d: Date): string {
   const secs = Math.floor((Date.now() - d.getTime()) / 1000);

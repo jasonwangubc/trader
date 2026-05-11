@@ -14,6 +14,7 @@ class StrEnum(str, Enum):
         return self.value
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -399,7 +400,8 @@ class DailyBar(Base):
     high: Mapped[Decimal] = mapped_column(_money)
     low: Mapped[Decimal] = mapped_column(_money)
     close: Mapped[Decimal] = mapped_column(_money)
-    volume: Mapped[int] = mapped_column(Integer)
+    # BIGINT — penny stocks can do 1B+ shares on event days (e.g. BYND 2025-10-21)
+    volume: Mapped[int] = mapped_column(BigInteger)
     adj_close: Mapped[Decimal] = mapped_column(_money)
 
     __table_args__ = (
@@ -417,7 +419,7 @@ class EarningsDate(Base):
     next_earnings_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     last_eps_surprise_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     last_earnings_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
-    avg_volume: Mapped[int | None] = mapped_column(Integer, nullable=True)   # 50d avg volume for PEP calc
+    avg_volume: Mapped[int | None] = mapped_column(BigInteger, nullable=True)   # 50d avg volume for PEP calc
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     __table_args__ = ()
@@ -467,16 +469,79 @@ class ScreenerScore(Base):
     high_52w: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
     low_52w: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
 
-    # Fundamentals from EDGAR (via SEC companyfacts API, same source as decadex)
+    # Fundamentals (from yfinance ticker.info — covers US + Canadian)
     fundamental_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal(0))
     revenue_growth: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     net_income_growth: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     net_margin: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    roe: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     eps_ttm: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     fundamental_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
-    # Composite score — TT 25% + VCP 25% + RS 20% + Fundamentals 30%
+    # IBD-style percentile rankings (0-99 within scored universe)
+    eps_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)   # earnings (qtrly EPS growth + TTM EPS)
+    smr_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)   # sales / margin / ROE composite
+
+    # Pattern + buyability — distinguishes "leader to watch" from "setup to act on".
+    # Composite is heavily penalized (or zeroed) when buyability == "extended".
+    pattern_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    pattern_quality: Mapped[Decimal | None] = mapped_column(Numeric(4, 3), nullable=True)
+    buyability: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    pivot_price: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    base_low: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    base_length_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_depth_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    extension_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+
+    # Composite score — weighted blend, zeroed if buyability == "extended" or "broken"
     composite_score: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal(0))
+
+
+class TrailingAction(Base, TimestampMixin):
+    """Pending coaching action created when a trailing milestone or exit ladder leg is hit.
+
+    Lifecycle: pending → (user confirms) → executed | (user dismisses) → dismissed
+    The monitor creates these; the API + frontend let the user act on them.
+    """
+    __tablename__ = "trailing_actions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    ticket_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tickets.id", ondelete="CASCADE"), index=True
+    )
+
+    # "trail_stop" — move the GTC stop to a new level
+    # "scale_out"  — sell a portion of the position at a target price
+    action_type: Mapped[str] = mapped_column(String(32))
+
+    # Which milestone triggered this (e.g. "+1R", "+5R", "T1 +1.5R")
+    milestone: Mapped[str] = mapped_column(String(32))
+
+    # trail_stop fields
+    old_stop: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    new_stop: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+
+    # scale_out fields
+    sell_price: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    sell_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    leg_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Context at trigger time
+    open_r: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=Decimal(0))
+    triggered_price: Mapped[Decimal] = mapped_column(_money)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Lifecycle: pending → executed | dismissed | failed
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    broker_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    execution_price: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    error_msg: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    ticket: Mapped["Ticket"] = relationship(backref="trailing_actions")
 
 
 class AuditLog(Base):

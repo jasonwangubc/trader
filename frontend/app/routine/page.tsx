@@ -1,5 +1,6 @@
 import { CheckCircle, XCircle, AlertTriangle, Clock } from "lucide-react";
 import { RiskGauge } from "@/components/risk-gauge";
+import { TrailingActionsCard } from "@/components/trailing-actions-card";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { api, ApiError } from "@/lib/api";
@@ -202,7 +203,10 @@ export default async function RoutinePage() {
           </CardContent>
         </Card>
 
-        {/* 3b. Open risk */}
+        {/* 3b. Trailing coaching actions — confirm stop moves and scale-outs */}
+        <TrailingActionsCard />
+
+        {/* 3c. Open risk */}
         <RiskGauge />
 
         {/* 4. Quick links */}

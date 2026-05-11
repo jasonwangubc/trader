@@ -24,6 +24,7 @@ from app.brokers.base import (
     BrokerAccount,
     BrokerBalance,
     BrokerInterface,
+    BrokerOpenOrder,
     BrokerOrderAck,
     BrokerOrderRequest,
     BrokerPosition,
@@ -37,6 +38,36 @@ _TOKEN_URL = "{login_server}/oauth2/token"
 _GRANT = "refresh_token"
 
 _REFRESH_BUFFER_SECS = 60
+
+_RECOVERY_HINT = (
+    "Generate a new token at https://login.questrade.com/APIAccess/UserApps.aspx "
+    "and paste it on the Settings page (or set QUESTRADE_REFRESH_TOKEN in backend/.env)."
+)
+
+
+def _format_refresh_error(resp: httpx.Response) -> str:
+    """Turn a Questrade non-200 token-refresh response into a clean one-line message.
+
+    Questrade frequently returns HTML error pages (especially on 5xx) and
+    bare 400/401 with JSON. We avoid leaking HTML into the UI and instead
+    classify by status code so the user knows whether to retry or re-paste.
+    """
+    code = resp.status_code
+    body = (resp.text or "").strip()
+    looks_html = body.lower().startswith(("<!doctype", "<html"))
+
+    if 500 <= code < 600:
+        return (
+            f"Questrade auth server returned {code} (transient). "
+            "Retry in a minute. If it persists, re-paste a fresh token. "
+            f"{_RECOVERY_HINT}"
+        )
+    if code in (400, 401, 403):
+        return f"Questrade rejected the refresh token ({code}). {_RECOVERY_HINT}"
+
+    # Unknown — include status but never the HTML body
+    snippet = "<error page>" if looks_html else (body[:120] if body else "no body")
+    return f"Questrade token refresh failed: {code} ({snippet}). {_RECOVERY_HINT}"
 
 
 def _infer_currency(symbol: str) -> str:
@@ -141,11 +172,7 @@ class QuestradeBroker(BrokerInterface):
             return await self._refresh(env_fallback=True)
 
         if resp.status_code != 200:
-            raise RuntimeError(
-                f"Questrade token refresh failed: {resp.status_code} {resp.text}. "
-                "Generate a new token at https://login.questrade.com/APIAccess/UserApps.aspx "
-                "and set QUESTRADE_REFRESH_TOKEN in backend/.env, then restart the backend."
-            )
+            raise RuntimeError(_format_refresh_error(resp))
 
         data = resp.json()
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=data["expires_in"])
@@ -495,3 +522,50 @@ class QuestradeBroker(BrokerInterface):
 
     async def cancel_order(self, account_id: str, broker_order_id: str) -> None:
         await self._delete(f"v1/accounts/{account_id}/orders/{broker_order_id}")
+
+    _ORDER_TYPE_REVERSE = {
+        "Market":     "market",
+        "Limit":      "limit",
+        "StopMarket": "stop_market",
+        "StopLimit":  "stop_limit",
+    }
+
+    async def get_open_orders(self, account_id: str) -> list[BrokerOpenOrder]:
+        """List currently-pending orders for this Questrade account.
+
+        Uses Questrade's `stateFilter=Open` which covers Queued / Accepted /
+        StopTriggered / partially-filled — i.e. anything still working at the
+        exchange. Excludes filled, cancelled, expired, and rejected orders.
+        """
+        data = await self._get(f"v1/accounts/{account_id}/orders", stateFilter="Open")
+        out: list[BrokerOpenOrder] = []
+        for o in data.get("orders", []):
+            total_qty  = int(o.get("totalQuantity") or 0)
+            filled_qty = int(o.get("filledQuantity") or 0)
+            open_qty   = max(0, total_qty - filled_qty)
+            if open_qty == 0:
+                continue
+            symbol = o.get("symbol") or ""
+            limit_p = o.get("limitPrice")
+            stop_p  = o.get("stopPrice")
+            submitted_str = o.get("creationTime")
+            submitted_at: datetime | None = None
+            if submitted_str:
+                try:
+                    submitted_at = datetime.fromisoformat(submitted_str.replace("Z", "+00:00"))
+                except Exception:
+                    submitted_at = None
+            out.append(BrokerOpenOrder(
+                broker_order_id=str(o.get("id", "")),
+                account_id=account_id,
+                symbol=symbol,
+                currency=_infer_currency(symbol),
+                side=(o.get("side") or "").lower(),
+                order_type=self._ORDER_TYPE_REVERSE.get(o.get("orderType", ""), "limit"),
+                quantity=open_qty,
+                limit_price=Decimal(str(limit_p)) if limit_p is not None else None,
+                stop_price=Decimal(str(stop_p))   if stop_p   is not None else None,
+                submitted_at=submitted_at,
+                status=self._map_qt_state(o.get("state", "")),
+            ))
+        return out

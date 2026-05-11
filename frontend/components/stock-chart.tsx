@@ -36,31 +36,46 @@ interface StockChartProps {
   symbol: string;
   height?: number;
   mini?: boolean;          // compact sparkline mode — fewer overlays, no axes
+  days?: number;           // explicit fetch window; overrides the mini/full default
+  visibleDays?: number;    // initial visible window after fitContent (zooms in tighter)
   showPivot?: boolean;
   showSmas?: boolean;      // show 50/150 SMA in mini mode (default true)
   levels?: PriceLevel[];  // optional horizontal price lines (stop, targets, etc.)
   className?: string;
+  barSpacing?: number;     // wider candles when zoomed; defaults handle most cases
 }
 
-export function StockChart({ symbol, height = 420, mini = false, showPivot = true, showSmas = true, levels, className }: StockChartProps) {
+export function StockChart({
+  symbol,
+  height = 420,
+  mini = false,
+  days,
+  visibleDays,
+  showPivot = true,
+  showSmas = true,
+  levels,
+  className,
+  barSpacing,
+}: StockChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef     = useRef<IChartApi | null>(null);
   const [data, setData]       = useState<ChartData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState<string | null>(null);
 
-  // Fetch data
+  // Fetch data — caller can override; otherwise mini=252 bars (1yr), full=504 (2yr)
+  const fetchDays = days ?? (mini ? 252 : 504);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    // Mini needs enough bars for SMA150 — fetch 252 (1yr)
-    fetch(`${API_URL}/api/chart/${symbol}?days=${mini ? 252 : 504}`)
+    fetch(`${API_URL}/api/chart/${symbol}?days=${fetchDays}`)
       .then(r => r.ok ? r.json() : r.json().then((d: any) => Promise.reject(d.detail ?? "No data")))
       .then((d: ChartData) => { if (!cancelled) { setData(d); setLoading(false); } })
       .catch((e: unknown) => { if (!cancelled) { setError(String(e)); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [symbol, mini]);
+  }, [symbol, fetchDays]);
 
   // Build chart
   useEffect(() => {
@@ -81,7 +96,12 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
       },
       crosshair: { mode: mini ? CrosshairMode.Hidden : CrosshairMode.Normal },
       rightPriceScale: { borderColor: gridColor, visible: !mini },
-      timeScale: { borderColor: gridColor, visible: !mini, rightOffset: 5, barSpacing: mini ? 2 : 6 },
+      timeScale: {
+        borderColor: gridColor,
+        visible: !mini,
+        rightOffset: 5,
+        barSpacing: barSpacing ?? (mini ? 2 : 6),
+      },
       handleScroll: !mini,
       handleScale:  !mini,
     });
@@ -219,6 +239,15 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
 
     chart.timeScale().fitContent();
 
+    // Zoom in to the last `visibleDays` bars if requested (clearer recent action)
+    if (visibleDays && data.bars.length > visibleDays) {
+      const fromIdx = data.bars.length - visibleDays;
+      chart.timeScale().setVisibleRange({
+        from: data.bars[fromIdx].time as any,
+        to:   data.bars[data.bars.length - 1].time as any,
+      });
+    }
+
     // Resize observer
     const ro = new ResizeObserver(() => {
       if (containerRef.current) {
@@ -232,7 +261,7 @@ export function StockChart({ symbol, height = 420, mini = false, showPivot = tru
       chart.remove();
       chartRef.current = null;
     };
-  }, [data, mini, showPivot, height]);
+  }, [data, mini, showPivot, height, visibleDays, barSpacing, levels]);
 
   if (loading) {
     return (

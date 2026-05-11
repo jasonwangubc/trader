@@ -100,3 +100,24 @@ def alert_target_hit(symbol: str, target_label: str, target_price: Decimal, is_p
     body = f"*[{label}] {symbol} TARGET HIT* — {target_label} @ {target_price}\nConsider scaling out."
     _send(f"[{label}] {symbol} TARGET: {target_label}", body.replace("*", ""))
     _telegram(body)
+
+
+def alert_trailing_action(
+    symbol: str,
+    action_type: str,
+    milestone: str,
+    detail: str,
+    is_paper: bool,
+) -> None:
+    """Alert when a trailing stop or scale-out action is queued for confirmation."""
+    label = "PAPER" if is_paper else "LIVE"
+    emoji = "🎯" if action_type == "scale_out" else "🛡"
+    action_label = "SCALE OUT" if action_type == "scale_out" else "TRAIL STOP"
+    body = (
+        f"*[{label}] {symbol} — {action_label}* {emoji}\n"
+        f"Milestone: {milestone}\n"
+        f"{detail}\n"
+        f"Open the app to confirm or dismiss."
+    )
+    _send(f"[{label}] {symbol} {action_label}: {milestone}", body.replace("*", "").replace("_", ""))
+    _telegram(body)

@@ -66,6 +66,22 @@ class BrokerOrderAck:
 
 
 @dataclass(frozen=True)
+class BrokerOpenOrder:
+    """Currently-pending order at the broker (any source — manual or system-placed)."""
+    broker_order_id: str
+    account_id: str
+    symbol: str
+    currency: str
+    side: str               # "buy" / "sell"
+    order_type: str         # "market" / "limit" / "stop_market" / "stop_limit"
+    quantity: int           # remaining open quantity (totalQuantity - filledQuantity)
+    limit_price: Decimal | None
+    stop_price: Decimal | None
+    submitted_at: datetime | None
+    status: str             # pending | accepted | partial
+
+
+@dataclass(frozen=True)
 class BrokerQuote:
     symbol: str
     last: Decimal
@@ -117,3 +133,11 @@ class BrokerInterface(ABC):
 
     @abstractmethod
     async def get_order(self, account_id: str, broker_order_id: str) -> BrokerOrderAck: ...
+
+    async def get_open_orders(self, account_id: str) -> list[BrokerOpenOrder]:
+        """Return all currently-pending orders at the broker for this account.
+
+        Default: empty list — useful for paper or limited brokers that don't
+        expose order listing. Real broker implementations should override.
+        """
+        return []

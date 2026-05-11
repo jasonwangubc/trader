@@ -12,12 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import DailyBar, ScreenerScore, ScreenerSymbol
 from app.db.session import get_session
 from app.api.auth import get_user_id
-from app.services.screener_service import PipelineStats, get_screener_results, run_screener
+from app.services.screener_service import PipelineStats, ScreenerProgress, get_screener_results, run_screener
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
 _sync_running = False
 _last_stats: PipelineStats | None = None
+_progress: ScreenerProgress | None = None
 
 
 # ── Watchlist CRUD ────────────────────────────────────────────────────────────
@@ -106,10 +107,25 @@ def _sym_out(s: ScreenerSymbol) -> SymbolOut:
 
 # ── Sync / pipeline ───────────────────────────────────────────────────────────
 
+class ScanProgressOut(BaseModel):
+    stage: str            # idle | starting | universe | eod | tt | vcp | fundamentals | rank | persist | done | error
+    stage_label: str
+    stage_index: int
+    total_stages: int
+    processed: int
+    total: int
+    pct: float            # 0-100, weighted by stage time-share
+    started_at: datetime | None
+    updated_at: datetime | None
+    finished_at: datetime | None
+    error: str | None
+
+
 class SyncStatusOut(BaseModel):
     running: bool
     message: str
     stats: dict | None = None
+    progress: ScanProgressOut | None = None
 
 
 @router.post("/scan", response_model=SyncStatusOut)
@@ -118,12 +134,18 @@ async def run_scan(
 ) -> SyncStatusOut:
     """Run a full screener scan: refresh universe, update price data, score all stocks,
     fetch missing fundamentals. Safe to run daily — price data is incremental (fast)."""
-    global _sync_running
+    global _sync_running, _progress
     if _sync_running:
-        return SyncStatusOut(running=True, message="Scan already running — check back in a few minutes")
+        return SyncStatusOut(
+            running=True,
+            message="Scan already running — check back in a few minutes",
+            progress=_progress_out(_progress),
+        )
     _sync_running = True
+    _progress = ScreenerProgress()
+    _progress.begin()
     background_tasks.add_task(_run_sync_bg, "auto")
-    return SyncStatusOut(running=True, message="Scan started")
+    return SyncStatusOut(running=True, message="Scan started", progress=_progress_out(_progress))
 
 
 @router.post("/sync", response_model=SyncStatusOut)
@@ -132,26 +154,48 @@ async def trigger_sync(
     mode: str = "auto",
 ) -> SyncStatusOut:
     """Legacy endpoint — use /scan instead."""
-    global _sync_running
+    global _sync_running, _progress
     if _sync_running:
-        return SyncStatusOut(running=True, message="Sync already in progress")
+        return SyncStatusOut(running=True, message="Sync already in progress", progress=_progress_out(_progress))
     _sync_running = True
+    _progress = ScreenerProgress()
+    _progress.begin()
     background_tasks.add_task(_run_sync_bg, mode)
-    return SyncStatusOut(running=True, message=f"Scan started")
+    return SyncStatusOut(running=True, message="Scan started", progress=_progress_out(_progress))
 
 
 async def _run_sync_bg(mode: str) -> None:
-    global _sync_running, _last_stats
+    global _sync_running, _last_stats, _progress
     from app.db.session import SessionLocal
     try:
         async with SessionLocal() as session:
-            _, stats = await run_screener(session, mode=mode)
+            _, stats = await run_screener(session, mode=mode, progress=_progress)
             _last_stats = stats
-    except Exception:
+    except Exception as exc:
         import logging
         logging.getLogger(__name__).exception("Background screener sync failed")
+        if _progress is not None:
+            _progress.fail(str(exc))
     finally:
         _sync_running = False
+
+
+def _progress_out(p: ScreenerProgress | None) -> ScanProgressOut | None:
+    if p is None:
+        return None
+    return ScanProgressOut(
+        stage=p.stage_key,
+        stage_label=p.stage_label,
+        stage_index=p.stage_index,
+        total_stages=p.total_stages,
+        processed=p.processed,
+        total=p.total,
+        pct=round(p.overall_pct(), 1),
+        started_at=p.started_at,
+        updated_at=p.updated_at,
+        finished_at=p.finished_at,
+        error=p.error,
+    )
 
 
 @router.get("/sync/status", response_model=SyncStatusOut)
@@ -169,6 +213,7 @@ async def sync_status() -> SyncStatusOut:
         running=_sync_running,
         message="running" if _sync_running else "idle",
         stats=stats_dict,
+        progress=_progress_out(_progress),
     )
 
 
@@ -325,7 +370,21 @@ class ScoreOut(BaseModel):
     revenue_growth: Decimal | None
     net_income_growth: Decimal | None
     net_margin: Decimal | None
+    roe: Decimal | None
     eps_ttm: Decimal | None
+    eps_rank: int | None
+    smr_rank: int | None
+
+    # Pattern + buyability
+    pattern_type: str | None
+    pattern_quality: Decimal | None
+    buyability: str | None
+    pivot_price: Decimal | None
+    base_low: Decimal | None
+    base_length_days: int | None
+    base_depth_pct: Decimal | None
+    extension_pct: Decimal | None
+
     composite_score: Decimal
 
 
@@ -341,12 +400,27 @@ class ResultsPage(BaseModel):
 async def results(
     min_tt: int = 0,
     min_vcp: float = 0.0,
+    min_eps: int = 0,
+    min_rs: int = 0,
+    min_composite: int = 0,
+    buyability: str | None = None,        # comma-separated: "at_pivot,in_base"
+    pattern: str | None = None,           # comma-separated: "vcp,cwh,flat_base,high_tight_flag"
     sector: str | None = None,
     page: int = 1,
     page_size: int = 20,
     session: AsyncSession = Depends(get_session),
 ) -> ResultsPage:
-    all_rows = await get_screener_results(session, min_tt=min_tt, min_vcp=min_vcp, sector=sector)
+    all_rows = await get_screener_results(
+        session,
+        min_tt=min_tt,
+        min_vcp=min_vcp,
+        min_eps=min_eps,
+        min_rs=min_rs,
+        min_composite=min_composite,
+        buyability=buyability,
+        pattern=pattern,
+        sector=sector,
+    )
     total = len(all_rows)
     pages = max(1, (total + page_size - 1) // page_size)
     page  = max(1, min(page, pages))
@@ -383,6 +457,17 @@ def _score_out(r: ScreenerScore) -> ScoreOut:
         revenue_growth=r.revenue_growth,
         net_income_growth=r.net_income_growth,
         net_margin=r.net_margin,
+        roe=r.roe,
         eps_ttm=r.eps_ttm,
+        eps_rank=r.eps_rank,
+        smr_rank=r.smr_rank,
+        pattern_type=r.pattern_type,
+        pattern_quality=r.pattern_quality,
+        buyability=r.buyability,
+        pivot_price=r.pivot_price,
+        base_low=r.base_low,
+        base_length_days=r.base_length_days,
+        base_depth_pct=r.base_depth_pct,
+        extension_pct=r.extension_pct,
         composite_score=r.composite_score,
     )

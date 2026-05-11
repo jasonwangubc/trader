@@ -13,6 +13,10 @@ export interface Position {
   is_buy_and_hold: boolean;
   ticket_id: string | null;
   as_of: string;
+  // Broker-side stop / target derived from open sell orders (best-effort).
+  broker_stop_price?: string | null;
+  broker_target_price?: string | null;
+  broker_open_order_count?: number;
 }
 
 export interface BuyingPower {

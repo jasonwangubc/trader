@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api, ApiError } from "@/lib/api";
 import { type BuyingPower, type Position, type PositionsData } from "@/lib/positions";
 import { type Account, type HouseholdData, fmtMoney } from "@/lib/tickets";
+import { UnmanagedActions } from "./unmanaged-actions";
 
 export const metadata = { title: 'Positions' };
 
@@ -12,6 +13,7 @@ export const metadata = { title: 'Positions' };
 export default async function PositionsPage() {
   let data: PositionsData | null = null;
   let accounts: Account[] = [];
+  let equityByCurrency: Record<string, number> = {};
   let error: string | null = null;
 
   try {
@@ -21,6 +23,9 @@ export default async function PositionsPage() {
     ]);
     data = pos;
     accounts = household.accounts;
+    equityByCurrency = Object.fromEntries(
+      Object.entries(household.household_equity ?? {}).map(([k, v]) => [k, parseFloat(v)])
+    );
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
@@ -54,7 +59,11 @@ export default async function PositionsPage() {
       {data && (
         <>
           <BuyingPowerSection breakdown={data.buying_power} />
-          <PositionsSection positions={data.positions} accountMap={accountMap} />
+          <PositionsSection
+            positions={data.positions}
+            accountMap={accountMap}
+            equityByCurrency={equityByCurrency}
+          />
         </>
       )}
     </main>
@@ -102,9 +111,11 @@ function BuyingPowerCard({ bp }: { bp: BuyingPower }) {
 function PositionsSection({
   positions,
   accountMap,
+  equityByCurrency,
 }: {
   positions: Position[];
   accountMap: Map<string, Account>;
+  equityByCurrency: Record<string, number>;
 }) {
   if (positions.length === 0) {
     return (
@@ -117,25 +128,58 @@ function PositionsSection({
   }
 
   const cashEquivalents = positions.filter((p) => p.is_cash_equivalent);
-  const managed = positions.filter((p) => !p.is_cash_equivalent && p.ticket_id !== null);
-  const unmanaged = positions.filter((p) => !p.is_cash_equivalent && p.ticket_id === null);
+  const buyAndHold      = positions.filter((p) => !p.is_cash_equivalent && p.is_buy_and_hold);
+  const managed         = positions.filter((p) => !p.is_cash_equivalent && !p.is_buy_and_hold && p.ticket_id !== null);
+  const unmanagedAll    = positions.filter((p) => !p.is_cash_equivalent && !p.is_buy_and_hold && p.ticket_id === null);
+  const unmanagedNoStop = unmanagedAll.filter((p) => !p.broker_stop_price);
+  const unmanagedStopped = unmanagedAll.filter((p) => !!p.broker_stop_price);
 
   return (
     <div className="space-y-6">
-      {unmanaged.length > 0 && (
+      {unmanagedNoStop.length > 0 && (
         <div className="border-destructive/40 bg-destructive/5 rounded-lg border p-4">
           <p className="text-destructive mb-3 text-xs font-semibold uppercase tracking-wide">
-            ⚠ Unmanaged positions ({unmanaged.length}) — no pre-trade ticket on file
+            ⚠ Unmanaged · no stop ({unmanagedNoStop.length}) — exposed without a defined exit
           </p>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {unmanaged.map((p) => (
-              <PositionCard key={p.id} position={p} account={accountMap.get(p.account_id)} />
+            {unmanagedNoStop.map((p) => (
+              <PositionCard
+                key={p.id} position={p}
+                account={accountMap.get(p.account_id)}
+                equityByCurrency={equityByCurrency}
+              />
             ))}
           </div>
         </div>
       )}
+
+      {unmanagedStopped.length > 0 && (
+        <div className="border-amber-400/50 bg-amber-500/5 rounded-lg border p-4">
+          <p className="text-amber-600 dark:text-amber-400 mb-3 text-xs font-semibold uppercase tracking-wide">
+            Unmanaged · stop at broker ({unmanagedStopped.length}) — adopt to track in journal + risk
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {unmanagedStopped.map((p) => (
+              <PositionCard
+                key={p.id} position={p}
+                account={accountMap.get(p.account_id)}
+                equityByCurrency={equityByCurrency}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
       {managed.length > 0 && (
         <PositionGroup title="Managed holdings" positions={managed} accountMap={accountMap} />
+      )}
+      {buyAndHold.length > 0 && (
+        <PositionGroup
+          title="Buy & hold"
+          subtitle="Long-term positions you've explicitly opted out of risk tracking for."
+          positions={buyAndHold}
+          accountMap={accountMap}
+        />
       )}
       {cashEquivalents.length > 0 && (
         <PositionGroup
@@ -180,9 +224,11 @@ function PositionGroup({
 function PositionCard({
   position,
   account,
+  equityByCurrency,
 }: {
   position: Position;
   account?: Account;
+  equityByCurrency?: Record<string, number>;
 }) {
   const pnl = parseFloat(position.open_pnl);
   const pnlPct =
@@ -195,6 +241,10 @@ function PositionCard({
       : pnl < 0
         ? "text-destructive"
         : "text-muted-foreground";
+
+  const isUnmanaged = !position.is_cash_equivalent && !position.is_buy_and_hold && !position.ticket_id;
+  const brokerStop   = position.broker_stop_price ? parseFloat(position.broker_stop_price) : null;
+  const brokerTarget = position.broker_target_price ? parseFloat(position.broker_target_price) : null;
 
   return (
     <Card>
@@ -211,14 +261,13 @@ function PositionCard({
               {position.currency}
             </Badge>
             {position.is_cash_equivalent && (
-              <Badge variant="secondary" className="text-xs">
-                cash-eq
-              </Badge>
+              <Badge variant="secondary" className="text-xs">cash-eq</Badge>
+            )}
+            {position.is_buy_and_hold && (
+              <Badge variant="secondary" className="text-xs">buy & hold</Badge>
             )}
             {position.ticket_id && (
-              <Badge variant="default" className="text-xs">
-                managed
-              </Badge>
+              <Badge variant="default" className="text-xs">managed</Badge>
             )}
           </div>
         </div>
@@ -238,6 +287,33 @@ function PositionCard({
             {pnlPct !== null && ` (${pnlPct.toFixed(2)}%)`}
           </span>
         </div>
+
+        {/* Broker-side stop / target — surfaces "I do have a stop" without ticket */}
+        {(brokerStop || brokerTarget) && (
+          <div className="border-t pt-2 space-y-1 text-xs">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground/70">At Questrade</div>
+            {brokerStop && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Stop</span>
+                <span className="tabular-nums text-amber-500">{fmtMoney(position.broker_stop_price!, position.currency)}</span>
+              </div>
+            )}
+            {brokerTarget && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Target</span>
+                <span className="tabular-nums text-emerald-500">{fmtMoney(position.broker_target_price!, position.currency)}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {isUnmanaged && (
+          <UnmanagedActions
+            position={position}
+            account={account}
+            equityByCurrency={equityByCurrency}
+          />
+        )}
       </CardContent>
     </Card>
   );

@@ -36,9 +36,38 @@ export interface ScoreResult {
   revenue_growth: string | null;
   net_income_growth: string | null;
   net_margin: string | null;
+  roe: string | null;
   eps_ttm: string | null;
+  eps_rank: number | null;
+  smr_rank: number | null;
+
+  // Pattern + buyability — what kind of setup is this and how actionable
+  pattern_type: string | null;             // 'vcp' | 'cwh' | 'flat_base' | 'high_tight_flag' | null
+  pattern_quality: string | null;          // 0-1 quality of matched pattern
+  buyability: string | null;               // 'at_pivot' | 'in_base' | 'extended' | 'broken' | 'no_pattern'
+  pivot_price: string | null;
+  base_low: string | null;
+  base_length_days: number | null;
+  base_depth_pct: string | null;
+  extension_pct: string | null;            // % current price is past pivot
+
   composite_score: string;
 }
+
+export const PATTERN_LABELS: Record<string, string> = {
+  vcp: "VCP",
+  cwh: "Cup w/Handle",
+  flat_base: "Flat Base",
+  high_tight_flag: "HTF",
+};
+
+export const BUYABILITY_LABELS: Record<string, string> = {
+  at_pivot: "At pivot",
+  in_base: "In base",
+  extended: "Extended",
+  broken: "Broken",
+  no_pattern: "No setup",
+};
 
 export interface UniverseStats {
   total_symbols: number;

@@ -30,6 +30,7 @@ from app.services.trailing_service import TrailingSuggestion, compute_trailing_s
 from app.services.tickets_service import (
     TicketValidationError,
     cancel_ticket,
+    create_retroactive_ticket,
     create_ticket,
     preview_ticket,
 )
@@ -308,6 +309,42 @@ async def create(
     except TicketValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    return TicketOut.from_orm_obj(ticket)
+
+
+class RetroactiveTicketIn(BaseModel):
+    position_id: uuid.UUID
+    stop_price: Decimal
+    target_price: Decimal | None = None
+    setup_type: str = "manual"
+    thesis: str = Field(min_length=10, max_length=2000)
+
+
+@router.post("/retroactive", response_model=TicketOut, status_code=201)
+async def create_retroactive(
+    body: RetroactiveTicketIn,
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> TicketOut:
+    """Create a FILLED ticket for an existing broker position.
+
+    Skips sizing, regime, and streak guardrails. Used to retroactively
+    "adopt" positions opened outside the system (manual buys, legacy
+    holdings) so they show up in the dashboard risk gauge with a real
+    stop attached.
+    """
+    try:
+        ticket = await create_retroactive_ticket(
+            session,
+            user_id=user_id,
+            position_id=body.position_id,
+            stop_price=body.stop_price,
+            target_price=body.target_price,
+            setup_type=body.setup_type,
+            thesis=body.thesis,
+        )
+    except TicketValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return TicketOut.from_orm_obj(ticket)
 
 

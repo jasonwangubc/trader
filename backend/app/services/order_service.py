@@ -31,7 +31,7 @@ from app.db.models import (
     TradeOutcome,
 )
 from app.services.audit_service import log_event
-from app.services.notifications_service import alert_stopped_out, alert_target_hit
+from app.services.notifications_service import alert_stopped_out, alert_target_hit, alert_trailing_action
 from app.services.streak_service import record_outcome
 
 log = logging.getLogger(__name__)
@@ -195,6 +195,24 @@ async def place_stop_order(
     return order
 
 
+def _build_default_exit_plan(fill_price: Decimal, stop_price: Decimal, shares: int) -> dict:
+    """Minervini default exit ladder: 1/3 at +1.5R, 1/3 at +2.5R, remainder at +4R.
+    User can edit on the ticket detail page after fill.
+    """
+    risk = float(fill_price) - float(stop_price)
+    if risk <= 0:
+        return {}
+    third = shares // 3
+    return {"targets": [
+        {"price": str(round(float(fill_price) + risk * 1.5, 2)), "shares": third,
+         "label": "T1 +1.5R", "hit": False, "action_queued": False},
+        {"price": str(round(float(fill_price) + risk * 2.5, 2)), "shares": third,
+         "label": "T2 +2.5R", "hit": False, "action_queued": False},
+        {"price": str(round(float(fill_price) + risk * 4.0, 2)), "shares": shares - 2 * third,
+         "label": "T3 +4R", "hit": False, "action_queued": False},
+    ]}
+
+
 async def on_entry_filled(
     session: AsyncSession,
     ticket: Ticket,
@@ -202,12 +220,19 @@ async def on_entry_filled(
     fill_price: Decimal,
     broker: BrokerInterface,
 ) -> None:
-    """Transition ticket to FILLED and arm the stop order."""
+    """Transition ticket to FILLED, arm the stop order, and auto-set exit plan."""
     entry_order.status = OrderStatus.FILLED.value
     entry_order.filled_at = datetime.now(timezone.utc)
 
     ticket.status = TicketStatus.FILLED.value
     ticket.filled_at = datetime.now(timezone.utc)
+
+    # Auto-populate the Minervini exit ladder if not already set.
+    # User can override on the ticket detail page.
+    if ticket.exit_plan is None:
+        plan = _build_default_exit_plan(fill_price, ticket.stop_price, ticket.position_size_shares)
+        if plan:
+            ticket.exit_plan = plan
 
     await log_event(
         session,
@@ -225,6 +250,158 @@ async def on_entry_filled(
     )
 
     await place_stop_order(session, ticket, broker)
+
+
+async def replace_stop_order(
+    session: AsyncSession,
+    ticket: Ticket,
+    new_stop_price: Decimal,
+    broker: BrokerInterface,
+) -> Order:
+    """Cancel the current GTC stop-loss and place a new one at new_stop_price.
+
+    Called when the user confirms a trail_stop TrailingAction.
+    Updates ticket.stop_price in DB so future R-multiple calculations are correct.
+    """
+    account = await session.get(Account, ticket.account_id)
+    if account is None:
+        raise RuntimeError(f"Account {ticket.account_id} not found")
+
+    # Find and cancel the current stop-loss order
+    result = await session.execute(
+        select(Order).where(
+            Order.ticket_id == ticket.id,
+            Order.intent == OrderIntent.STOP_LOSS.value,
+            Order.status.in_([OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value]),
+        )
+    )
+    old_stop_order = result.scalar_one_or_none()
+    if old_stop_order is not None and not ticket.is_paper:
+        try:
+            await broker.cancel_order(account.questrade_account_id, old_stop_order.questrade_order_id)
+            old_stop_order.status = OrderStatus.CANCELLED.value
+            old_stop_order.cancelled_at = datetime.now(timezone.utc)
+            log.info("Cancelled old stop order %s for %s", old_stop_order.questrade_order_id, ticket.symbol)
+        except Exception:
+            log.exception("Failed to cancel old stop order %s — continuing anyway", old_stop_order.questrade_order_id)
+
+    # Update ticket stop price
+    old_stop = ticket.stop_price
+    ticket.stop_price = new_stop_price
+
+    # Place new stop order (reuses full remaining shares)
+    remaining_shares = ticket.position_size_shares
+    req = BrokerOrderRequest(
+        account_id=account.questrade_account_id,
+        symbol=ticket.symbol,
+        side="sell",
+        order_type="stop_market",
+        quantity=remaining_shares,
+        stop_price=new_stop_price,
+        time_in_force="GoodTillCancelled",
+    )
+    ack = await broker.place_order(req)
+    log.info("New trailing stop placed: %s %s → %s broker_id=%s",
+             ticket.symbol, old_stop, new_stop_price, ack.broker_order_id)
+
+    new_order = Order(
+        ticket_id=ticket.id,
+        account_id=ticket.account_id,
+        questrade_order_id=ack.broker_order_id,
+        symbol=ticket.symbol,
+        currency=ticket.currency,
+        side=OrderSide.SELL.value,
+        order_type=OrderType.STOP_MARKET.value,
+        intent=OrderIntent.STOP_LOSS.value,
+        quantity=remaining_shares,
+        stop_price=new_stop_price,
+        status=OrderStatus.SUBMITTED.value,
+        is_paper=ticket.is_paper,
+        submitted_at=ack.submitted_at,
+    )
+    session.add(new_order)
+    await session.flush()
+
+    await log_event(
+        session,
+        actor="user",
+        event_type="stop_trailed",
+        entity_type="ticket",
+        entity_id=ticket.id,
+        payload={
+            "symbol": ticket.symbol,
+            "old_stop": str(old_stop),
+            "new_stop": str(new_stop_price),
+            "broker_order_id": ack.broker_order_id,
+            "is_paper": ticket.is_paper,
+        },
+    )
+    return new_order
+
+
+async def place_scale_out_order(
+    session: AsyncSession,
+    ticket: Ticket,
+    sell_price: Decimal,
+    sell_shares: int,
+    broker: BrokerInterface,
+) -> Order:
+    """Place a limit sell order for a partial exit (exit ladder leg).
+
+    Called when the user confirms a scale_out TrailingAction.
+    Does NOT close the ticket — it remains FILLED with reduced effective size.
+    The existing GTC stop continues to protect the remaining shares.
+    """
+    account = await session.get(Account, ticket.account_id)
+    if account is None:
+        raise RuntimeError(f"Account {ticket.account_id} not found")
+
+    req = BrokerOrderRequest(
+        account_id=account.questrade_account_id,
+        symbol=ticket.symbol,
+        side="sell",
+        order_type="limit",
+        quantity=sell_shares,
+        limit_price=sell_price,
+        time_in_force="Day",
+    )
+    ack = await broker.place_order(req)
+    log.info("Scale-out order placed: %s %d sh @ %s broker_id=%s",
+             ticket.symbol, sell_shares, sell_price, ack.broker_order_id)
+
+    order = Order(
+        ticket_id=ticket.id,
+        account_id=ticket.account_id,
+        questrade_order_id=ack.broker_order_id,
+        symbol=ticket.symbol,
+        currency=ticket.currency,
+        side=OrderSide.SELL.value,
+        order_type=OrderType.LIMIT.value,
+        intent=OrderIntent.SCALE_OUT.value,
+        quantity=sell_shares,
+        limit_price=sell_price,
+        status=OrderStatus.SUBMITTED.value,
+        is_paper=ticket.is_paper,
+        submitted_at=ack.submitted_at,
+    )
+    session.add(order)
+    await session.flush()
+
+    await log_event(
+        session,
+        actor="user",
+        event_type="scale_out_placed",
+        entity_type="ticket",
+        entity_id=ticket.id,
+        payload={
+            "symbol": ticket.symbol,
+            "sell_price": str(sell_price),
+            "sell_shares": sell_shares,
+            "broker_order_id": ack.broker_order_id,
+            "is_paper": ticket.is_paper,
+        },
+    )
+    return order
 
 
 async def check_open_entry_orders(
@@ -356,7 +533,11 @@ async def check_filled_tickets_for_close(
     broker: BrokerInterface,
     quotes: dict[str, BrokerQuote],
 ) -> None:
-    """For paper tickets: check if stop or target was hit. For live: poll GTC stop order."""
+    """For paper tickets: check stop/target hits. For live: poll GTC stop order.
+    For all filled tickets: check trailing milestones and queue coaching actions.
+    """
+    from app.services.trailing_service import check_and_queue_actions
+
     result = await session.execute(
         select(Ticket).where(Ticket.status == TicketStatus.FILLED.value)
     )
@@ -365,23 +546,40 @@ async def check_filled_tickets_for_close(
         return
 
     for ticket in filled_tickets:
+        quote = quotes.get(ticket.symbol)
+        last = quote.last if quote else None
+
         if ticket.is_paper:
-            quote = quotes.get(ticket.symbol)
-            if quote is None:
+            if last is None:
                 continue
-            last = quote.last
             stop = ticket.stop_price
             target = ticket.target_price
 
             if last <= stop:
                 await close_ticket(session, ticket, stop, "stop_hit")
+                continue
             elif target and last >= target:
                 await close_ticket(session, ticket, target, "target_hit")
+                continue
             else:
                 await _check_exit_ladder(session, ticket, last)
         else:
-            # Live: poll the GTC stop-loss order for fills.
             await _check_live_stop_order(session, ticket, broker)
+
+        # Queue trailing actions for all filled tickets that have a live quote.
+        # Both paper (to coach simulation habits) and live.
+        if last is not None:
+            new_actions = await check_and_queue_actions(session, ticket, last)
+            for action in new_actions:
+                action.notified_at = datetime.now(timezone.utc)
+                detail = (
+                    f"Move stop: {action.old_stop} → {action.new_stop}"
+                    if action.action_type == "trail_stop"
+                    else f"Sell {action.sell_shares} sh @ {action.sell_price} ({action.leg_label})"
+                )
+                alert_trailing_action(
+                    ticket.symbol, action.action_type, action.milestone, detail, ticket.is_paper
+                )
 
 
 async def _check_live_stop_order(

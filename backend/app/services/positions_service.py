@@ -10,16 +10,20 @@ a settings table or a manual override flag on Position.
 """
 from __future__ import annotations
 
+import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.brokers.base import BrokerInterface
+from app.brokers.base import BrokerInterface, BrokerOpenOrder
 from app.db.models import Account, AccountBalance, Position
 from app.services.audit_service import log_event
+
+log = logging.getLogger(__name__)
 
 
 # USD T-bill / cash-park ETFs + Canadian HISA/MM ETFs commonly used to park CAD.
@@ -124,6 +128,63 @@ async def list_positions(
         .order_by(Position.symbol)
     )
     return list(result.scalars().all())
+
+
+@dataclass
+class BrokerStopTarget:
+    """Best-effort stop / target derived from a position's broker-side open orders.
+
+    Computed from sell-side open orders only. The lowest sell-stop becomes the
+    stop; the highest sell-limit becomes the target. Multiple stops would
+    indicate a partial-exit ladder — we take the lowest (most protective)
+    for the headline.
+    """
+    stop_price: Decimal | None
+    target_price: Decimal | None
+    open_order_count: int
+
+
+async def fetch_broker_stop_targets(
+    *,
+    user_id: str,
+    session: AsyncSession,
+    broker: BrokerInterface,
+) -> dict[tuple[uuid.UUID, str], BrokerStopTarget]:
+    """For each (account_id, symbol) tied to an active account, derive the
+    sell-side stop and target from the broker's currently-open orders.
+
+    Returns an empty map if the broker can't list orders or any account fails.
+    Never raises — this is a best-effort annotation, not authoritative data.
+    """
+    out: dict[tuple[uuid.UUID, str], BrokerStopTarget] = {}
+    accounts_q = await session.execute(
+        select(Account).where(
+            Account.is_active == True,  # noqa: E712
+            Account.user_id == user_id,
+        )
+    )
+    for acct in accounts_q.scalars().all():
+        try:
+            orders = await broker.get_open_orders(acct.questrade_account_id)
+        except Exception as exc:
+            log.debug("get_open_orders failed for %s: %s", acct.questrade_account_id, exc)
+            continue
+
+        per_symbol: dict[str, list[BrokerOpenOrder]] = {}
+        for o in orders:
+            if o.side.lower() != "sell":
+                continue
+            per_symbol.setdefault(o.symbol, []).append(o)
+
+        for symbol, sym_orders in per_symbol.items():
+            stops = [o.stop_price for o in sym_orders if o.stop_price is not None and "stop" in o.order_type]
+            targets = [o.limit_price for o in sym_orders if o.limit_price is not None and o.order_type == "limit"]
+            out[(acct.id, symbol)] = BrokerStopTarget(
+                stop_price=min(stops) if stops else None,
+                target_price=max(targets) if targets else None,
+                open_order_count=len(sym_orders),
+            )
+    return out
 
 
 async def buying_power_breakdown(

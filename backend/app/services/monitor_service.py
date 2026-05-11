@@ -264,16 +264,7 @@ class MonitorService:
                 await on_entry_filled(session, ticket, entry_order, fill_price, self._broker)
                 alert_filled(ticket.symbol, fill_price, ticket.stop_price,
                              ticket.position_size_shares, ticket.is_paper)
-                # Set default Minervini exit plan on paper fills for easy reference
-                if ticket.exit_plan is None and float(ticket.stop_price) > 0:
-                    risk = float(quote.last) - float(ticket.stop_price)
-                    n = ticket.position_size_shares
-                    third = n // 3
-                    ticket.exit_plan = {"targets": [
-                        {"price": str(round(float(quote.last) + risk * 1.5, 2)), "shares": third, "label": "T1 +1.5R", "hit": False},
-                        {"price": str(round(float(quote.last) + risk * 2.5, 2)), "shares": third, "label": "T2 +2.5R", "hit": False},
-                        {"price": str(round(float(quote.last) + risk * 4.0, 2)), "shares": n - 2 * third, "label": "T3 +4R", "hit": False},
-                    ]}
+                # Exit plan is now auto-set in on_entry_filled for all fills.
 
         except Exception:
             log.exception("Order placement failed for %s — ticket stays triggered", ticket.symbol)

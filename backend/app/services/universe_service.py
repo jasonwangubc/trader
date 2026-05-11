@@ -106,12 +106,51 @@ def _fetch_wikipedia_tickers(source_key: str) -> list[dict]:
         return []
 
 
-async def _fetch_sec_exchange_universe() -> list[dict]:
-    """Fetch ALL NYSE/Nasdaq/CBOE listed stocks from SEC exchange JSON.
+# Ticker suffixes that identify non-common-stock securities listed on the
+# same exchanges as equities. We skip these so they don't bloat the download
+# queue with symbols that yfinance has no useful price/fundamental data for.
+#
+# Examples:
+#   ACMR-W   (warrant)
+#   AJAX-U   (unit)
+#   PSTH-WT  (warrant)
+#   LFTR-R   (right)
+#   FRT-PC   (preferred series C)
+#   BAC-PE   (preferred series E)
+#
+# Class-shares like BRK-A, BRK-B are intentionally kept (one-letter A-E that
+# are NOT prefixed with P are kept).
+_NON_EQUITY_SUFFIXES: frozenset[str] = frozenset({
+    "W",   "WS",  "WT",  "WW",         # warrants
+    "R",   "RT",  "RIGT",              # rights / subscription receipts
+    "U",   "UN",  "UNIT",              # units (often SPAC units)
+    "Z",                                # misc (often temporary symbols)
+    "P", "PA", "PB", "PC", "PD",       # preferred shares (multiple series)
+    "PE", "PF", "PG", "PH", "PI",
+    "PJ", "PK", "PL", "PM", "PN",
+    "PO", "PP", "PQ", "PR",
+})
 
-    Returns rows with symbol, cik, and source='sec_all'. This covers ~7,500
-    US-listed stocks including ETFs, small-caps, and anything not in the
-    curated S&P indices. CIKs are pre-attached so EDGAR fetch is instant.
+
+def _is_common_stock_ticker(ticker: str) -> bool:
+    """Return False for tickers that are almost certainly non-equity securities."""
+    if "-" not in ticker:
+        return True
+    parts = ticker.rsplit("-", 1)
+    suffix = parts[-1].upper()
+    return suffix not in _NON_EQUITY_SUFFIXES
+
+
+async def _fetch_sec_exchange_universe() -> list[dict]:
+    """Fetch NYSE/Nasdaq/CBOE listed stocks from SEC exchange JSON.
+
+    Returns rows with symbol, cik, and source='sec_all'. Filters out obvious
+    non-equity securities (warrants, rights, units) that inflate the universe
+    and have no useful price or fundamental data in yfinance.
+
+    Note: deduplication against the curated Wikipedia indices (S&P 500 etc.)
+    happens in build_universe — symbols already added from those sources are
+    not re-added from this list.
     """
     try:
         async with httpx.AsyncClient(
@@ -126,6 +165,7 @@ async def _fetch_sec_exchange_universe() -> list[dict]:
 
     fields = data.get("fields", [])
     rows: list[dict] = []
+    skipped_non_equity = 0
     for item in data.get("data", []):
         d = dict(zip(fields, item))
         exchange = d.get("exchange") or ""
@@ -135,13 +175,19 @@ async def _fetch_sec_exchange_universe() -> list[dict]:
         cik_num = d.get("cik")
         if not ticker or not cik_num:
             continue
+        if not _is_common_stock_ticker(ticker):
+            skipped_non_equity += 1
+            continue
         rows.append({
             "symbol": ticker,
             "cik": str(cik_num).zfill(10),
             "source": "sec_all",
         })
 
-    log.info("SEC exchange universe: %d valid US-listed stocks", len(rows))
+    log.info(
+        "SEC exchange universe: %d equity tickers (%d non-equity skipped)",
+        len(rows), skipped_non_equity,
+    )
     return rows
 
 

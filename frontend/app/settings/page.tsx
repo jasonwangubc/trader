@@ -8,13 +8,18 @@ export const dynamic = "force-dynamic";
 
 export const metadata = { title: "Settings" };
 
-interface ConnectionStatus { connected: boolean; message: string }
+interface ConnectionStatus { connected: boolean; message: string; has_token?: boolean }
 
 export default async function SettingsPage() {
-  let status: ConnectionStatus = { connected: false, message: "" };
+  let status: ConnectionStatus = { connected: false, message: "Not connected", has_token: false };
   try {
     status = await api<ConnectionStatus>("/api/settings/questrade");
-  } catch {/* not connected */}
+  } catch (e) {
+    if (e instanceof ApiError) {
+      status = { connected: false, message: e.message, has_token: true };
+    }
+  }
+  const isBroken = !status.connected && !!status.has_token;
 
   return (
     <main className="container mx-auto max-w-2xl p-6 sm:p-10">
@@ -38,7 +43,11 @@ export default async function SettingsPage() {
         </Card>
 
         {/* Questrade connection */}
-        <Card className={status.connected ? "border-emerald-400/50" : ""}>
+        <Card className={
+          status.connected ? "border-emerald-400/50"
+          : isBroken      ? "border-amber-400/50"
+          : ""
+        }>
           <CardHeader>
             <div className="flex items-center justify-between">
               <div>
@@ -48,13 +57,20 @@ export default async function SettingsPage() {
               <span className={`text-xs font-medium px-2 py-1 rounded-full ${
                 status.connected
                   ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
-                  : "bg-muted text-muted-foreground"
+                  : isBroken
+                    ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+                    : "bg-muted text-muted-foreground"
               }`}>
-                {status.connected ? "Connected" : "Not connected"}
+                {status.connected ? "Connected" : isBroken ? "Token broken" : "Not connected"}
               </span>
             </div>
           </CardHeader>
           <CardContent>
+            {isBroken && status.message && (
+              <div className="mb-3 rounded-md border border-amber-400/40 bg-amber-50 dark:bg-amber-950/20 p-3 text-xs text-amber-800 dark:text-amber-200">
+                {status.message}
+              </div>
+            )}
             <QuestradConnect initialConnected={status.connected} />
           </CardContent>
         </Card>
