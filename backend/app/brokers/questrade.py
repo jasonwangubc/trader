@@ -23,6 +23,8 @@ import httpx
 from app.brokers.base import (
     BrokerAccount,
     BrokerBalance,
+    BrokerBracketAck,
+    BrokerBracketRequest,
     BrokerInterface,
     BrokerOpenOrder,
     BrokerOrderAck,
@@ -500,6 +502,76 @@ class QuestradeBroker(BrokerInterface):
             status=self._map_qt_state(order.get("state", "")),
             submitted_at=datetime.now(timezone.utc),
         )
+
+    async def place_bracket_order(self, req: BrokerBracketRequest) -> BrokerBracketAck:
+        """Submit an atomic bracket: stop-limit Buy + stop-market Sell GTC.
+
+        Hits POST /v1/accounts/{accountId}/orders/bracket. Questrade holds the
+        StopLoss child dormant until the Primary fills, then activates it
+        broker-side. If we die between submit and fill, the bracket is still
+        intact at Questrade — no naked window.
+        """
+        sym_to_id = await self._resolve_symbol_ids([req.symbol])
+        symbol_id = sym_to_id.get(req.symbol)
+        if not symbol_id:
+            raise RuntimeError(f"Cannot resolve Questrade symbolId for {req.symbol}")
+
+        body: dict = {
+            "accountId": req.account_id,
+            "symbolId": symbol_id,
+            "primaryRoute": "AUTO",
+            "secondaryRoute": "AUTO",
+            "components": [
+                {
+                    "orderClass": "Primary",
+                    "orderType": "StopLimit",
+                    "action": "Buy",
+                    "quantity": req.quantity,
+                    "stopPrice": float(req.entry_stop_price),
+                    "limitPrice": float(req.entry_limit_price),
+                    "timeInForce": req.entry_time_in_force,
+                    "isAllOrNone": False,
+                    "isAnonymous": False,
+                },
+                {
+                    "orderClass": "StopLoss",
+                    "orderType": "StopMarket",
+                    "action": "Sell",
+                    "quantity": req.quantity,
+                    "stopPrice": float(req.stop_loss_price),
+                    "timeInForce": req.stop_loss_time_in_force,
+                    "isAllOrNone": False,
+                    "isAnonymous": False,
+                },
+            ],
+        }
+
+        data = await self._post(f"v1/accounts/{req.account_id}/orders/bracket", body)
+        orders = data.get("orders") or []
+        if len(orders) < 2:
+            raise RuntimeError(
+                f"Questrade bracket returned {len(orders)} orders; expected 2. Body: {data}"
+            )
+
+        primary_o = next((o for o in orders if o.get("orderClass") == "Primary"), None)
+        stop_o = next((o for o in orders if o.get("orderClass") == "StopLoss"), None)
+        if primary_o is None or stop_o is None:
+            raise RuntimeError(
+                f"Questrade bracket response missing Primary/StopLoss components: {data}"
+            )
+
+        now = datetime.now(timezone.utc)
+        primary_ack = BrokerOrderAck(
+            broker_order_id=str(primary_o["id"]),
+            status=self._map_qt_state(primary_o.get("state", "")),
+            submitted_at=now,
+        )
+        stop_ack = BrokerOrderAck(
+            broker_order_id=str(stop_o["id"]),
+            status=self._map_qt_state(stop_o.get("state", "")),
+            submitted_at=now,
+        )
+        return BrokerBracketAck(primary=primary_ack, stop_loss=stop_ack)
 
     async def get_order(self, account_id: str, broker_order_id: str) -> BrokerOrderAck:
         data = await self._get(f"v1/accounts/{account_id}/orders/{broker_order_id}")

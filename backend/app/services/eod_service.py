@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid as _uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable
@@ -17,6 +18,7 @@ from typing import Callable
 import pandas as pd
 import yfinance as yf
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import DailyBar, ScreenerSymbol
@@ -227,18 +229,21 @@ async def _upsert_symbol_bars(
     raw: pd.DataFrame,
     all_symbols: list[str],
 ) -> int:
-    """Extract one symbol from the yfinance multi-symbol DataFrame and upsert."""
+    """Extract one symbol from the yfinance DataFrame and upsert into daily_bars.
+
+    Uses a single bulk INSERT … ON CONFLICT (symbol, bar_date) DO UPDATE so
+    the operation is atomic and safe against:
+      - duplicate date rows in yfinance source data
+      - repeated calls for the same symbol within one transaction
+      - concurrent writes (unlikely but safe regardless)
+    """
     try:
-        # yfinance always returns a MultiIndex (field, symbol) even for single-symbol
-        # downloads in newer versions. Handle both cases.
         if hasattr(raw.columns, "levels"):
-            # MultiIndex columns — extract this symbol's slice
             if symbol in raw.columns.get_level_values(1):
                 df = raw.xs(symbol, axis=1, level=1).copy()
             else:
                 df = pd.DataFrame()
         else:
-            # Flat columns (legacy single-symbol behaviour)
             df = raw.copy()
     except Exception:
         log.warning("No data in download for %s", symbol)
@@ -251,32 +256,46 @@ async def _upsert_symbol_bars(
     df = df.dropna(subset=["Close"])
     df.index = pd.to_datetime(df.index)
 
-    upserted = 0
+    rows: list[dict] = []
+    seen_dates: set = set()
     for bar_date, row in df.iterrows():
         try:
             dt = bar_date.to_pydatetime().replace(tzinfo=None)
-            existing = await session.execute(
-                select(DailyBar).where(
-                    DailyBar.symbol == symbol,
-                    DailyBar.bar_date == dt,
-                )
-            )
-            bar = existing.scalar_one_or_none()
-            if bar is None:
-                bar = DailyBar(symbol=symbol, bar_date=dt)
-                session.add(bar)
-
-            bar.open = Decimal(str(round(float(row.get("Open", row["Close"])), 6)))
-            bar.high = Decimal(str(round(float(row.get("High", row["Close"])), 6)))
-            bar.low = Decimal(str(round(float(row.get("Low", row["Close"])), 6)))
-            bar.close = Decimal(str(round(float(row["Close"]), 6)))
-            bar.volume = int(row.get("Volume", 0))
-            bar.adj_close = bar.close  # auto_adjust=True means Close IS already adjusted
-            upserted += 1
+            if dt in seen_dates:
+                continue  # deduplicate within the yfinance response itself
+            seen_dates.add(dt)
+            close = Decimal(str(round(float(row["Close"]), 6)))
+            rows.append({
+                "id":        _uuid.uuid4(),
+                "symbol":    symbol,
+                "bar_date":  dt,
+                "open":      Decimal(str(round(float(row.get("Open",   row["Close"])), 6))),
+                "high":      Decimal(str(round(float(row.get("High",   row["Close"])), 6))),
+                "low":       Decimal(str(round(float(row.get("Low",    row["Close"])), 6))),
+                "close":     close,
+                "volume":    int(row.get("Volume", 0)),
+                "adj_close": close,  # auto_adjust=True — Close is already adjusted
+            })
         except Exception:
-            log.exception("Error upserting bar %s %s", symbol, bar_date)
+            log.exception("Error preparing bar %s %s", symbol, bar_date)
 
-    return upserted
+    if not rows:
+        return 0
+
+    stmt = pg_insert(DailyBar).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["symbol", "bar_date"],
+        set_={
+            "open":      stmt.excluded.open,
+            "high":      stmt.excluded.high,
+            "low":       stmt.excluded.low,
+            "close":     stmt.excluded.close,
+            "volume":    stmt.excluded.volume,
+            "adj_close": stmt.excluded.adj_close,
+        },
+    )
+    await session.execute(stmt)
+    return len(rows)
 
 
 async def get_bars_df(session: AsyncSession, symbol: str, days: int = 504) -> pd.DataFrame:

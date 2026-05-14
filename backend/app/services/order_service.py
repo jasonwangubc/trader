@@ -17,7 +17,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.brokers.base import BrokerInterface, BrokerOrderRequest, BrokerQuote
+from app.brokers.base import BrokerBracketRequest, BrokerInterface, BrokerOrderRequest, BrokerQuote
 from app.db.models import (
     Account,
     Fill,
@@ -82,6 +82,17 @@ async def place_entry_order(
     trigger = ticket.trigger_price
     limit   = (trigger * Decimal("1.005")).quantize(Decimal("0.01"))  # 0.5% ceiling
 
+    # Live path: try a bracket order so the stop is in place at the broker
+    # the moment the entry fills (zero naked window). Fall back to sequential
+    # place_order if the broker doesn't support brackets.
+    if not ticket.is_paper:
+        try:
+            return await _place_entry_with_bracket(
+                session, ticket, broker, account, trigger, limit,
+            )
+        except NotImplementedError:
+            log.warning("Broker %s lacks bracket support; falling back to sequential orders", broker.name)
+
     req = BrokerOrderRequest(
         account_id=account.questrade_account_id,
         symbol=ticket.symbol,
@@ -136,6 +147,87 @@ async def place_entry_order(
         },
     )
     return order
+
+
+async def _place_entry_with_bracket(
+    session: AsyncSession,
+    ticket: Ticket,
+    broker: BrokerInterface,
+    account: Account,
+    trigger: Decimal,
+    limit: Decimal,
+) -> Order:
+    """Atomic entry+stop via broker bracket. Creates two Order rows in one shot:
+    the entry (returned) and the GTC stop that activates server-side on fill.
+    """
+    req = BrokerBracketRequest(
+        account_id=account.questrade_account_id,
+        symbol=ticket.symbol,
+        quantity=ticket.position_size_shares,
+        entry_stop_price=trigger,
+        entry_limit_price=limit,
+        stop_loss_price=ticket.stop_price,
+        entry_time_in_force="Day",
+        stop_loss_time_in_force="GoodTillCancelled",
+    )
+    ack = await broker.place_bracket_order(req)
+    log.info("Bracket placed: %s qty=%d entry=%s/%s stop=%s primary_id=%s stop_id=%s",
+             ticket.symbol, ticket.position_size_shares,
+             trigger, limit, ticket.stop_price,
+             ack.primary.broker_order_id, ack.stop_loss.broker_order_id)
+
+    entry_order = Order(
+        ticket_id=ticket.id,
+        account_id=ticket.account_id,
+        questrade_order_id=ack.primary.broker_order_id,
+        symbol=ticket.symbol,
+        currency=ticket.currency,
+        side=OrderSide.BUY.value,
+        order_type=OrderType.STOP_LIMIT.value,
+        intent=OrderIntent.ENTRY.value,
+        quantity=ticket.position_size_shares,
+        limit_price=limit,
+        stop_price=trigger,
+        status=OrderStatus.SUBMITTED.value,
+        is_paper=False,
+        submitted_at=ack.primary.submitted_at,
+    )
+    stop_order = Order(
+        ticket_id=ticket.id,
+        account_id=ticket.account_id,
+        questrade_order_id=ack.stop_loss.broker_order_id,
+        symbol=ticket.symbol,
+        currency=ticket.currency,
+        side=OrderSide.SELL.value,
+        order_type=OrderType.STOP_MARKET.value,
+        intent=OrderIntent.STOP_LOSS.value,
+        quantity=ticket.position_size_shares,
+        stop_price=ticket.stop_price,
+        status=OrderStatus.SUBMITTED.value,
+        is_paper=False,
+        submitted_at=ack.stop_loss.submitted_at,
+    )
+    session.add(entry_order)
+    session.add(stop_order)
+    await session.flush()
+
+    await log_event(
+        session,
+        actor="system",
+        event_type="bracket_order_placed",
+        entity_type="ticket",
+        entity_id=ticket.id,
+        payload={
+            "entry_broker_order_id": ack.primary.broker_order_id,
+            "stop_broker_order_id": ack.stop_loss.broker_order_id,
+            "symbol": ticket.symbol,
+            "quantity": ticket.position_size_shares,
+            "entry_stop_price": str(trigger),
+            "entry_limit_price": str(limit),
+            "stop_loss_price": str(ticket.stop_price),
+        },
+    )
+    return entry_order
 
 
 async def place_stop_order(
@@ -249,7 +341,17 @@ async def on_entry_filled(
         },
     )
 
-    await place_stop_order(session, ticket, broker)
+    # Skip stop placement if it's already at the broker (bracket-order path).
+    # Cancelled/rejected stops don't count — fall through to place a fresh one.
+    existing_stop_q = await session.execute(
+        select(Order).where(
+            Order.ticket_id == ticket.id,
+            Order.intent == OrderIntent.STOP_LOSS.value,
+            Order.status.notin_([OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value]),
+        )
+    )
+    if existing_stop_q.scalar_one_or_none() is None:
+        await place_stop_order(session, ticket, broker)
 
 
 async def replace_stop_order(

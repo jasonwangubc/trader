@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, ChevronUp, Plus, ExternalLink } from "lucide-react";
+import { ChevronDown, ChevronRight, ChevronUp, Plus, ExternalLink, Bookmark, BookmarkCheck } from "lucide-react";
+import { API_URL } from "@/lib/api";
 import { StockChart } from "@/components/stock-chart";
 import {
   type ScoreResult,
@@ -41,7 +42,7 @@ const COLUMNS: { key: SortKey; label: string; align?: "left" | "right" | "center
 export function ResultsTable({ results }: { results: ScoreResult[] }) {
   const [sortKey, setSortKey] = useState<SortKey>("composite_score");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const sorted = useMemo(() => {
     const arr = [...results];
@@ -58,6 +59,15 @@ export function ResultsTable({ results }: { results: ScoreResult[] }) {
     });
     return arr;
   }, [results, sortKey, sortDir]);
+
+  const allExpanded = sorted.length > 0 && expanded.size === sorted.length;
+  const toggleAll   = () => {
+    if (allExpanded) {
+      setExpanded(new Set());
+    } else {
+      setExpanded(new Set(sorted.map(r => r.symbol)));
+    }
+  };
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -83,7 +93,17 @@ export function ResultsTable({ results }: { results: ScoreResult[] }) {
         <table className="w-full text-sm">
           <thead className="bg-muted/30 border-b border-border/60 sticky top-0 z-10">
             <tr>
-              <th className="w-8" />
+              <th className="w-8 px-1">
+                <button
+                  onClick={toggleAll}
+                  title={allExpanded ? "Collapse all" : "Expand all"}
+                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                >
+                  {allExpanded
+                    ? <ChevronDown className="h-3.5 w-3.5" />
+                    : <ChevronRight className="h-3.5 w-3.5" />}
+                </button>
+              </th>
               {COLUMNS.map(c => (
                 <th
                   key={c.key}
@@ -113,8 +133,12 @@ export function ResultsTable({ results }: { results: ScoreResult[] }) {
               <ResultRow
                 key={r.symbol}
                 r={r}
-                expanded={expanded === r.symbol}
-                onToggle={() => setExpanded(expanded === r.symbol ? null : r.symbol)}
+                expanded={expanded.has(r.symbol)}
+                onToggle={() => setExpanded(prev => {
+                  const next = new Set(prev);
+                  next.has(r.symbol) ? next.delete(r.symbol) : next.add(r.symbol);
+                  return next;
+                })}
               />
             ))}
           </tbody>
@@ -145,6 +169,7 @@ function buyabilityDot(b: string | null): { color: string; label: string } {
     case "in_base":  return { color: "bg-sky-500",             label: "In base — wait for breakout" };
     case "extended": return { color: "bg-rose-500",            label: "Extended past pivot — not buyable" };
     case "broken":   return { color: "bg-rose-700",            label: "Trend broken — exclude" };
+    case "frozen":   return { color: "bg-slate-500",           label: "Frozen — likely acquisition target or halted (near-zero daily range)" };
     default:         return { color: "bg-muted-foreground/40", label: "No clean setup" };
   }
 }
@@ -155,6 +180,24 @@ function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolea
   const ext = r.extension_pct ? parseFloat(r.extension_pct) : null;
   const dot = buyabilityDot(r.buyability);
   const patternLabel = r.pattern_type ? PATTERN_LABELS[r.pattern_type] ?? r.pattern_type : null;
+  const [watched, setWatched] = useState(false);
+  const [watching, setWatching] = useState(false);
+
+  const addToWatchlist = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (watched || watching) return;
+    setWatching(true);
+    try {
+      await fetch(`${API_URL}/api/screener/watchlist`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ symbol: r.symbol }),
+      });
+      setWatched(true);
+    } finally {
+      setWatching(false);
+    }
+  };
 
   return (
     <>
@@ -202,6 +245,18 @@ function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolea
         <td className={`px-2 py-2 text-right tabular-nums ${rankColor(r.smr_rank)}`}>{r.smr_rank ?? "—"}</td>
         <td className="px-2 py-2" onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-end gap-1.5">
+            <button
+              onClick={addToWatchlist}
+              disabled={watching}
+              title={watched ? "On watchlist" : "Add to watchlist"}
+              className={`inline-flex h-6 w-6 items-center justify-center rounded border transition-colors ${
+                watched
+                  ? "border-primary/50 text-primary"
+                  : "border-border/60 text-muted-foreground hover:text-foreground hover:border-primary/50"
+              }`}
+            >
+              {watched ? <BookmarkCheck className="h-3 w-3" /> : <Bookmark className="h-3 w-3" />}
+            </button>
             <Link
               href={`/tickets/new?symbol=${r.symbol}`}
               className="inline-flex h-6 items-center gap-0.5 rounded bg-primary/15 px-1.5 text-[10px] font-medium text-primary hover:bg-primary/25 transition-colors"
@@ -211,10 +266,9 @@ function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolea
             </Link>
             <Link
               href={`/chart/${r.symbol}`}
-              className="inline-flex h-6 w-6 items-center justify-center rounded border border-border/60 text-muted-foreground hover:text-foreground hover:border-primary/50 transition-colors"
-              title="Open full chart"
+              className="inline-flex h-6 items-center gap-1 rounded border border-border/60 px-2 text-[10px] font-medium text-muted-foreground hover:text-foreground hover:border-primary/50 transition-colors"
             >
-              <ExternalLink className="h-3 w-3" />
+              <ExternalLink className="h-3 w-3" /> Chart
             </Link>
           </div>
         </td>
@@ -230,20 +284,26 @@ function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolea
   );
 }
 
-function ExpandedDetails({ r }: { r: ScoreResult }) {
+export function ExpandedDetails({ r }: { r: ScoreResult }) {
   const passing = Object.entries(r.tt_criteria).filter(([, v]) => v).map(([k]) => TT_CRITERIA_LABELS[k] ?? k);
   const failing = Object.entries(r.tt_criteria).filter(([, v]) => !v).map(([k]) => TT_CRITERIA_LABELS[k] ?? k);
   const dot = buyabilityDot(r.buyability);
   const buyabilityLabel = r.buyability ? BUYABILITY_LABELS[r.buyability] ?? r.buyability : "—";
   const patternLabel = r.pattern_type ? PATTERN_LABELS[r.pattern_type] ?? r.pattern_type : "no clean setup";
 
+  // Acceleration: quarterly EPS growth > annual EPS growth by a meaningful margin
+  const qGrowth = r.net_income_growth ? parseFloat(r.net_income_growth) : null;
+  const aGrowth = r.earnings_annual_growth ? parseFloat(r.earnings_annual_growth) : null;
+  const isAccelerating = qGrowth !== null && aGrowth !== null && qGrowth > aGrowth + 0.05 && qGrowth > 0.10;
+  const isDecelerating = qGrowth !== null && aGrowth !== null && aGrowth > qGrowth + 0.05 && aGrowth > 0;
+
   return (
     <div className="grid gap-4 lg:grid-cols-[1fr_22rem]">
-      {/* Chart — 1yr fetch, zoomed to last ~80 bars (~4 months) for clearer candles */}
-      <div>
+      {/* Chart — taller, 1yr fetch zoomed to last ~80 bars (~4 months) */}
+      <div className="flex flex-col gap-2">
         <StockChart
           symbol={r.symbol}
-          height={320}
+          height={420}
           days={252}
           visibleDays={80}
           barSpacing={8}
@@ -251,10 +311,19 @@ function ExpandedDetails({ r }: { r: ScoreResult }) {
           showPivot={false}
           className="rounded-lg overflow-hidden"
         />
+        <div className="flex justify-end">
+          <Link
+            href={`/chart/${r.symbol}`}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground hover:border-primary/50 hover:text-primary transition-colors"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open full interactive chart
+          </Link>
+        </div>
       </div>
 
       {/* Side panel: setup, fundamentals, criteria */}
-      <div className="space-y-4">
+      <div className="space-y-3">
         <div className="rounded-lg border border-border/60 bg-card p-3">
           <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Setup</h4>
           <div className="space-y-1.5 text-xs">
@@ -303,13 +372,26 @@ function ExpandedDetails({ r }: { r: ScoreResult }) {
         </div>
 
         <div className="rounded-lg border border-border/60 bg-card p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Fundamentals (yoy)</h4>
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Fundamentals</h4>
+            {isAccelerating && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-400" title={`Q EPS ${qGrowth !== null ? (qGrowth*100).toFixed(0) : '?'}% vs Annual ${aGrowth !== null ? (aGrowth*100).toFixed(0) : '?'}% — earnings accelerating`}>
+                ↑ Accelerating
+              </span>
+            )}
+            {isDecelerating && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-400" title={`Q EPS ${qGrowth !== null ? (qGrowth*100).toFixed(0) : '?'}% vs Annual ${aGrowth !== null ? (aGrowth*100).toFixed(0) : '?'}% — earnings decelerating`}>
+                ↓ Decelerating
+              </span>
+            )}
+          </div>
           {(r.revenue_growth || r.net_income_growth || r.net_margin || r.roe) ? (
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <FundCell label="Revenue growth"   value={r.revenue_growth}    target={0.15} />
-              <FundCell label="EPS growth (Q)"   value={r.net_income_growth} target={0.25} />
-              <FundCell label="Net margin"       value={r.net_margin}        target={0.10} />
-              <FundCell label="Return on equity" value={r.roe}               target={0.17} />
+            <div className="grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
+              <FundCell label="Rev growth (YoY)"   value={r.revenue_growth}           target={0.15} isGrowth />
+              <FundCell label="EPS growth (Q YoY)" value={r.net_income_growth}        target={0.25} isGrowth
+                hint={aGrowth !== null ? `Annual: ${aGrowth >= 0 ? "+" : ""}${(aGrowth * 100).toFixed(0)}%` : undefined} />
+              <FundCell label="Net margin"          value={r.net_margin}               target={0.10} isGrowth={false} />
+              <FundCell label="Return on equity"    value={r.roe}                      target={0.17} isGrowth={false} />
             </div>
           ) : (
             <p className="text-xs text-muted-foreground/70">No fundamental data.</p>
@@ -345,7 +427,15 @@ function ExpandedDetails({ r }: { r: ScoreResult }) {
   );
 }
 
-function FundCell({ label, value, target }: { label: string; value: string | null; target: number }) {
+function FundCell({
+  label, value, target, isGrowth = true, hint,
+}: {
+  label: string;
+  value: string | null;
+  target: number;
+  isGrowth?: boolean;   // true = growth rate (show +/-), false = level (e.g. margin, ROE)
+  hint?: string;        // optional sub-label, e.g. annual comparison
+}) {
   if (value == null) return (
     <div>
       <div className="text-[10px] uppercase tracking-wide text-muted-foreground/60">{label}</div>
@@ -358,12 +448,17 @@ function FundCell({ label, value, target }: { label: string; value: string | nul
     v >= target     ? "text-emerald-400/80" :
     v >  0          ? "text-amber-400" :
                       "text-rose-400";
+
+  // Growth rates show +/-; levels (margin, ROE) show plain %
+  const formatted = isGrowth
+    ? `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`
+    : `${(v * 100).toFixed(1)}%`;
+
   return (
     <div>
       <div className="text-[10px] uppercase tracking-wide text-muted-foreground/60">{label}</div>
-      <div className={`font-mono font-semibold tabular-nums text-sm ${cls}`}>
-        {v >= 0 ? "+" : ""}{(v * 100).toFixed(1)}%
-      </div>
+      <div className={`font-mono font-semibold tabular-nums text-sm ${cls}`}>{formatted}</div>
+      {hint && <div className="text-[10px] text-muted-foreground/60 mt-0.5">{hint}</div>}
     </div>
   );
 }

@@ -426,6 +426,7 @@ async def summary(
             Ticket.outcome.isnot(None),
             Ticket.r_multiple.isnot(None),
             Ticket.user_id == user_id,
+            Ticket.is_paper == False,  # noqa: E712
         ).order_by(Ticket.closed_at.asc().nullslast())
     )
     tickets = result.scalars().all()
@@ -546,7 +547,11 @@ async def export_csv(
     """Download this user's closed trades as a CSV file."""
     result = await session.execute(
         select(Ticket)
-        .where(Ticket.outcome.isnot(None), Ticket.user_id == user_id)
+        .where(
+            Ticket.outcome.isnot(None),
+            Ticket.user_id == user_id,
+            Ticket.is_paper == False,  # noqa: E712
+        )
         .order_by(Ticket.closed_at.asc().nullslast())
     )
     tickets = result.scalars().all()

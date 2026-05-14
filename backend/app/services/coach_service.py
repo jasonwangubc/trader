@@ -60,6 +60,7 @@ async def compute_insights(
             Ticket.outcome.isnot(None),
             Ticket.r_multiple.isnot(None),
             Ticket.user_id == user_id,
+            Ticket.is_paper == False,  # noqa: E712
         ).order_by(Ticket.closed_at.asc().nullslast())
     )
     tickets = result.scalars().all()

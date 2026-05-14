@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   createChart,
-  CandlestickSeries,
+  BarSeries,
   HistogramSeries,
   LineSeries,
   type IChartApi,
@@ -99,7 +99,7 @@ export function StockChart({
       timeScale: {
         borderColor: gridColor,
         visible: !mini,
-        rightOffset: 5,
+        rightOffset: mini ? 3 : 12,
         barSpacing: barSpacing ?? (mini ? 2 : 6),
       },
       handleScroll: !mini,
@@ -129,18 +129,15 @@ export function StockChart({
       }))
     );
 
-    // ── Candlesticks ─────────────────────────────────────────────────────────
-    const candleSeries = chart.addSeries(CandlestickSeries, {
+    // ── OHLC bars ─────────────────────────────────────────────────────────────
+    const ohlcSeries = chart.addSeries(BarSeries, {
       upColor:          "#16a34a",
       downColor:        "#dc2626",
-      borderUpColor:    "#16a34a",
-      borderDownColor:  "#dc2626",
-      wickUpColor:      "#16a34a",
-      wickDownColor:    "#dc2626",
+      openVisible:      false,
       lastValueVisible: !mini,
       priceLineVisible: !mini,
     });
-    candleSeries.setData(data.bars as any[]);
+    ohlcSeries.setData(data.bars as any[]);
 
     // ── SMA overlays — full chart: all three; mini: 50 + 150 ─────────────────
     if (showSmas) {
@@ -224,7 +221,7 @@ export function StockChart({
           color: "#a78bfa",
           lineWidth: 1,
           priceScaleId: "rs",
-          title: "RS",
+          title: "RS (indexed)",
           crosshairMarkerVisible: false,
           lastValueVisible: true,
           priceLineVisible: false,
@@ -293,7 +290,7 @@ export function StockChart({
           <span><span className="mr-1 inline-block h-0.5 w-3 bg-violet-500" />150 SMA</span>
           <span><span className="mr-1 inline-block h-0.5 w-3 bg-red-500" />200 SMA</span>
           <span><span className="mr-1 inline-block h-0.5 w-3 border-dashed bg-cyan-500" />Pivot {data.pivot.toFixed(2)}</span>
-          <span className="ml-auto"><span className="mr-1 inline-block h-0.5 w-3 bg-violet-400" />RS line</span>
+          <span className="ml-auto"><span className="mr-1 inline-block h-0.5 w-3 bg-violet-400" />RS vs SPY (indexed 100)</span>
         </div>
       )}
       <div ref={containerRef} style={{ height }} className="overflow-hidden rounded-lg" />

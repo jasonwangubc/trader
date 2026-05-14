@@ -10,6 +10,8 @@ from decimal import Decimal
 from app.brokers.base import (
     BrokerAccount,
     BrokerBalance,
+    BrokerBracketAck,
+    BrokerBracketRequest,
     BrokerInterface,
     BrokerOrderAck,
     BrokerOrderRequest,
@@ -75,6 +77,29 @@ class PaperBroker(BrokerInterface):
         )
         _paper_orders[order_id] = ack
         return ack
+
+    async def place_bracket_order(self, req: BrokerBracketRequest) -> BrokerBracketAck:
+        """Simulate a bracket: entry fills instantly at entry_limit_price, stop
+        sits as a pending order. Matches the live broker's atomic semantics."""
+        primary_id = f"paper-{_uuid.uuid4().hex[:12]}"
+        stop_id    = f"paper-{_uuid.uuid4().hex[:12]}"
+        now = datetime.now(timezone.utc)
+
+        primary_ack = BrokerOrderAck(
+            broker_order_id=primary_id,
+            status="filled",
+            submitted_at=now,
+            fill_price=req.entry_limit_price,
+            fill_quantity=req.quantity,
+        )
+        stop_ack = BrokerOrderAck(
+            broker_order_id=stop_id,
+            status="accepted",
+            submitted_at=now,
+        )
+        _paper_orders[primary_id] = primary_ack
+        _paper_orders[stop_id] = stop_ack
+        return BrokerBracketAck(primary=primary_ack, stop_loss=stop_ack)
 
     async def get_order(self, account_id: str, broker_order_id: str) -> BrokerOrderAck:
         ack = _paper_orders.get(broker_order_id)

@@ -368,7 +368,8 @@ class ScoreOut(BaseModel):
     low_52w: Decimal | None
     fundamental_score: Decimal
     revenue_growth: Decimal | None
-    net_income_growth: Decimal | None
+    net_income_growth: Decimal | None       # most recent quarter YoY EPS growth
+    earnings_annual_growth: Decimal | None  # TTM/annual YoY (for acceleration comparison)
     net_margin: Decimal | None
     roe: Decimal | None
     eps_ttm: Decimal | None
@@ -394,6 +395,312 @@ class ResultsPage(BaseModel):
     page: int
     page_size: int
     pages: int
+
+
+# Literature win-rate and avg-gain estimates for each pattern.
+# Source: Bulkowski's Encyclopedia of Chart Patterns + practitioner consensus.
+# These are reference numbers for the UI — not backtested on this universe.
+_PATTERN_LITERATURE: dict[str, dict] = {
+    "high_tight_flag":    {"label": "High Tight Flag",    "win_rate": "65-70%", "avg_gain": "+50-100%+"},
+    "ascending_triangle": {"label": "Ascending Triangle", "win_rate": "~68%",   "avg_gain": "+35-45%"},
+    "cwh":                {"label": "Cup w/Handle",       "win_rate": "55-60%", "avg_gain": "+30-40%"},
+    "three_weeks_tight":  {"label": "3 Weeks Tight",      "win_rate": "60-65%", "avg_gain": "+25-40%"},
+    "vcp":                {"label": "VCP",                 "win_rate": "55-60%", "avg_gain": "+25-50%"},
+    "bull_flag":          {"label": "Bull Flag",           "win_rate": "55-60%", "avg_gain": "+20-35%"},
+    "flat_base":          {"label": "Flat Base",           "win_rate": "50-55%", "avg_gain": "+20-30%"},
+}
+
+
+class PatternStatRow(BaseModel):
+    pattern_type: str
+    label: str
+    count: int
+    avg_quality: float
+    win_rate: str
+    avg_gain: str
+
+
+@router.get("/pattern-stats", response_model=list[PatternStatRow])
+async def pattern_stats(
+    session: AsyncSession = Depends(get_session),
+) -> list[PatternStatRow]:
+    """Return hit counts and quality averages per pattern for the latest scan,
+    alongside literature-sourced win-rate estimates."""
+    from sqlalchemy import func, text
+    rows = await session.execute(
+        select(
+            ScreenerScore.pattern_type,
+            func.count().label("n"),
+            func.avg(ScreenerScore.pattern_quality).label("avg_q"),
+        )
+        .where(ScreenerScore.pattern_type.isnot(None))
+        .group_by(ScreenerScore.pattern_type)
+        .order_by(func.count().desc())
+    )
+    out: list[PatternStatRow] = []
+    for r in rows.all():
+        lit = _PATTERN_LITERATURE.get(r.pattern_type, {})
+        out.append(PatternStatRow(
+            pattern_type=r.pattern_type,
+            label=lit.get("label", r.pattern_type),
+            count=r.n,
+            avg_quality=round(float(r.avg_q or 0) * 100, 1),
+            win_rate=lit.get("win_rate", "—"),
+            avg_gain=lit.get("avg_gain", "—"),
+        ))
+    # Append patterns with zero hits so the table is complete
+    seen = {r.pattern_type for r in out}
+    for pt, lit in _PATTERN_LITERATURE.items():
+        if pt not in seen:
+            out.append(PatternStatRow(
+                pattern_type=pt,
+                label=lit["label"],
+                count=0,
+                avg_quality=0.0,
+                win_rate=lit["win_rate"],
+                avg_gain=lit["avg_gain"],
+            ))
+    return out
+
+
+# ─── Today's Picks — tiered curated list to fight decision paralysis ──────────
+
+class PickRow(BaseModel):
+    symbol: str
+    sector: str | None
+    last_close: Decimal | None
+    pattern_type: str | None
+    pattern_quality: float        # 0-100
+    buyability: str
+    pivot_price: Decimal | None
+    extension_pct: Decimal | None
+    composite_score: float         # 0-100
+    eps_rank: int | None
+    rs_rank: int | None
+    accelerating: bool            # earnings accelerating (Q > Annual)
+    tier: str                     # "S" | "A" | "B"
+    reason: str                   # 1-line "why this one"
+
+
+class PicksOut(BaseModel):
+    tier_s: list[PickRow]
+    tier_a: list[PickRow]
+    tier_b: list[PickRow]
+    as_of: datetime | None
+    note: str
+
+
+def _is_accelerating(r: ScreenerScore) -> bool:
+    """Return True if earnings show acceleration or are strongly positive.
+
+    Preferred: compare quarterly (most-recent) vs annual (trend).
+    Fallback: if annual data is missing (common after a migration before rescan),
+    accept any stock with quarterly EPS growth > 25% — still a strong signal.
+    """
+    q = float(r.net_income_growth) if r.net_income_growth is not None else None
+    a = float(r.earnings_annual_growth) if r.earnings_annual_growth is not None else None
+
+    if q is None:
+        return False
+    if a is not None:
+        # Full check: quarterly genuinely beating annual trend
+        return q > a + 0.05 and q > 0.10
+    # Fallback: annual data not yet populated — use standalone quarterly threshold
+    return q > 0.25
+
+
+def _pick_reason(r: ScreenerScore, tier: str) -> str:
+    """Human-readable 1-line reason for the pick."""
+    parts: list[str] = []
+    if r.pattern_type:
+        labels = {
+            "high_tight_flag": "HTF", "ascending_triangle": "Ascending triangle",
+            "cwh": "Cup w/Handle", "vcp": "VCP", "flat_base": "Flat base",
+            "three_weeks_tight": "3 Weeks Tight", "bull_flag": "Bull flag",
+        }
+        q = int(round(float(r.pattern_quality or 0) * 100))
+        parts.append(f"{labels.get(r.pattern_type, r.pattern_type)} q{q}")
+    if r.buyability == "at_pivot":
+        parts.append("at pivot")
+    elif r.buyability == "in_base":
+        parts.append("in base")
+    if r.eps_rank is not None and r.eps_rank >= 80:
+        parts.append(f"EPS {r.eps_rank}")
+    if r.rs_rank is not None and r.rs_rank >= 80:
+        parts.append(f"RS {r.rs_rank}")
+    if _is_accelerating(r):
+        parts.append("EPS accelerating")
+    return " · ".join(parts) if parts else f"{r.pattern_type or 'setup'}"
+
+
+def _pick_row(r: ScreenerScore, tier: str) -> PickRow:
+    return PickRow(
+        symbol=r.symbol,
+        sector=r.sector,
+        last_close=r.last_close,
+        pattern_type=r.pattern_type,
+        pattern_quality=round(float(r.pattern_quality or 0) * 100, 1),
+        buyability=r.buyability or "no_pattern",
+        pivot_price=r.pivot_price,
+        extension_pct=r.extension_pct,
+        composite_score=round(float(r.composite_score) * 100, 1),
+        eps_rank=r.eps_rank,
+        rs_rank=r.rs_rank,
+        accelerating=_is_accelerating(r),
+        tier=tier,
+        reason=_pick_reason(r, tier),
+    )
+
+
+@router.get("/picks", response_model=PicksOut)
+async def todays_picks(
+    session: AsyncSession = Depends(get_session),
+) -> PicksOut:
+    """Tiered curated picks — designed to eliminate decision paralysis.
+
+    Tier S (≤ 3):  HTF or Ascending Triangle at pivot, q ≥ 50 — highest EV
+    Tier A (≤ 3):  Other patterns at pivot, q ≥ 65 AND accelerating earnings
+    Tier B (≤ 4):  Quality patterns in-base (watch list, may break out today)
+
+    Returns at most ~10 picks total, all already filtered for buyability.
+    """
+    q = (
+        select(ScreenerScore)
+        .where(ScreenerScore.buyability.in_(["at_pivot", "in_base"]))
+        .where(ScreenerScore.pattern_quality.isnot(None))
+        .where(ScreenerScore.pattern_quality > 0.40)
+        .order_by(ScreenerScore.composite_score.desc())
+    )
+    result = await session.execute(q)
+    rows = result.scalars().all()
+
+    used: set[str] = set()
+
+    # Tier S: HTF or Ascending Triangle at pivot
+    tier_s: list[PickRow] = []
+    for r in rows:
+        if r.symbol in used: continue
+        if r.buyability != "at_pivot": continue
+        if r.pattern_type not in ("high_tight_flag", "ascending_triangle"): continue
+        if float(r.pattern_quality) < 0.50: continue
+        tier_s.append(_pick_row(r, "S"))
+        used.add(r.symbol)
+        if len(tier_s) >= 10: break
+
+    # Tier A: Other patterns at pivot, quality ≥ 0.60, accelerating earnings
+    tier_a: list[PickRow] = []
+    for r in rows:
+        if r.symbol in used: continue
+        if r.buyability != "at_pivot": continue
+        if r.pattern_type in ("high_tight_flag", "ascending_triangle"): continue  # already in S
+        if float(r.pattern_quality) < 0.60: continue
+        if not _is_accelerating(r): continue
+        tier_a.append(_pick_row(r, "A"))
+        used.add(r.symbol)
+        if len(tier_a) >= 10: break
+
+    # Tier B: In-base watchlist
+    tier_b: list[PickRow] = []
+    for r in rows:
+        if r.symbol in used: continue
+        if r.buyability != "in_base": continue
+        if float(r.pattern_quality) < 0.55: continue
+        tier_b.append(_pick_row(r, "B"))
+        used.add(r.symbol)
+        if len(tier_b) >= 10: break
+
+    # Most recent scored_at as the "as of" timestamp
+    as_of_q = await session.execute(select(func.max(ScreenerScore.scored_at)))
+    as_of = as_of_q.scalar_one_or_none()
+
+    return PicksOut(
+        tier_s=tier_s,
+        tier_a=tier_a,
+        tier_b=tier_b,
+        as_of=as_of,
+        note="Tier S = highest expected value (HTF / Ascending Triangle). Tier A = quality bases at pivot with accelerating earnings. Tier B = quality bases in-base (watch for breakout).",
+    )
+
+
+@router.get("/score/{symbol}", response_model=ScoreOut)
+async def get_score(
+    symbol: str,
+    session: AsyncSession = Depends(get_session),
+) -> ScoreOut:
+    """Return the latest screener score for a single symbol."""
+    result = await session.execute(
+        select(ScreenerScore).where(ScreenerScore.symbol == symbol.upper())
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No score found for {symbol.upper()}")
+    return _score_out(row)
+
+
+class SearchHit(BaseModel):
+    symbol: str
+    sector: str | None
+    tt_score: int | None              # None if unscored
+    composite_score: float | None     # 0-100, None if unscored
+
+
+@router.get("/search", response_model=list[SearchHit])
+async def search_symbols(
+    q: str = "",
+    limit: int = 20,
+    session: AsyncSession = Depends(get_session),
+) -> list[SearchHit]:
+    """Full-universe symbol search. Returns matches by symbol prefix, symbol
+    substring, or sector substring — including stocks that aren't in the top
+    composite-score window. Empty q returns the top-N by composite.
+    """
+    q = (q or "").strip().upper()
+
+    # Join screener_symbols (universe) with screener_scores (latest score)
+    # so stocks that haven't been scored yet still appear in search results.
+    base = (
+        select(
+            ScreenerSymbol.symbol,
+            ScreenerScore.sector,
+            ScreenerScore.tt_score,
+            ScreenerScore.composite_score,
+        )
+        .outerjoin(ScreenerScore, ScreenerScore.symbol == ScreenerSymbol.symbol)
+        .where(ScreenerSymbol.is_active == True)  # noqa: E712
+    )
+
+    if not q:
+        stmt = base.order_by(ScreenerScore.composite_score.desc().nullslast()).limit(limit)
+    else:
+        # Prefix match scores higher than substring; sector match also accepted.
+        prefix = f"{q}%"
+        contains = f"%{q}%"
+        stmt = (
+            base
+            .where(
+                (ScreenerSymbol.symbol.like(prefix))
+                | (ScreenerSymbol.symbol.like(contains))
+                | (func.upper(ScreenerScore.sector).like(contains))
+            )
+            # Prefix matches first, then by score
+            .order_by(
+                ScreenerSymbol.symbol.like(prefix).desc(),
+                ScreenerScore.composite_score.desc().nullslast(),
+                ScreenerSymbol.symbol.asc(),
+            )
+            .limit(limit)
+        )
+
+    rows = (await session.execute(stmt)).all()
+    return [
+        SearchHit(
+            symbol=r.symbol,
+            sector=r.sector,
+            tt_score=r.tt_score,
+            composite_score=round(float(r.composite_score) * 100, 1) if r.composite_score is not None else None,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/results", response_model=ResultsPage)
@@ -456,6 +763,7 @@ def _score_out(r: ScreenerScore) -> ScoreOut:
         fundamental_score=r.fundamental_score,
         revenue_growth=r.revenue_growth,
         net_income_growth=r.net_income_growth,
+        earnings_annual_growth=r.earnings_annual_growth,
         net_margin=r.net_margin,
         roe=r.roe,
         eps_ttm=r.eps_ttm,

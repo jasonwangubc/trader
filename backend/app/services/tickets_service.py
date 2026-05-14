@@ -200,8 +200,9 @@ async def create_retroactive_ticket(
     equity_basis = equity.get(pos.currency, Decimal(0))
     risk_pct = (risk_amount / equity_basis) if equity_basis > 0 else Decimal(0)
 
-    settings = get_settings()
-    is_paper = not account.real_money_enabled or settings.paper_mode_default
+    # Retroactive tickets track an already-open real position — don't let the
+    # global paper_mode_default override the account's own real-money setting.
+    is_paper = not account.real_money_enabled
 
     now = datetime.now(timezone.utc)
     ticket = Ticket(

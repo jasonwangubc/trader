@@ -34,7 +34,8 @@ export interface ScoreResult {
   low_52w: string | null;
   fundamental_score: string;
   revenue_growth: string | null;
-  net_income_growth: string | null;
+  net_income_growth: string | null;        // most recent quarter YoY EPS growth
+  earnings_annual_growth: string | null;   // TTM/annual YoY (compare vs quarterly for acceleration)
   net_margin: string | null;
   roe: string | null;
   eps_ttm: string | null;
@@ -56,9 +57,12 @@ export interface ScoreResult {
 
 export const PATTERN_LABELS: Record<string, string> = {
   vcp: "VCP",
-  cwh: "Cup w/Handle",
+  cwh: "CWH",
   flat_base: "Flat Base",
   high_tight_flag: "HTF",
+  ascending_triangle: "Asc Tri",
+  three_weeks_tight: "3WT",
+  bull_flag: "Bull Flag",
 };
 
 export const BUYABILITY_LABELS: Record<string, string> = {
@@ -66,6 +70,7 @@ export const BUYABILITY_LABELS: Record<string, string> = {
   in_base: "In base",
   extended: "Extended",
   broken: "Broken",
+  frozen: "Frozen",
   no_pattern: "No setup",
 };
 

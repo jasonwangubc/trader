@@ -40,6 +40,15 @@ class VCPResult:
     volume_ratio: float | None = None      # recent avg vol / prior avg vol
 
 
+# Minimum average daily range as % of price. Below this the stock is frozen —
+# most likely in acquisition limbo or halted. Not a tradeable setup.
+MIN_ADR_PCT = 0.50   # 50 basis points — real stocks always exceed this
+
+# Minimum base depth for a valid VCP. Acquisition targets lock to the offer
+# price and show 1-2% "bases" that are purely price pinning, not real bases.
+MIN_BASE_DEPTH_PCT = 0.025   # 2.5%
+
+
 def score_vcp(df: pd.DataFrame, tt: TTResult) -> VCPResult:
     """
     df: daily bars sorted ascending, columns [date, close, high, low, volume].
@@ -53,10 +62,26 @@ def score_vcp(df: pd.DataFrame, tt: TTResult) -> VCPResult:
     lows   = df["low"].values.astype(float)
     vols   = df["volume"].values.astype(float)
 
+    # ── 0. Frozen-stock guard ────────────────────────────────────────────────
+    # Acquisition targets / halted stocks have essentially zero daily movement.
+    # Their "tight base" is price-pinning to an offer price, not organic contraction.
+    # Reject before scoring — these should not rank as VCP candidates.
+    recent_closes = closes[-BASE_WINDOW:]
+    recent_highs  = highs[-BASE_WINDOW:]
+    recent_lows   = lows[-BASE_WINDOW:]
+    avg_daily_range = float(np.mean((recent_highs - recent_lows) / recent_closes)) * 100
+    if avg_daily_range < MIN_ADR_PCT:
+        return VCPResult(score=0.0, details={"frozen": True, "avg_adr_pct": round(avg_daily_range, 3)})
+
     # ── 1. Base tightness ────────────────────────────────────────────────────
     base_h = float(np.max(highs[-BASE_WINDOW:]))
     base_l = float(np.min(lows[-BASE_WINDOW:]))
     base_depth = (base_h - base_l) / base_h if base_h > 0 else 1.0
+
+    # Reject impossibly tight bases (< 2.5%) — acquisition pinning, not real contraction
+    if base_depth < MIN_BASE_DEPTH_PCT:
+        return VCPResult(score=0.0, base_depth_pct=base_depth * 100,
+                         details={"frozen": True, "base_depth_pct": round(base_depth * 100, 2)})
 
     # Tight = depth < 10% → 2 pts; decent < 15% → 1 pt; loose → 0
     if base_depth < 0.10:

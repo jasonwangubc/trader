@@ -6,11 +6,19 @@ import { api, ApiError } from "@/lib/api";
 import { type BuyingPower, type Position, type PositionsData } from "@/lib/positions";
 import { type Account, type HouseholdData, fmtMoney } from "@/lib/tickets";
 import { UnmanagedActions } from "./unmanaged-actions";
+import { AccountFilter } from "./account-filter";
 
 export const metadata = { title: 'Positions' };
 
 
-export default async function PositionsPage() {
+export default async function PositionsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ exclude?: string }>;
+}) {
+  const params = await searchParams;
+  const excludeTypes = new Set((params.exclude ?? "").split(",").filter(Boolean));
+
   let data: PositionsData | null = null;
   let accounts: Account[] = [];
   let equityByCurrency: Record<string, number> = {};
@@ -32,6 +40,9 @@ export default async function PositionsPage() {
 
   const accountMap = new Map(accounts.map((a) => [a.id, a]));
 
+  // Unique account types across all accounts, for the filter chips
+  const accountTypes = [...new Set(accounts.map(a => a.type))].sort();
+
   return (
     <main className="container mx-auto max-w-5xl p-6 sm:p-10">
       <header className="mb-8 flex items-center justify-between">
@@ -50,6 +61,12 @@ export default async function PositionsPage() {
         </Link>
       </header>
 
+      {accountTypes.length > 1 && (
+        <div className="mb-5">
+          <AccountFilter accountTypes={accountTypes} />
+        </div>
+      )}
+
       {error && (
         <div className="border-destructive/50 bg-destructive/10 text-destructive mb-6 rounded-md border p-4 text-sm">
           {error}
@@ -60,7 +77,10 @@ export default async function PositionsPage() {
         <>
           <BuyingPowerSection breakdown={data.buying_power} />
           <PositionsSection
-            positions={data.positions}
+            positions={data.positions.filter(p => {
+              const acct = accountMap.get(p.account_id);
+              return !acct || !excludeTypes.has(acct.type);
+            })}
             accountMap={accountMap}
             equityByCurrency={equityByCurrency}
           />

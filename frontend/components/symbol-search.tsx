@@ -5,24 +5,20 @@ import { useRouter } from "next/navigation";
 import { Search, TrendingUp, BarChart2, X } from "lucide-react";
 import { API_URL } from "@/lib/api";
 
-interface ScoreRow { symbol: string; tt_score: number; composite_score: string; sector: string | null }
+interface SearchHit {
+  symbol: string;
+  sector: string | null;
+  tt_score: number | null;
+  composite_score: number | null;
+}
 
 export function SymbolSearch() {
   const router = useRouter();
   const [open, setOpen]       = useState(false);
   const [query, setQuery]     = useState("");
-  const [results, setResults] = useState<ScoreRow[]>([]);
+  const [results, setResults] = useState<SearchHit[]>([]);
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
-  const allRef   = useRef<ScoreRow[]>([]);
-
-  // Load all scored symbols once
-  useEffect(() => {
-    fetch(`${API_URL}/api/screener/results?page_size=500`)
-      .then(r => r.json())
-      .then((d: any) => { allRef.current = d.items ?? []; })
-      .catch(() => {});
-  }, []);
 
   // CMD+K / CTRL+K to open
   useEffect(() => {
@@ -43,19 +39,23 @@ export function SymbolSearch() {
     if (open) setTimeout(() => inputRef.current?.focus(), 50);
   }, [open]);
 
+  // Debounced server-side search across the full universe (not just top-scored).
   useEffect(() => {
-    if (!query.trim()) {
-      setResults(allRef.current.slice(0, 8));
-      return;
-    }
-    const q = query.toUpperCase();
-    setResults(
-      allRef.current
-        .filter(r => r.symbol.startsWith(q) || r.symbol.includes(q) || (r.sector || "").toUpperCase().includes(q))
-        .slice(0, 8)
-    );
-    setSelected(0);
-  }, [query]);
+    if (!open) return;
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const url = `${API_URL}/api/screener/search?q=${encodeURIComponent(query)}&limit=12`;
+        const r = await fetch(url, { signal: ctrl.signal });
+        if (r.ok) {
+          const data: SearchHit[] = await r.json();
+          setResults(data);
+          setSelected(0);
+        }
+      } catch {/* aborted */}
+    }, query ? 120 : 0);
+    return () => { clearTimeout(t); ctrl.abort(); };
+  }, [query, open]);
 
   const go = useCallback((symbol: string, dest: "chart" | "ticket") => {
     setOpen(false);
@@ -123,8 +123,12 @@ export function SymbolSearch() {
                 {r.sector && <span className="text-muted-foreground text-xs">{r.sector}</span>}
               </div>
               <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground">TT {r.tt_score}/8</span>
-                <span className="text-xs font-medium">{Math.round(parseFloat(r.composite_score) * 100)}</span>
+                <span className="text-xs text-muted-foreground">
+                  {r.tt_score !== null ? `TT ${r.tt_score}/8` : "unscored"}
+                </span>
+                <span className="text-xs font-medium">
+                  {r.composite_score !== null ? Math.round(r.composite_score) : "—"}
+                </span>
                 <div className="flex gap-1">
                   <button
                     onClick={e => { e.stopPropagation(); go(r.symbol, "chart"); }}

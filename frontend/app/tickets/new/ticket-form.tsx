@@ -69,7 +69,7 @@ export function TicketForm({
   const [guardrailBlock, setGuardrailBlock] = useState<{ code: string; message: string } | null>(null);
   const [overrideRegime, setOverrideRegime] = useState(false);
   const [overrideStreak, setOverrideStreak] = useState(false);
-  const [isPaper, setIsPaper] = useState<boolean | null>(null);
+  const [isPaper, setIsPaper] = useState<boolean>(false);
   const [earningsWarning, setEarningsWarning] = useState<string | null>(null);
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
@@ -211,44 +211,29 @@ export function TicketForm({
     preview?.regime === "bear"    ? "text-destructive" : "";
 
   const selectedAccount = accounts.find(a => a.id === form.account_id);
-  const effectiveLive = isPaper === false || (isPaper === null && selectedAccount && !isPaper);
 
   return (
     <form onSubmit={submit} className="grid gap-6 lg:grid-cols-[1fr_22rem]">
       <div className="space-y-6">
-        {/* Paper / Live mode selector */}
-        <div className={`rounded-lg border px-4 py-3 ${isPaper === false ? "border-destructive/50 bg-destructive/5" : "border-muted bg-muted/30"}`}>
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium">
-                {isPaper === false ? "⚠ LIVE execution — real order will be sent to Questrade" : "Paper mode — simulated trade only"}
-              </p>
-              <p className="text-muted-foreground text-xs mt-0.5">
-                {isPaper === null ? "Following account default setting" : isPaper ? "Override: forced paper" : "Override: forced live"}
-              </p>
-            </div>
-            <div className="flex rounded-md border overflow-hidden text-xs font-medium">
-              {([["paper", true], ["auto", null], ["live", false]] as const).map(([label, val]) => (
-                <button
-                  key={label}
-                  type="button"
-                  onClick={() => setIsPaper(val)}
-                  className={`px-3 py-1.5 capitalize transition-colors ${
-                    isPaper === val
-                      ? val === false ? "bg-destructive text-destructive-foreground" : "bg-primary text-primary-foreground"
-                      : "hover:bg-muted"
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-          {isPaper === false && (
-            <p className="text-destructive text-xs mt-2 font-medium">
-              This ticket will send real buy and stop-loss orders to Questrade when it triggers. Make sure your account has real-money execution enabled.
+        {/* Paper trade toggle */}
+        <div className={`rounded-lg border px-4 py-3 flex items-center justify-between gap-4 ${isPaper ? "border-muted bg-muted/30" : "border-emerald-500/30 bg-emerald-500/5"}`}>
+          <div>
+            <p className="text-sm font-medium">
+              {isPaper ? "Paper trade — simulated only, no real orders sent" : "Live trade — real orders will go to Questrade"}
             </p>
-          )}
+            <p className="text-muted-foreground text-xs mt-0.5">
+              {isPaper ? "Use this for testing setups without risk." : "Make sure your account has real-money execution enabled."}
+            </p>
+          </div>
+          <label className="flex items-center gap-2 cursor-pointer shrink-0">
+            <span className="text-xs text-muted-foreground">Paper</span>
+            <input
+              type="checkbox"
+              checked={isPaper}
+              onChange={e => setIsPaper(e.target.checked)}
+              className="h-4 w-4 rounded border-border accent-primary cursor-pointer"
+            />
+          </label>
         </div>
 
         <Card>

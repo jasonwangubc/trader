@@ -73,6 +73,11 @@ def _yf_info_sync(sym: str) -> dict:
 
     Returns an empty dict on permanent failure or if the response lacks price
     data (which usually means the symbol isn't in yfinance at all).
+
+    We fetch BOTH quarterly and annual EPS growth so we can detect acceleration:
+      - earningsQuarterlyGrowth: most recent quarter YoY (the CANSLIM "C")
+      - earningsGrowth: TTM/annual YoY (baseline)
+    If quarterly > annual, earnings are accelerating — a Minervini/CANSLIM signal.
     """
     import time
     for attempt in range(2):
@@ -81,18 +86,21 @@ def _yf_info_sync(sym: str) -> dict:
             # An empty or stub response has no regularMarketPrice. Skip it.
             if not info.get("regularMarketPrice") and not info.get("currentPrice") and not info.get("trailingEps"):
                 if attempt == 0:
-                    # Wait and retry once — might be a transient 429
                     time.sleep(YF_FUNDAMENTALS_RETRY_DELAY)
                     continue
                 return {}
-            eps_growth = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
+            quarterly_growth = info.get("earningsQuarterlyGrowth")
+            annual_growth    = info.get("earningsGrowth")
+            # Prefer quarterly for the primary metric; fall back to annual
+            eps_growth = quarterly_growth if quarterly_growth is not None else annual_growth
             return {
-                "net_income_growth": eps_growth,
-                "revenue_growth":    info.get("revenueGrowth"),
-                "net_margin":        info.get("profitMargins"),
-                "roe":               info.get("returnOnEquity"),
-                "sector":            info.get("sector"),
-                "trailing_eps":      info.get("trailingEps"),
+                "net_income_growth":     eps_growth,
+                "earnings_annual_growth": annual_growth,
+                "revenue_growth":        info.get("revenueGrowth"),
+                "net_margin":            info.get("profitMargins"),
+                "roe":                   info.get("returnOnEquity"),
+                "sector":                info.get("sector"),
+                "trailing_eps":          info.get("trailingEps"),
             }
         except Exception as exc:
             if attempt == 0:
@@ -599,28 +607,49 @@ async def run_screener(
 
         fund = fundamental_map.get(sym)
         if fund:
-            rev_g  = fund.get("revenue_growth")
-            ni_g   = fund.get("net_income_growth")
-            margin = fund.get("net_margin")
-            roe    = fund.get("roe")
-            eps    = fund.get("trailing_eps")
-            sector = fund.get("sector")
+            rev_g         = fund.get("revenue_growth")
+            ni_g          = fund.get("net_income_growth")      # quarterly YoY
+            annual_g      = fund.get("earnings_annual_growth")  # TTM/annual YoY
+            margin        = fund.get("net_margin")
+            roe           = fund.get("roe")
+            eps           = fund.get("trailing_eps")
+            sector        = fund.get("sector")
 
-            # Minervini 4-point fundamental score (kept for backward compatibility)
+            # 5-point fundamental score (Minervini/CANSLIM):
+            #   +1  EPS quarterly growth ≥ 25%  (CANSLIM "C")
+            #   +1  Revenue growth ≥ 15%         (CANSLIM "S")
+            #   +1  Net margin ≥ 10%             (quality / SEPA)
+            #   +1  ROE ≥ 17%                    (Minervini quality filter)
+            #   +1  Earnings acceleration: quarterly growth > annual growth
+            #       (the most recent quarter accelerating vs trend — CANSLIM "A")
             score_pts = 0
             if ni_g   is not None and ni_g   >= 0.25: score_pts += 1
             if rev_g  is not None and rev_g  >= 0.15: score_pts += 1
             if margin is not None and margin >= 0.10: score_pts += 1
             if roe    is not None and roe    >= 0.17: score_pts += 1
+            # Acceleration: quarterly EPS growth meaningfully above annual — sign of momentum
+            if (ni_g is not None and annual_g is not None
+                    and ni_g > annual_g + 0.05       # at least 5pp better than annual
+                    and ni_g > 0.10):                # must still be genuinely positive
+                score_pts += 1
 
-            score_row.fundamental_score  = Decimal(str(round(score_pts / 4.0, 3)))
-            score_row.revenue_growth     = Decimal(str(round(rev_g,  4))) if rev_g  is not None else None
-            score_row.net_income_growth  = Decimal(str(round(ni_g,   4))) if ni_g   is not None else None
-            score_row.net_margin         = Decimal(str(round(margin, 4))) if margin is not None else None
-            score_row.roe                = Decimal(str(round(roe,    4))) if roe    is not None else None
-            score_row.eps_ttm            = Decimal(str(round(eps,    4))) if eps    is not None else None
-            score_row.sector             = sector or score_row.sector
-            score_row.fundamental_error  = None
+            # Clamp growth rates to ±1000.0 (100,000%) before storing.
+            # yfinance occasionally returns astronomical values for micro-caps
+            # emerging from near-zero bases (e.g., rev went from $1k to $4M).
+            # These values are meaningless for screening; cap them so DB columns
+            # never overflow even if Numeric precision is widened further later.
+            def _clamp(v: float | None, lo: float = -1000.0, hi: float = 1000.0) -> float | None:
+                return max(lo, min(hi, v)) if v is not None else None
+
+            score_row.fundamental_score      = Decimal(str(round(score_pts / 5.0, 3)))
+            score_row.revenue_growth         = Decimal(str(round(_clamp(rev_g),    4))) if rev_g    is not None else None
+            score_row.net_income_growth      = Decimal(str(round(_clamp(ni_g),     4))) if ni_g     is not None else None
+            score_row.earnings_annual_growth = Decimal(str(round(_clamp(annual_g), 4))) if annual_g is not None else None
+            score_row.net_margin             = Decimal(str(round(_clamp(margin, -10.0, 10.0), 4))) if margin is not None else None
+            score_row.roe                    = Decimal(str(round(_clamp(roe,    -100.0, 100.0), 4))) if roe   is not None else None
+            score_row.eps_ttm                = Decimal(str(round(eps,       4))) if eps      is not None else None
+            score_row.sector                 = sector or score_row.sector
+            score_row.fundamental_error      = None
         else:
             score_row.fundamental_score = Decimal(0)
 
@@ -687,32 +716,43 @@ async def run_screener(
     _assign_percentile(all_ranked_rows, _smr_raw, "smr_rank")
 
     # ── Step 9: Composite score ───────────────────────────────────────────────
-    # Components: TT 12% + VCP 15% + RS 20% + EPS 20% + SMR 13% + Pattern 20%
-    # Strict Minervini extension rule: extended/broken stocks have composite=0.
-    # The pattern_quality component pushes "at_pivot" + clean-base stocks to the
-    # top, dethroning extended rockets that would otherwise dominate by leadership
-    # metrics alone.
+    # Components: TT 12% + VCP 15% + RS 20% + EPS 20% + SMR 13% + Pattern 20%.
+    # Extended/broken/frozen stocks → composite = 0.
+    # Pattern quality is multiplied by an EV factor that reflects literature
+    # win-rate × avg-gain so HTF/Asc-Triangle setups naturally outrank CWH/Flat.
+    PATTERN_EV_MULT = {
+        "high_tight_flag":    2.00,  # ~6.9R expectancy — rare, take always
+        "ascending_triangle": 1.40,  # ~3.6R
+        "vcp":                1.00,
+        "cwh":                1.00,
+        "three_weeks_tight":  1.00,
+        "bull_flag":          0.85,  # ~1.8R
+        "flat_base":          0.75,  # ~1.4R
+        None:                 0.50,
+    }
+
     for s in all_ranked_rows:
-        # Strict exclusion — extended/broken stocks aren't buyable
-        if s.buyability in ("extended", "broken"):
+        # Strict exclusion — extended/broken/frozen stocks aren't buyable.
+        if s.buyability in ("extended", "broken", "frozen"):
             s.composite_score = Decimal(0)
             continue
 
-        tt_norm   = s.tt_score / 8.0
-        vcp_norm  = float(s.vcp_score)
-        rs_norm   = (s.rs_rank or 50) / 99.0
-        eps_norm  = (s.eps_rank if s.eps_rank is not None else 0) / 99.0
-        smr_norm  = (s.smr_rank if s.smr_rank is not None else 0) / 99.0
-        pattern_norm = float(s.pattern_quality) if s.pattern_quality is not None else 0.0
+        tt_norm      = s.tt_score / 8.0
+        vcp_norm     = float(s.vcp_score)
+        rs_norm      = (s.rs_rank or 50) / 99.0
+        eps_norm     = (s.eps_rank if s.eps_rank is not None else 0) / 99.0
+        smr_norm     = (s.smr_rank if s.smr_rank is not None else 0) / 99.0
+        pattern_q    = float(s.pattern_quality) if s.pattern_quality is not None else 0.0
+        ev_mult      = PATTERN_EV_MULT.get(s.pattern_type, 0.50)
+        pattern_norm = min(1.0, pattern_q * ev_mult)   # cap at 1.0 to keep composite ≤ 1
 
-        # Buyability multiplier — reward at_pivot, neutral on in_base
-        buyability_mult = 1.0
+        # Buyability multiplier — strongly reward at_pivot, penalize no-pattern
         if s.buyability == "at_pivot":
-            buyability_mult = 1.10
+            buyability_mult = 1.15
         elif s.buyability == "in_base":
             buyability_mult = 1.00
-        elif s.buyability == "no_pattern":
-            buyability_mult = 0.85   # less attractive than a clean base
+        else:
+            buyability_mult = 0.80   # no_pattern stocks are background candidates
 
         composite = (
             tt_norm      * 0.12 +

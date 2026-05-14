@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     # App
     app_env: str = "development"
     secret_key: str = "dev-only-change-me-before-prod"
-    paper_mode_default: bool = True
+    paper_mode_default: bool = False
 
     # Risk
     base_risk_pct: float = 0.0075

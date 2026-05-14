@@ -48,10 +48,10 @@ export default async function WatchlistPage() {
   try {
     // Top-scored symbols = primary watchlist
     const [res, earningsList] = await Promise.all([
-      api<ScoreResult[]>("/api/screener/results?min_tt=5"),
+      api<{ items: ScoreResult[] }>("/api/screener/results?min_tt=5&page_size=30"),
       api<EarningsInfo[]>("/api/earnings").catch(() => [] as EarningsInfo[]),
     ]);
-    results = res.slice(0, 30);  // top 30 by composite score
+    results = res.items;
     earningsMap = Object.fromEntries(earningsList.map(e => [e.symbol, e]));
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);

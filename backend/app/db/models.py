@@ -471,10 +471,11 @@ class ScreenerScore(Base):
 
     # Fundamentals (from yfinance ticker.info — covers US + Canadian)
     fundamental_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal(0))
-    revenue_growth: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
-    net_income_growth: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
-    net_margin: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
-    roe: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    revenue_growth: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    net_income_growth: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)  # most recent quarter YoY
+    earnings_annual_growth: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)  # TTM/annual YoY
+    net_margin: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    roe: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     eps_ttm: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     fundamental_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
 

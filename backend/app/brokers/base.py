@@ -66,6 +66,30 @@ class BrokerOrderAck:
 
 
 @dataclass(frozen=True)
+class BrokerBracketRequest:
+    """Atomic entry + stop bracket. Stop activates server-side once entry fills.
+
+    Primary is a stop-limit buy (matches what we'd send for a non-bracket entry).
+    StopLoss is a stop-market sell GTC — same protection profile as the legacy
+    sequential stop, but placed in the same API call so there's no naked window.
+    """
+    account_id: str
+    symbol: str
+    quantity: int
+    entry_stop_price: Decimal
+    entry_limit_price: Decimal
+    stop_loss_price: Decimal
+    entry_time_in_force: str = "Day"
+    stop_loss_time_in_force: str = "GoodTillCancelled"
+
+
+@dataclass(frozen=True)
+class BrokerBracketAck:
+    primary: BrokerOrderAck
+    stop_loss: BrokerOrderAck
+
+
+@dataclass(frozen=True)
 class BrokerOpenOrder:
     """Currently-pending order at the broker (any source — manual or system-placed)."""
     broker_order_id: str
@@ -127,6 +151,12 @@ class BrokerInterface(ABC):
     # ---- Orders ----
     @abstractmethod
     async def place_order(self, req: BrokerOrderRequest) -> BrokerOrderAck: ...
+
+    async def place_bracket_order(self, req: BrokerBracketRequest) -> BrokerBracketAck:
+        """Place an atomic entry+stop bracket. Default impl raises; brokers that
+        support it should override. Callers should fall back to sequential
+        place_order calls if this raises NotImplementedError."""
+        raise NotImplementedError(f"{self.name} does not support bracket orders")
 
     @abstractmethod
     async def cancel_order(self, account_id: str, broker_order_id: str) -> None: ...

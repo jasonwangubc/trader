@@ -4,8 +4,11 @@ import { api, ApiError } from "@/lib/api";
 import { type ResultsPage } from "@/lib/screener";
 import { ResultsTable } from "./results-table";
 import { DataStatusPanel } from "./data-status-panel";
+import { PatternStats } from "./pattern-stats";
 import { AddSymbolButton } from "./add-symbol-button";
 import { ScanProgress } from "./scan-progress";
+import { TodaysPicks } from "./todays-picks";
+import { FilterChips } from "./filter-chips";
 
 export const metadata = { title: "Screener" };
 
@@ -61,25 +64,6 @@ interface SyncStatus {
   progress?: ScanProgressData | null;
 }
 
-// Quick-filter chip definitions (preset combos that match common screening intents)
-interface ChipDef {
-  label: string;
-  hint: string;
-  params: Record<string, string>;
-}
-
-const CHIPS: ChipDef[] = [
-  { label: "All",         hint: "No filters",                                            params: {} },
-  { label: "Setting up",  hint: "At pivot or in base — actionable now (Recommended)",   params: { buyability: "at_pivot,in_base" } },
-  { label: "At pivot",    hint: "Within ±5% of pivot — buyable today",                  params: { buyability: "at_pivot" } },
-  { label: "VCP",         hint: "Volatility Contraction Pattern setups only",           params: { pattern: "vcp", buyability: "at_pivot,in_base" } },
-  { label: "Cup & Handle",hint: "Cup with Handle setups only",                          params: { pattern: "cwh", buyability: "at_pivot,in_base" } },
-  { label: "Flat Base",   hint: "Flat base setups only",                                params: { pattern: "flat_base", buyability: "at_pivot,in_base" } },
-  { label: "Leaders",     hint: "Composite ≥ 70 (includes extended)",                   params: { min_composite: "70" } },
-  { label: "EPS ≥ 80",    hint: "Top quintile of earnings strength",                    params: { min_eps: "80" } },
-  { label: "RS ≥ 80",     hint: "Top quintile of relative strength",                    params: { min_rs: "80" } },
-  { label: "CANSLIM",     hint: "EPS+RS top quartile + clean setup",                    params: { min_eps: "75", min_rs: "75", buyability: "at_pivot,in_base" } },
-];
 
 const PAGE_SIZE = 50;
 
@@ -137,7 +121,6 @@ export default async function ScreenerPage({
 
   const results = resultsPage?.items ?? [];
   const lastRun = health?.scores.last_run_at ? new Date(health.scores.last_run_at) : null;
-  const activeFilters = { minTT, minVCP, minEPS, minRS, minComposite, buyability: buyabilityParam, pattern: patternParam };
   const anyFilter = minTT || minVCP || minEPS || minRS || minComposite || buyabilityParam || patternParam;
 
   return (
@@ -177,8 +160,11 @@ export default async function ScreenerPage({
       </div>
 
       <div className="space-y-3 min-w-0">
-        {/* Quick filter chips */}
-        <FilterChips active={activeFilters} totalResults={resultsPage?.total ?? 0} />
+        {/* Today's curated tier-S/A/B picks — eliminates decision paralysis */}
+        <TodaysPicks />
+
+        {/* Quick filter chips — multi-select client component */}
+        <FilterChips totalResults={resultsPage?.total ?? 0} />
 
         {/* Results table */}
         <ResultsTable results={results} />
@@ -189,9 +175,13 @@ export default async function ScreenerPage({
             page={page}
             pages={resultsPage.pages}
             total={resultsPage.total}
-            activeFilters={activeFilters}
+            minTT={minTT} minVCP={minVCP} minEPS={minEPS} minRS={minRS}
+            minComposite={minComposite} buyability={buyabilityParam} pattern={patternParam}
           />
         )}
+
+        {/* Pattern breakdown stats */}
+        <PatternStats />
 
         {/* Data status — collapsed by default */}
         {health && <DataStatusPanel health={health} />}
@@ -206,80 +196,28 @@ export default async function ScreenerPage({
   );
 }
 
-// ---- Quick filter chips ----
-
-function FilterChips({
-  active, totalResults,
-}: {
-  active: { minTT: number; minVCP: number; minEPS: number; minRS: number; minComposite: number; buyability: string; pattern: string };
-  totalResults: number;
-}) {
-  const isActive = (chip: ChipDef): boolean => {
-    const want = chip.params;
-    const has = (k: string, v: number | string) => {
-      const wv = want[k];
-      if (wv === undefined) return v === 0 || v === "0" || v === "";
-      return String(v) === wv;
-    };
-    return (
-      has("min_tt", active.minTT) &&
-      has("min_vcp", active.minVCP) &&
-      has("min_eps", active.minEPS) &&
-      has("min_rs", active.minRS) &&
-      has("min_composite", active.minComposite) &&
-      has("buyability", active.buyability) &&
-      has("pattern", active.pattern)
-    );
-  };
-
-  return (
-    <div className="flex flex-wrap items-center gap-2">
-      <span className="text-muted-foreground text-xs font-medium pr-1">
-        {totalResults.toLocaleString()} {totalResults === 1 ? "stock" : "stocks"}
-      </span>
-      <div className="flex flex-wrap gap-1.5">
-        {CHIPS.map(chip => {
-          const active_ = isActive(chip);
-          const qs = new URLSearchParams(chip.params).toString();
-          const href = qs ? `/screener?${qs}` : "/screener";
-          return (
-            <Link
-              key={chip.label}
-              href={href}
-              title={chip.hint}
-              className={`inline-flex h-7 items-center rounded-full border px-3 text-xs font-medium transition-colors ${
-                active_
-                  ? "border-primary/50 bg-primary/15 text-primary"
-                  : "border-border/60 text-muted-foreground hover:border-border hover:text-foreground"
-              }`}
-            >
-              {chip.label}
-            </Link>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+// (FilterChips is now a client component imported from ./filter-chips)
 
 // ---- Pagination ----
 
 function Pagination({
-  page, pages, total, activeFilters,
+  page, pages, total,
+  minTT, minVCP, minEPS, minRS, minComposite, buyability, pattern,
 }: {
   page: number; pages: number; total: number;
-  activeFilters: { minTT: number; minVCP: number; minEPS: number; minRS: number; minComposite: number; buyability: string; pattern: string };
+  minTT: number; minVCP: number; minEPS: number; minRS: number; minComposite: number;
+  buyability: string; pattern: string;
 }) {
   const buildUrl = (p: number) => {
     const q = new URLSearchParams();
-    if (activeFilters.minTT)        q.set("min_tt",        String(activeFilters.minTT));
-    if (activeFilters.minVCP)       q.set("min_vcp",       String(activeFilters.minVCP));
-    if (activeFilters.minEPS)       q.set("min_eps",       String(activeFilters.minEPS));
-    if (activeFilters.minRS)        q.set("min_rs",        String(activeFilters.minRS));
-    if (activeFilters.minComposite) q.set("min_composite", String(activeFilters.minComposite));
-    if (activeFilters.buyability)   q.set("buyability",    activeFilters.buyability);
-    if (activeFilters.pattern)      q.set("pattern",       activeFilters.pattern);
-    if (p > 1) q.set("page", String(p));
+    if (minTT)        q.set("min_tt",        String(minTT));
+    if (minVCP)       q.set("min_vcp",       String(minVCP));
+    if (minEPS)       q.set("min_eps",       String(minEPS));
+    if (minRS)        q.set("min_rs",        String(minRS));
+    if (minComposite) q.set("min_composite", String(minComposite));
+    if (buyability)   q.set("buyability",    buyability);
+    if (pattern)      q.set("pattern",       pattern);
+    if (p > 1)        q.set("page",          String(p));
     return `/screener${q.size ? "?" + q : ""}`;
   };
 
