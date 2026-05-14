@@ -71,7 +71,10 @@ export function StockChart({
     setLoading(true);
     setError(null);
     fetch(`${API_URL}/api/chart/${symbol}?days=${fetchDays}`)
-      .then(r => r.ok ? r.json() : r.json().then((d: any) => Promise.reject(d.detail ?? "No data")))
+      .then(r => r.json().then((d: any) => {
+        if (!r.ok) return Promise.reject(d.detail ?? `HTTP ${r.status}`);
+        return d as ChartData;
+      }))
       .then((d: ChartData) => { if (!cancelled) { setData(d); setLoading(false); } })
       .catch((e: unknown) => { if (!cancelled) { setError(String(e)); setLoading(false); } });
     return () => { cancelled = true; };

@@ -14,42 +14,45 @@ const BACKEND = process.env.BACKEND_URL ?? "http://localhost:8002";
 const USER_DEFAULT = "user_default";
 
 async function proxy(req: NextRequest, params: { path: string[] }) {
-  const { userId } = await auth();
+  let effectiveUserId = USER_DEFAULT;
+  try {
+    const { userId } = await auth();
+    if (userId) effectiveUserId = userId;
+  } catch { /* Clerk not configured */ }
 
-  // In development without Clerk configured, fall back to the default user
-  const effectiveUserId = userId ?? USER_DEFAULT;
-
-  // params.path already contains the full path from the URL
-  // e.g. URL /api/backend/api/screener/results → path = "api/screener/results"
-  // so we just join directly — no extra /api/ prefix needed
   const path = params.path.join("/");
   const targetUrl = `${BACKEND}/${path}${req.nextUrl.search}`;
 
   const headers = new Headers(req.headers);
   headers.set("X-User-Id", effectiveUserId);
-  headers.delete("host");   // don't forward the browser's host header
+  headers.delete("host");
 
   const body = req.method !== "GET" && req.method !== "HEAD"
     ? await req.arrayBuffer()
     : undefined;
 
-  const response = await fetch(targetUrl, {
-    method: req.method,
-    headers,
-    body,
-    // Don't follow redirects — proxy them as-is
-    redirect: "manual",
-  });
+  try {
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers,
+      body,
+      redirect: "manual",
+    });
 
-  // Stream the response back, preserving status, headers, body
-  const responseHeaders = new Headers(response.headers);
-  // Allow the browser to read the response
-  responseHeaders.delete("content-encoding"); // Next.js handles compression
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("content-encoding");
 
-  return new NextResponse(response.body, {
-    status: response.status,
-    headers: responseHeaders,
-  });
+    return new NextResponse(response.body, {
+      status: response.status,
+      headers: responseHeaders,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return NextResponse.json(
+      { detail: `Backend unreachable (${BACKEND}): ${message}` },
+      { status: 502 },
+    );
+  }
 }
 
 export const GET     = (req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) => ctx.params.then(p => proxy(req, p));

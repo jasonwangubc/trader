@@ -126,11 +126,19 @@ async def startup_stale_check() -> None:
 
 
 async def _do_sync(symbols: list[str]) -> None:
-    """Run the incremental EOD download for the given symbols."""
+    """Download incremental EOD bars then immediately rescore the universe."""
     from app.db.session import SessionLocal
     from app.services.eod_service import sync_eod_incremental
+    from app.services.screener_service import run_screener
 
     async with SessionLocal() as session:
         counts = await sync_eod_incremental(session, symbols, delta_days=5)
     downloaded = sum(v for v in counts.values() if v > 0)
-    log.info("EOD sync: %d/%d symbols updated", downloaded, len(symbols))
+    log.info("EOD sync: %d/%d symbols updated — running screener rescore", downloaded, len(symbols))
+
+    async with SessionLocal() as session:
+        _, stats = await run_screener(session, mode="auto")
+    log.info(
+        "Nightly rescore complete: %d scored, %d TT-passing, %d with fundamentals",
+        stats.scored, stats.tt_passing, stats.with_fundamentals,
+    )
