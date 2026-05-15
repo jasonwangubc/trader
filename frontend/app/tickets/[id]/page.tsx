@@ -2,12 +2,18 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api, ApiError } from "@/lib/api";
-import { type Ticket, fmtMoney, fmtPct } from "@/lib/tickets";
+import { type Account, type HouseholdData, type Ticket, fmtMoney, fmtPct } from "@/lib/tickets";
 import { CancelButton } from "./cancel-button";
 import { CloseForm } from "./close-form";
 import { ExitPlanForm } from "./exit-plan-form";
 import { PyramidForm } from "./pyramid-form";
 import { StockChart } from "@/components/stock-chart";
+
+const TRIGGER_DESCRIPTIONS: Record<string, string> = {
+  price_above:             "Fires when intraday price crosses the trigger level.",
+  price_above_with_volume: "Fires when intraday price crosses the trigger level AND volume is elevated (volume confirm multiple applied).",
+  day_close_above:         "Fires only when the daily close is above the trigger — avoids intraday fakeouts.",
+};
 
 interface TicketOrder {
   id: string;
@@ -69,10 +75,16 @@ export default async function TicketDetailPage({
 }) {
   const { id } = await params;
   let ticket: TicketDetail | null = null;
+  let account: Account | undefined;
   let error: string | null = null;
 
   try {
-    ticket = await api<TicketDetail>(`/api/tickets/${id}`);
+    const [t, household] = await Promise.all([
+      api<TicketDetail>(`/api/tickets/${id}`),
+      api<HouseholdData>("/api/accounts").catch(() => ({ accounts: [], household_equity: {} })),
+    ]);
+    ticket = t;
+    account = household.accounts.find(a => a.id === t.account_id);
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
@@ -105,13 +117,20 @@ export default async function TicketDetailPage({
 
       <header className="mb-8 flex items-start justify-between gap-4">
         <div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
             <h1 className="font-mono text-3xl font-semibold tracking-tight">{ticket.symbol}</h1>
-            <Badge variant={variant}>{ticket.status}</Badge>
-            {ticket.is_paper && <Badge variant="secondary">paper</Badge>}
+            <Badge variant={variant}>{ticket.status.replace(/_/g, " ")}</Badge>
+            <Badge variant={ticket.is_paper ? "secondary" : "outline"} className={ticket.is_paper ? "" : "border-emerald-500/50 text-emerald-500"}>
+              {ticket.is_paper ? "paper" : "live"}
+            </Badge>
           </div>
-          <p className="text-muted-foreground mt-1 text-sm">
-            {ticket.setup_type} · {ticket.trigger_type.replace(/_/g, " ")}
+          <p className="text-muted-foreground mt-1.5 text-sm">
+            {ticket.setup_type.replace(/_/g, " ")}
+            {account && (
+              <span className="ml-2 font-medium text-foreground/80">
+                · {account.type} #{account.questrade_account_id} ({ticket.currency})
+              </span>
+            )}
           </p>
         </div>
         {ticket.outcome && (
@@ -136,23 +155,55 @@ export default async function TicketDetailPage({
       </Card>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        {/* Prices */}
+        {/* Setup + mechanics */}
         <Card>
-          <CardHeader><CardTitle className="text-base">Trade setup</CardTitle></CardHeader>
+          <CardHeader>
+            <CardTitle className="text-base">Trade setup</CardTitle>
+            <CardDescription>
+              {TRIGGER_DESCRIPTIONS[ticket.trigger_type] ?? ticket.trigger_type.replace(/_/g, " ")}
+            </CardDescription>
+          </CardHeader>
           <CardContent className="space-y-2 text-sm">
-            <Row label="Trigger" value={fmtMoney(ticket.trigger_price, ticket.currency)} />
-            <Row label="Stop" value={fmtMoney(ticket.stop_price, ticket.currency)} />
+            {/* Prices */}
+            <Row label="Trigger (buy point)" value={fmtMoney(ticket.trigger_price, ticket.currency)} />
+            <Row label="Stop (max loss)" value={fmtMoney(ticket.stop_price, ticket.currency)} />
             {ticket.target_price && (
               <Row
                 label={`Target${reward ? ` (${reward}R)` : ""}`}
                 value={fmtMoney(ticket.target_price, ticket.currency)}
               />
             )}
-            <div className="border-t pt-2" />
-            <Row label="Shares" value={ticket.position_size_shares.toLocaleString()} />
-            <Row label="Position value" value={fmtMoney(ticket.position_size_value, ticket.currency)} />
-            <Row label="Risk amount" value={`${fmtMoney(ticket.risk_amount, ticket.currency)} (${fmtPct(ticket.risk_pct)})`} />
-            <Row label="Streak mult." value={`${ticket.streak_multiplier_at_creation}×`} />
+
+            {/* Order mechanics */}
+            <div className="border-t pt-2 space-y-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                What will happen
+              </p>
+              {ticket.is_paper ? (
+                <Row label="Entry" value="Simulated fill at trigger — no real order sent" />
+              ) : (
+                <Row
+                  label="Entry order"
+                  value={`Stop-limit buy: stop ${fmtMoney(ticket.trigger_price, ticket.currency)}, limit ${fmtMoney((parseFloat(ticket.trigger_price) * 1.005).toFixed(2), ticket.currency)} (0.5% ceiling)`}
+                />
+              )}
+              {ticket.is_paper ? (
+                <Row label="Stop order" value="Simulated — monitored by backend only" />
+              ) : (
+                <Row
+                  label="Stop order"
+                  value={`GTC stop-market sell at ${fmtMoney(ticket.stop_price, ticket.currency)} — placed at Questrade when entry fills`}
+                />
+              )}
+            </div>
+
+            {/* Sizing */}
+            <div className="border-t pt-2 space-y-2">
+              <Row label="Shares" value={ticket.position_size_shares.toLocaleString()} />
+              <Row label="Position value" value={fmtMoney(ticket.position_size_value, ticket.currency)} />
+              <Row label="Risk amount" value={`${fmtMoney(ticket.risk_amount, ticket.currency)} (${fmtPct(ticket.risk_pct)})`} />
+              <Row label="Streak mult." value={`${ticket.streak_multiplier_at_creation}×`} />
+            </div>
           </CardContent>
         </Card>
 
