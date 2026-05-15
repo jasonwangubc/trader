@@ -139,10 +139,10 @@ function TicketCard({ ticket: t, account }: { ticket: Ticket; account?: Account 
   const entryLimit  = (trigger * 1.005).toFixed(2);
   const entryOrder  = t.is_paper
     ? "Simulated fill at trigger"
-    : `Stop-limit buy: stop ${fmtMoney(t.trigger_price, t.currency)} / limit ${fmtMoney(entryLimit, t.currency)}`;
+    : `Bracket entry leg: stop-limit buy at ${fmtMoney(t.trigger_price, t.currency)} / max ${fmtMoney(entryLimit, t.currency)}`;
   const stopOrder   = t.is_paper
     ? "Simulated stop"
-    : `GTC stop-market sell at ${fmtMoney(t.stop_price, t.currency)}`;
+    : `Bracket stop leg: GTC stop-market sell at ${fmtMoney(t.stop_price, t.currency)} — active at Questrade the moment entry fills`;
 
   // Expiry — only relevant while armed
   const expiresIn = t.expires_at && t.status === "armed"

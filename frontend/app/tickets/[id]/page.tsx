@@ -10,9 +10,9 @@ import { PyramidForm } from "./pyramid-form";
 import { StockChart } from "@/components/stock-chart";
 
 const TRIGGER_DESCRIPTIONS: Record<string, string> = {
-  price_above:             "Fires when intraday price crosses the trigger level.",
-  price_above_with_volume: "Fires when intraday price crosses the trigger level AND volume is elevated (volume confirm multiple applied).",
-  day_close_above:         "Fires only when the daily close is above the trigger — avoids intraday fakeouts.",
+  price_above:             "Fires when intraday price crosses the trigger. A bracket order (entry + stop, atomic) is sent to Questrade.",
+  price_above_with_volume: "Fires when intraday price crosses the trigger AND volume is elevated. A bracket order (entry + stop, atomic) is then sent to Questrade.",
+  day_close_above:         "Fires only on a daily close above the trigger — avoids intraday fakeouts. A bracket order (entry + stop, atomic) is sent to Questrade.",
 };
 
 interface TicketOrder {
@@ -180,20 +180,26 @@ export default async function TicketDetailPage({
                 What will happen
               </p>
               {ticket.is_paper ? (
-                <Row label="Entry" value="Simulated fill at trigger — no real order sent" />
+                <>
+                  <Row label="Entry" value="Simulated fill at trigger — no real order sent" />
+                  <Row label="Stop"  value="Simulated — monitored by backend polling only" />
+                </>
               ) : (
-                <Row
-                  label="Entry order"
-                  value={`Stop-limit buy: stop ${fmtMoney(ticket.trigger_price, ticket.currency)}, limit ${fmtMoney((parseFloat(ticket.trigger_price) * 1.005).toFixed(2), ticket.currency)} (0.5% ceiling)`}
-                />
-              )}
-              {ticket.is_paper ? (
-                <Row label="Stop order" value="Simulated — monitored by backend only" />
-              ) : (
-                <Row
-                  label="Stop order"
-                  value={`GTC stop-market sell at ${fmtMoney(ticket.stop_price, ticket.currency)} — placed at Questrade when entry fills`}
-                />
+                <>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    A <strong>bracket order</strong> is submitted to Questrade as a single atomic call.
+                    Both legs are live at the broker from the moment the bracket is accepted —
+                    the stop is never naked, even if the backend goes offline.
+                  </p>
+                  <Row
+                    label="Entry leg"
+                    value={`Stop-limit buy: stop ${fmtMoney(ticket.trigger_price, ticket.currency)}, limit ${fmtMoney((parseFloat(ticket.trigger_price) * 1.005).toFixed(2), ticket.currency)} (0.5% ceiling)`}
+                  />
+                  <Row
+                    label="Stop leg"
+                    value={`GTC stop-market sell at ${fmtMoney(ticket.stop_price, ticket.currency)} — activates at Questrade the moment entry fills`}
+                  />
+                </>
               )}
             </div>
 
