@@ -63,7 +63,8 @@ async def sync_eod_incremental(
 
     cutoff_full = (datetime.now(timezone.utc) - timedelta(days=full_years * 365 + 30)).strftime("%Y-%m-%d")
     cutoff_delta = (datetime.now(timezone.utc) - timedelta(days=delta_days)).strftime("%Y-%m-%d")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # yfinance end is exclusive, so pass tomorrow to include today's completed bars.
+    today = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
 
     new_symbols = [s for s in symbols if s not in latest_by_sym]
     existing_symbols = [s for s in symbols if s in latest_by_sym]
