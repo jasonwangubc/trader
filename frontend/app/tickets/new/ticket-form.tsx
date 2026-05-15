@@ -41,11 +41,13 @@ export function TicketForm({
   prefillSymbol,
   prefillTrigger,
   prefillStop,
+  prefillTarget,
 }: {
   accounts: Account[];
   prefillSymbol?: string;
   prefillTrigger?: string;
   prefillStop?: string;
+  prefillTarget?: string;
 }) {
   const router = useRouter();
   const [form, setForm] = useState<FormState>(() => ({
@@ -56,7 +58,7 @@ export function TicketForm({
     trigger_type: "price_above_with_volume",
     trigger_price: prefillTrigger ?? "",
     stop_price: prefillStop ?? "",
-    target_price: "",
+    target_price: prefillTarget ?? "",
     time_stop_days: "21",
     valid_for_days: "7",
     volume_confirm_multiple: "1.5",
@@ -71,6 +73,11 @@ export function TicketForm({
   const [overrideStreak, setOverrideStreak] = useState(false);
   const [isPaper, setIsPaper] = useState<boolean>(false);
   const [earningsWarning, setEarningsWarning] = useState<string | null>(null);
+  const [suggest, setSuggest] = useState<{
+    trigger_price: number | null; stop_price: number | null;
+    target_price: number | null; stop_method: string;
+    setup_type: string | null; atr14: number | null;
+  } | null>(null);
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
     setForm((s) => ({ ...s, [key]: value }));
@@ -90,6 +97,29 @@ export function TicketForm({
           setEarningsWarning(null);
         }
       } catch { setEarningsWarning(null); }
+    }, 600);
+    return () => { clearTimeout(t); ctrl.abort(); };
+  }, [form.symbol]);
+
+  // Auto-populate prices from screener suggestion when symbol changes.
+  useEffect(() => {
+    const sym = form.symbol.trim().toUpperCase();
+    if (sym.length < 1) { setSuggest(null); return; }
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/screener/suggest/${sym}`, { signal: ctrl.signal });
+        if (!res.ok) { setSuggest(null); return; }
+        const s = await res.json();
+        setSuggest(s);
+        setForm(prev => ({
+          ...prev,
+          trigger_price: s.trigger_price != null ? String(s.trigger_price) : prev.trigger_price,
+          stop_price:    s.stop_price    != null ? String(s.stop_price)    : prev.stop_price,
+          target_price:  s.target_price  != null ? String(s.target_price)  : prev.target_price,
+          ...(s.setup_type ? { setup_type: s.setup_type } : {}),
+        }));
+      } catch { setSuggest(null); }
     }, 600);
     return () => { clearTimeout(t); ctrl.abort(); };
   }, [form.symbol]);
@@ -341,7 +371,17 @@ export function TicketForm({
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Risk management</CardTitle>
-            <CardDescription>Stop is immutable once armed.</CardDescription>
+            <CardDescription>
+              Stop is immutable once armed.
+              {suggest && (
+                <span className="ml-2 text-primary/80">
+                  · Screener: pivot ${suggest.trigger_price?.toFixed(2)},
+                  stop ${suggest.stop_price?.toFixed(2)} ({suggest.stop_method}
+                  {suggest.atr14 ? `, ATR ${suggest.atr14.toFixed(2)}` : ""}),
+                  target ${suggest.target_price?.toFixed(2)} (3R)
+                </span>
+              )}
+            </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-3">
             <Field label="Stop price">

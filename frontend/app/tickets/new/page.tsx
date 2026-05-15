@@ -5,9 +5,9 @@ import { TicketForm } from "./ticket-form";
 export default async function NewTicketPage({
   searchParams,
 }: {
-  searchParams: Promise<{ symbol?: string; trigger?: string; stop?: string }>;
+  searchParams: Promise<{ symbol?: string; trigger?: string; stop?: string; target?: string }>;
 }) {
-  const { symbol, trigger, stop } = await searchParams;
+  const { symbol, trigger, stop, target } = await searchParams;
   const household = await api<HouseholdData>("/api/accounts");
 
   return (
@@ -27,6 +27,7 @@ export default async function NewTicketPage({
         prefillSymbol={symbol?.toUpperCase()}
         prefillTrigger={trigger}
         prefillStop={stop}
+        prefillTarget={target}
       />
     </main>
   );

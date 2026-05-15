@@ -622,6 +622,112 @@ async def todays_picks(
     )
 
 
+_PATTERN_TO_SETUP: dict[str, str] = {
+    "vcp":                "VCP",
+    "cwh":                "cup_handle",
+    "flat_base":          "flat_base",
+    "high_tight_flag":    "VCP",
+    "ascending_triangle": "pivot",
+    "three_weeks_tight":  "flat_base",
+    "bull_flag":          "VCP",
+}
+
+
+class SuggestOut(BaseModel):
+    symbol: str
+    trigger_price: float | None    # pivot (buy point)
+    stop_price: float | None       # base_low with buffer, or ATR-derived
+    target_price: float | None     # trigger + 3R
+    stop_method: str               # "base_low" | "atr" | "pct"
+    suggested_r: float             # R used for target (always 3.0)
+    setup_type: str | None         # pre-selected setup type
+    pattern_type: str | None
+    last_close: float | None
+    atr14: float | None
+
+
+def _compute_atr14(df) -> float | None:
+    """ATR(14) from a pandas DataFrame with high/low/close columns."""
+    import numpy as np
+    if df is None or len(df) < 15:
+        return None
+    h = df["high"].values.astype(float)
+    l = df["low"].values.astype(float)
+    c = df["close"].values.astype(float)
+    trs = [max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])) for i in range(-14, 0)]
+    return float(sum(trs) / 14)
+
+
+@router.get("/suggest/{symbol}", response_model=SuggestOut)
+async def suggest_entry(
+    symbol: str,
+    session: AsyncSession = Depends(get_session),
+) -> SuggestOut:
+    """Suggested trigger / stop / target for a new ticket.
+
+    Trigger  = pivot_price from screener (the breakout buy point).
+    Stop     = base_low × 0.995 (0.5% below base support) when available,
+               else pivot − 1.5×ATR(14), else pivot × 0.93.
+    Target   = trigger + 3 × risk  (3R Minervini default).
+    """
+    from app.services.eod_service import get_bars_df
+
+    sym = symbol.upper()
+    score_result = await session.execute(
+        select(ScreenerScore).where(ScreenerScore.symbol == sym)
+    )
+    row = score_result.scalar_one_or_none()
+
+    # ATR from recent bars — used as stop fallback
+    df = await get_bars_df(session, sym, days=30)
+    atr14 = _compute_atr14(df)
+
+    last_close = float(row.last_close) if row and row.last_close else None
+
+    if row is None or row.pivot_price is None:
+        # No screener data — ATR-only suggestion from last close
+        if last_close and atr14:
+            stop = round(last_close - 1.5 * atr14, 2)
+            risk = last_close - stop
+            target = round(last_close + 3 * risk, 2)
+            return SuggestOut(
+                symbol=sym, trigger_price=last_close,
+                stop_price=stop, target_price=target,
+                stop_method="atr", suggested_r=3.0,
+                setup_type=None, pattern_type=None,
+                last_close=last_close, atr14=round(atr14, 4),
+            )
+        raise HTTPException(404, f"No score or bar data for {sym}")
+
+    trigger = round(float(row.pivot_price), 2)
+
+    if row.base_low is not None:
+        stop = round(float(row.base_low) * 0.995, 2)
+        stop_method = "base_low"
+    elif atr14:
+        stop = round(trigger - 1.5 * atr14, 2)
+        stop_method = "atr"
+    else:
+        stop = round(trigger * 0.93, 2)
+        stop_method = "pct"
+
+    risk = trigger - stop
+    target = round(trigger + 3 * risk, 2) if risk > 0 else None
+
+    return SuggestOut(
+        symbol=sym,
+        trigger_price=trigger,
+        stop_price=stop,
+        target_price=target,
+        stop_method=stop_method,
+        suggested_r=3.0,
+        setup_type=_PATTERN_TO_SETUP.get(row.pattern_type or ""),
+        pattern_type=row.pattern_type,
+        last_close=last_close,
+        atr14=round(atr14, 4) if atr14 else None,
+    )
+
+
 @router.get("/score/{symbol}", response_model=ScoreOut)
 async def get_score(
     symbol: str,
