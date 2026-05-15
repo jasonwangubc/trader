@@ -7,9 +7,9 @@ State machine per ticket:
 Lifecycle also handles:
   armed ──(expires_at passed)──► expired
 
-Volume confirmation (price_above_with_volume) requires historical average volume
-from yfinance, which arrives in Sprint 3. Price-only check is used for now with
-an audit note. Real-money tickets with delayed quotes (delay > 0) are skipped.
+Volume confirmation (price_above_with_volume): projects current intraday volume
+to end-of-day and requires it to exceed ADV × ticket.volume_confirm_multiple.
+Real-money tickets with delayed quotes (delay > 0) are skipped.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.brokers.base import BrokerInterface, BrokerQuote
-from app.db.models import Ticket, TicketStatus, TriggerType
+from app.db.models import DailyBar, EarningsDate, Ticket, TicketStatus, TriggerType
 from app.db.session import SessionLocal
 from app.services.audit_service import log_event
 from app.services.notifications_service import alert_filled, alert_stopped_out, alert_target_hit, alert_triggered
@@ -189,6 +189,11 @@ class MonitorService:
             log.exception("Quote fetch failed; skipping tick")
             return
 
+        # Load 50-day ADV for any volume-confirm tickets.
+        vol_symbols = [t.symbol for t in tickets
+                       if t.trigger_type == TriggerType.PRICE_ABOVE_WITH_VOLUME.value]
+        avg_vol_map = await self._load_adv(session, vol_symbols) if vol_symbols else {}
+
         # Check armed tickets for triggers.
         for ticket in tickets:
             quote = quotes.get(ticket.symbol)
@@ -199,22 +204,121 @@ class MonitorService:
                 log.warning("%s quote delayed %dmin — skipping real-money check",
                             ticket.symbol, quote.delay)
                 continue
-            if self._is_triggered(ticket, quote):
+            avg_vol = avg_vol_map.get(ticket.symbol)
+            if self._is_triggered(ticket, quote, avg_vol=avg_vol):
                 await self._fire_trigger(session, ticket, quote)
 
         # Check filled tickets for stop/target hits.
         await check_filled_tickets_for_close(session, self._broker, quotes)
 
-    def _is_triggered(self, ticket: Ticket, quote: BrokerQuote) -> bool:
-        last = quote.last
+    async def _load_adv(self, session: AsyncSession, symbols: list[str]) -> dict[str, int]:
+        """50-day average daily volume. Primary: EarningsDate.avg_volume.
+        Fallback: compute from the last 50 daily_bars rows."""
+        result: dict[str, int] = {}
+
+        # Primary: already-computed field on EarningsDate
+        ed_result = await session.execute(
+            select(EarningsDate.symbol, EarningsDate.avg_volume)
+            .where(EarningsDate.symbol.in_(symbols))
+            .where(EarningsDate.avg_volume.isnot(None))
+        )
+        for row in ed_result:
+            result[row.symbol] = int(row.avg_volume)
+
+        # Fallback: compute from daily_bars for any missing symbol
+        missing = [s for s in symbols if s not in result]
+        for sym in missing:
+            bars = await session.execute(
+                select(DailyBar.volume)
+                .where(DailyBar.symbol == sym, DailyBar.volume > 0)
+                .order_by(DailyBar.bar_date.desc())
+                .limit(50)
+            )
+            vols = [r.volume for r in bars]
+            if vols:
+                result[sym] = int(sum(vols) / len(vols))
+
+        return result
+
+    def _is_triggered(self, ticket: Ticket, quote: BrokerQuote, *, avg_vol: int | None = None) -> bool:
+        last    = quote.last
         trigger = Decimal(str(ticket.trigger_price))
-        if ticket.trigger_type in (
-            TriggerType.PRICE_ABOVE.value,
-            TriggerType.PRICE_ABOVE_WITH_VOLUME.value,
-            TriggerType.DAY_CLOSE_ABOVE.value,
-        ):
-            return last >= trigger
+
+        if last < trigger:
+            return False  # Price condition never met — fast path
+
+        if ticket.trigger_type == TriggerType.PRICE_ABOVE.value:
+            return True
+
+        if ticket.trigger_type == TriggerType.PRICE_ABOVE_WITH_VOLUME.value:
+            return self._volume_confirms(ticket, quote, avg_vol)
+
+        if ticket.trigger_type == TriggerType.DAY_CLOSE_ABOVE.value:
+            # Handled separately in the post-close window; should not appear here
+            return True
+
         return False
+
+    def _volume_confirms(self, ticket: Ticket, quote: BrokerQuote, avg_vol: int | None) -> bool:
+        """True when projected end-of-day volume clears the ticket's multiple of ADV.
+
+        Projection: current_volume / time_fraction_of_session.
+        The first minute is skipped (opening-auction data is unreliable).
+        For 1–15 min: only confirm if current volume ALREADY exceeds the full
+        requirement — this catches massive gap-up events without relying on
+        noisy early projections.
+        After 15 min: use the projection so the trade fires at a reasonable time
+        on a legitimate breakout rather than waiting until afternoon.
+
+        If ADV is unavailable, we confirm rather than block — missing data
+        should never silently prevent a trade from firing.
+        """
+        if avg_vol is None or avg_vol <= 0:
+            log.warning("%s: no ADV data — volume check skipped, treating as confirmed", ticket.symbol)
+            return True
+
+        current_vol = quote.volume
+        if not current_vol or current_vol <= 0:
+            log.debug("%s: no intraday volume in quote — not yet confirmed", ticket.symbol)
+            return False
+
+        multiple = float(ticket.volume_confirm_multiple or 1.5)
+        required = avg_vol * multiple
+
+        now_et = _eastern_now()
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_elapsed = max(0.0, (now_et - market_open).total_seconds() / 60.0)
+
+        if minutes_elapsed < 1:
+            # Opening auction — quote volumes are meaningless
+            log.debug("%s: opening auction, skipping volume check", ticket.symbol)
+            return False
+
+        if minutes_elapsed < 15:
+            # Too early to project reliably. Only fire if current volume already
+            # clears the full-day requirement (e.g. monster earnings gap-up).
+            confirms = current_vol >= required
+            log.info(
+                "%s early-session volume: elapsed=%.0fmin current=%d required=%.0f "
+                "(ADV=%d × %.1f) → %s",
+                ticket.symbol, minutes_elapsed, current_vol, required, avg_vol, multiple,
+                "CONFIRM" if confirms else "waiting (< 15min, no projection yet)",
+            )
+            return confirms
+
+        # 15+ minutes in: project to end of day
+        _SESSION_MINUTES = 390.0  # 9:30–16:00 ET
+        time_fraction = min(minutes_elapsed / _SESSION_MINUTES, 1.0)
+        projected = int(current_vol / time_fraction)
+        confirms = projected >= required
+
+        log.info(
+            "%s volume: elapsed=%.0fmin current=%d projected=%d required=%.0f "
+            "(ADV=%d × %.1f) → %s",
+            ticket.symbol, minutes_elapsed, current_vol, projected, required, avg_vol, multiple,
+            "CONFIRM" if confirms else "reject",
+        )
+        return confirms
 
     async def _fire_trigger(
         self, session: AsyncSession, ticket: Ticket, quote: BrokerQuote
@@ -223,13 +327,8 @@ class MonitorService:
         ticket.status = TicketStatus.TRIGGERED.value
         ticket.triggered_at = datetime.now(timezone.utc)
 
-        volume_note = (
-            " (volume confirmation deferred to Sprint 3)"
-            if ticket.trigger_type == TriggerType.PRICE_ABOVE_WITH_VOLUME.value
-            else ""
-        )
-        log.info("TRIGGER: %s last=%s trigger=%s%s", ticket.symbol, quote.last,
-                 ticket.trigger_price, volume_note)
+        log.info("TRIGGER: %s last=%s trigger=%s type=%s",
+                 ticket.symbol, quote.last, ticket.trigger_price, ticket.trigger_type)
 
         await log_event(
             session,
@@ -245,7 +344,6 @@ class MonitorService:
                 "volume": quote.volume,
                 "quote_delay_mins": quote.delay,
                 "is_paper": ticket.is_paper,
-                "note": volume_note.strip() or None,
             },
         )
 

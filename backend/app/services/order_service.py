@@ -80,7 +80,12 @@ async def place_entry_order(
 
     # Use stop-limit for live; paper broker handles market-style simulation internally
     trigger = ticket.trigger_price
-    limit   = (trigger * Decimal("1.005")).quantize(Decimal("0.01"))  # 0.5% ceiling
+    # 2% ceiling: prevents chasing a runaway gap but handles normal breakout
+    # volatility. 0.5% was too tight — any overnight gap > 0.5% above the pivot
+    # would activate the stop price but fail to fill the limit, missing the trade.
+    # Minervini's proper buy zone is within 5% of the pivot; 2% is disciplined
+    # without causing routine missed entries.
+    limit   = (trigger * Decimal("1.02")).quantize(Decimal("0.01"))
 
     # Live path: try a bracket order so the stop is in place at the broker
     # the moment the entry fills (zero naked window). Fall back to sequential

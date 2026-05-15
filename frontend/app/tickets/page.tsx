@@ -136,7 +136,7 @@ function TicketCard({ ticket: t, account }: { ticket: Ticket; account?: Account 
     t.outcome === "loss" ? "text-destructive" : "text-muted-foreground";
 
   // Entry order description
-  const entryLimit  = (trigger * 1.005).toFixed(2);
+  const entryLimit  = (trigger * 1.02).toFixed(2);
   const entryOrder  = t.is_paper
     ? "Simulated fill at trigger"
     : `Bracket entry leg: stop-limit buy at ${fmtMoney(t.trigger_price, t.currency)} / max ${fmtMoney(entryLimit, t.currency)}`;

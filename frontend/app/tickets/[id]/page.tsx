@@ -193,7 +193,7 @@ export default async function TicketDetailPage({
                   </p>
                   <Row
                     label="Entry leg"
-                    value={`Stop-limit buy: stop ${fmtMoney(ticket.trigger_price, ticket.currency)}, limit ${fmtMoney((parseFloat(ticket.trigger_price) * 1.005).toFixed(2), ticket.currency)} (0.5% ceiling)`}
+                    value={`Stop-limit buy: stop ${fmtMoney(ticket.trigger_price, ticket.currency)}, limit ${fmtMoney((parseFloat(ticket.trigger_price) * 1.02).toFixed(2), ticket.currency)} (2% ceiling)`}
                   />
                   <Row
                     label="Stop leg"
