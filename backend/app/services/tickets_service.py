@@ -329,6 +329,12 @@ async def patch_ticket(
     if patch.thesis is not None:
         ticket.thesis = patch.thesis.strip()
 
+    # Always re-derive is_paper from the current account — fixes tickets whose
+    # flag became stale after the user toggled live/paper on the account page.
+    current_account = await session.get(Account, ticket.account_id)
+    if current_account:
+        ticket.is_paper = not current_account.real_money_enabled or get_settings().paper_mode_default
+
     if needs_resize:
         streak = await get_snapshot(session)
         equity = await get_household_equity(session)

@@ -9,7 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.brokers.registry import get_broker
-from app.db.models import Account, AccountBalance
+from app.config import get_settings
+from app.db.models import Account, AccountBalance, Ticket, TicketStatus
 from app.db.session import get_session
 from app.api.auth import get_user_id
 from app.services.accounts_service import get_household_equity, sync_accounts
@@ -111,6 +112,20 @@ async def update_account(
     account.real_money_enabled = body.real_money_enabled
     if body.nickname is not None:
         account.nickname = body.nickname or None
+
+    # Cascade: update is_paper on all armed tickets for this account so they
+    # immediately reflect the new live/paper state without needing a re-save.
+    if prev != body.real_money_enabled:
+        settings = get_settings()
+        new_is_paper = not body.real_money_enabled or settings.paper_mode_default
+        armed_result = await session.execute(
+            select(Ticket).where(
+                Ticket.account_id == account.id,
+                Ticket.status == TicketStatus.ARMED.value,
+            )
+        )
+        for t in armed_result.scalars().all():
+            t.is_paper = new_is_paper
 
     await log_event(
         session,
