@@ -33,6 +33,7 @@ async def preview_ticket(
     currency: str,
     trigger_price: Decimal,
     stop_price: Decimal,
+    max_shares: int | None = None,
 ) -> tuple[SizingResult, StreakSnapshot, dict[str, Decimal]]:
     """Compute sizing + streak snapshot + buying-power breakdown for the
     trade currency. Nothing is persisted."""
@@ -48,6 +49,7 @@ async def preview_ticket(
         currency=currency,
         equity_by_currency=equity,
         multiplier=streak.multiplier,
+        max_shares=max_shares,
     )
     buying_power = await buying_power_breakdown(session, currency=currency)
     return sizing, streak, buying_power
@@ -70,6 +72,7 @@ async def create_ticket(
     volume_confirm_multiple: float | None,
     thesis: str,
     is_paper: bool | None = None,
+    max_shares: int | None = None,
 ) -> Ticket:
     """Create + arm a ticket. Snapshots sizing and streak state at creation."""
     account = await session.get(Account, account_id)
@@ -88,6 +91,7 @@ async def create_ticket(
         currency=currency,
         trigger_price=trigger_price,
         stop_price=stop_price,
+        max_shares=max_shares,
     )
 
     if sizing.shares <= 0:

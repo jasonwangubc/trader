@@ -45,6 +45,7 @@ class TicketPreviewIn(BaseModel):
     currency: str
     trigger_price: Decimal
     stop_price: Decimal
+    max_shares: int | None = None
 
 
 class StreakOut(BaseModel):
@@ -102,6 +103,7 @@ class TicketIn(BaseModel):
     time_stop_days: int | None = Field(default=None, ge=1, le=365)
     valid_for_days: int = Field(default=7, ge=1, le=90)
     thesis: str = Field(min_length=10, max_length=2000)
+    max_shares: int | None = Field(default=None, ge=1)
     is_paper: bool | None = None
     override_regime: bool = False   # explicitly proceed despite bear regime
     override_streak: bool = False   # explicitly proceed despite loss-streak block
@@ -217,6 +219,7 @@ async def preview(
     try:
         sizing, streak, buying_power = await preview_ticket(
             session,
+            max_shares=body.max_shares,
             account_id=body.account_id,
             currency=body.currency,
             trigger_price=body.trigger_price,
@@ -305,6 +308,7 @@ async def create(
             volume_confirm_multiple=body.volume_confirm_multiple,
             thesis=body.thesis,
             is_paper=body.is_paper,
+            max_shares=body.max_shares,
         )
     except TicketValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

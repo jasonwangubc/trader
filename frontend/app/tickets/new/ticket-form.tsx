@@ -30,6 +30,7 @@ type FormState = {
   trigger_price: string;
   stop_price: string;
   target_price: string;
+  max_shares: string;
   time_stop_days: string;
   valid_for_days: string;
   volume_confirm_multiple: string;
@@ -59,6 +60,7 @@ export function TicketForm({
     trigger_price: prefillTrigger ?? "",
     stop_price: prefillStop ?? "",
     target_price: prefillTarget ?? "",
+    max_shares: "",
     time_stop_days: "21",
     valid_for_days: "7",
     volume_confirm_multiple: "1.5",
@@ -125,7 +127,7 @@ export function TicketForm({
   }, [form.symbol]);
 
   // Live sizing preview — debounced.
-  const previewKey = `${form.account_id}|${form.currency}|${form.trigger_price}|${form.stop_price}`;
+  const previewKey = `${form.account_id}|${form.currency}|${form.trigger_price}|${form.stop_price}|${form.max_shares}`;
   useEffect(() => {
     const trigger = parseFloat(form.trigger_price);
     const stop = parseFloat(form.stop_price);
@@ -146,6 +148,7 @@ export function TicketForm({
             currency: form.currency,
             trigger_price: trigger,
             stop_price: stop,
+            max_shares: form.max_shares ? parseInt(form.max_shares, 10) : null,
           }),
         });
         if (!res.ok) {
@@ -187,6 +190,7 @@ export function TicketForm({
           ? parseFloat(form.volume_confirm_multiple)
           : null,
         thesis: form.thesis,
+        max_shares: form.max_shares ? parseInt(form.max_shares, 10) : null,
       };
       const res = await fetch(`${API_URL}/api/tickets`, {
         method: "POST",
@@ -405,6 +409,22 @@ export function TicketForm({
                 className="tabular-nums"
               />
             </Field>
+            <Field
+              label="Max shares"
+              hint={preview && form.max_shares && parseInt(form.max_shares) < preview.sizing.shares
+                ? `Risk-based: ${preview.sizing.shares} → capped to ${form.max_shares}`
+                : "Optional — leave blank for full risk-based sizing"}
+            >
+              <Input
+                type="number"
+                min="1"
+                step="1"
+                value={form.max_shares}
+                onChange={(e) => set("max_shares", e.target.value)}
+                placeholder="e.g. 50"
+                className="tabular-nums"
+              />
+            </Field>
             <Field label="Time stop (days)">
               <Input
                 type="number"
@@ -533,15 +553,18 @@ function Field({
   label,
   children,
   className,
+  hint,
 }: {
   label: string;
   children: React.ReactNode;
   className?: string;
+  hint?: string;
 }) {
   return (
     <div className={`flex flex-col gap-1.5 ${className ?? ""}`}>
       <Label>{label}</Label>
       {children}
+      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
     </div>
   );
 }

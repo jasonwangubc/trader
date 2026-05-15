@@ -42,6 +42,7 @@ def compute_sizing(
     multiplier: Decimal,
     base_risk_pct: Decimal | None = None,
     max_risk_pct: Decimal | None = None,
+    max_shares: int | None = None,
 ) -> SizingResult:
     settings = get_settings()
     base = base_risk_pct if base_risk_pct is not None else Decimal(str(settings.base_risk_pct))
@@ -69,20 +70,27 @@ def compute_sizing(
     if shares == 0 and not warnings:
         warnings.append("Risk amount too small for any whole shares — try widening stop or re-check risk %.")
 
+    if max_shares is not None and max_shares > 0 and shares > max_shares:
+        warnings.append(f"Capped to {max_shares} shares (risk-based sizing was {shares}).")
+        shares = max_shares
+
     # Tight-stop warning: if risk per share is < 1% of trigger, the breakout might be too tight.
     if per_share_risk > 0 and per_share_risk / trigger_price < Decimal("0.01"):
         warnings.append("Stop is <1% from trigger — risk of whipsaw on noise.")
 
     position_value = (Decimal(shares) * trigger_price).quantize(Decimal("0.01"))
+    # Recalculate actual risk after any share cap so preview shows real exposure.
+    actual_risk_amount = (Decimal(shares) * per_share_risk).quantize(Decimal("0.01")) if per_share_risk > 0 else Decimal(0)
+    actual_risk_pct = (actual_risk_amount / equity).quantize(Decimal("0.00001")) if equity > 0 else Decimal(0)
 
     return SizingResult(
-        risk_pct=risk_pct,
+        risk_pct=actual_risk_pct,
         base_risk_pct=base,
         multiplier=multiplier,
         capped=capped,
         equity_basis=equity,
         equity_currency=currency,
-        risk_amount=risk_amount,
+        risk_amount=actual_risk_amount,
         per_share_risk=per_share_risk,
         shares=shares,
         position_value=position_value,
