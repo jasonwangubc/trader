@@ -100,10 +100,11 @@ async def update_account(
     account_id: uuid.UUID,
     body: AccountSettingsIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> AccountOut:
     """Toggle real-money execution and set nickname for an account."""
     account = await session.get(Account, account_id)
-    if account is None:
+    if account is None or account.user_id != user_id:
         raise HTTPException(status_code=404, detail="Account not found")
 
     prev = account.real_money_enabled
