@@ -4,6 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api, ApiError } from "@/lib/api";
 import { type Account, type HouseholdData, type Ticket, fmtMoney, fmtPct } from "@/lib/tickets";
 import { CancelButton } from "./cancel-button";
+import { TicketEditForm } from "./edit-form";
 import { CloseForm } from "./close-form";
 import { ExitPlanForm } from "./exit-plan-form";
 import { PyramidForm } from "./pyramid-form";
@@ -76,6 +77,7 @@ export default async function TicketDetailPage({
   const { id } = await params;
   let ticket: TicketDetail | null = null;
   let account: Account | undefined;
+  let allAccounts: Account[] = [];
   let error: string | null = null;
 
   try {
@@ -84,7 +86,8 @@ export default async function TicketDetailPage({
       api<HouseholdData>("/api/accounts").catch(() => ({ accounts: [], household_equity: {} })),
     ]);
     ticket = t;
-    account = household.accounts.find(a => a.id === t.account_id);
+    allAccounts = household.accounts;
+    account = allAccounts.find(a => a.id === t.account_id);
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
@@ -109,10 +112,13 @@ export default async function TicketDetailPage({
 
   return (
     <main className="container mx-auto max-w-4xl p-6 sm:p-10">
-      <div className="mb-6 flex items-center gap-3">
+      <div className="mb-6 flex items-center justify-between gap-3">
         <Link href="/tickets" className="text-muted-foreground hover:text-foreground text-sm">
           ← Tickets
         </Link>
+        {ticket.status === "armed" && (
+          <TicketEditForm ticket={ticket} accounts={allAccounts} />
+        )}
       </div>
 
       <header className="mb-8 flex items-start justify-between gap-4">

@@ -32,6 +32,7 @@ from app.services.tickets_service import (
     cancel_ticket,
     create_retroactive_ticket,
     create_ticket,
+    patch_ticket,
     preview_ticket,
 )
 
@@ -463,6 +464,34 @@ async def get_ticket(
 
     base = TicketOut.from_orm_obj(t)
     return TicketDetailOut(**base.model_dump(), orders=order_outs, trailing=trailing_out)
+
+
+class TicketPatch(BaseModel):
+    """Fields that can be changed on an armed ticket. All fields optional."""
+    account_id:              uuid.UUID | None = None
+    trigger_price:           Decimal   | None = Field(default=None, gt=0)
+    stop_price:              Decimal   | None = Field(default=None, gt=0)
+    target_price:            Decimal   | None = None  # null = clear it
+    valid_for_days:          int       | None = Field(default=None, ge=1, le=90)
+    setup_type:              str       | None = None
+    volume_confirm_multiple: float     | None = None
+    thesis:                  str       | None = Field(default=None, min_length=10, max_length=2000)
+
+
+@router.patch("/{ticket_id}", response_model=TicketOut)
+async def edit_ticket(
+    ticket_id: uuid.UUID,
+    body: TicketPatch,
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> TicketOut:
+    """Edit an armed ticket. Only armed tickets can be modified; once triggered
+    the position is in-flight and changes are no longer safe."""
+    try:
+        ticket = await patch_ticket(session, ticket_id=ticket_id, user_id=user_id, patch=body)
+    except TicketValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return TicketOut.from_orm_obj(ticket)
 
 
 @router.post("/{ticket_id}/cancel", response_model=TicketOut)

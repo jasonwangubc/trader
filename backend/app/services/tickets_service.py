@@ -267,6 +267,104 @@ async def create_retroactive_ticket(
     return ticket
 
 
+async def patch_ticket(
+    session: AsyncSession,
+    *,
+    ticket_id: uuid.UUID,
+    user_id: str,
+    patch: object,   # TicketPatch — imported from api layer to avoid circular import
+) -> Ticket:
+    """Apply a partial update to an armed ticket.
+
+    Only armed tickets can be edited — once triggered, the entry order is
+    in-flight and changing prices or accounts is unsafe. If the account or
+    prices change, sizing is recalculated from current equity and streak.
+    """
+    ticket = await session.get(Ticket, ticket_id)
+    if ticket is None or ticket.user_id != user_id:
+        raise TicketValidationError("Ticket not found.")
+    if ticket.status != TicketStatus.ARMED.value:
+        raise TicketValidationError(
+            f"Only armed tickets can be edited (current status: {ticket.status})."
+        )
+
+    needs_resize = False
+
+    if patch.account_id is not None and patch.account_id != ticket.account_id:
+        account = await session.get(Account, patch.account_id)
+        if account is None or account.user_id != user_id:
+            raise TicketValidationError("Account not found.")
+        ticket.account_id = patch.account_id
+        ticket.currency   = account.primary_currency
+        settings = get_settings()
+        ticket.is_paper   = not account.real_money_enabled or settings.paper_mode_default
+        needs_resize = True
+
+    if patch.trigger_price is not None:
+        ticket.trigger_price = patch.trigger_price
+        needs_resize = True
+
+    if patch.stop_price is not None:
+        ticket.stop_price = patch.stop_price
+        needs_resize = True
+
+    # Validate after any price change
+    if ticket.trigger_price <= ticket.stop_price:
+        raise TicketValidationError("Trigger must be strictly above stop.")
+
+    if hasattr(patch, "target_price"):   # None is a valid value (clears target)
+        ticket.target_price = patch.target_price
+
+    if patch.valid_for_days is not None:
+        ticket.expires_at = datetime.now(timezone.utc) + timedelta(days=patch.valid_for_days)
+
+    if patch.setup_type is not None:
+        if patch.setup_type not in {s.value for s in SetupType}:
+            raise TicketValidationError(f"Invalid setup_type: {patch.setup_type}")
+        ticket.setup_type = patch.setup_type
+
+    if patch.volume_confirm_multiple is not None:
+        ticket.volume_confirm_multiple = patch.volume_confirm_multiple
+
+    if patch.thesis is not None:
+        ticket.thesis = patch.thesis.strip()
+
+    if needs_resize:
+        streak = await get_snapshot(session)
+        equity = await get_household_equity(session)
+        sizing = compute_sizing(
+            trigger_price=ticket.trigger_price,
+            stop_price=ticket.stop_price,
+            currency=ticket.currency,
+            equity_by_currency=equity,
+            multiplier=streak.multiplier,
+        )
+        if sizing.shares <= 0:
+            raise TicketValidationError(
+                "Sizing returns 0 shares after changes. " + " ".join(sizing.warnings)
+            )
+        ticket.risk_pct                  = sizing.risk_pct
+        ticket.risk_amount               = sizing.risk_amount
+        ticket.position_size_shares      = sizing.shares
+        ticket.position_size_value       = sizing.position_value
+        ticket.household_equity_at_creation = sizing.equity_basis
+
+    await log_event(
+        session, actor="user", event_type="ticket_edited",
+        entity_type="ticket", entity_id=ticket.id,
+        payload={
+            "symbol": ticket.symbol,
+            "account_id": str(ticket.account_id),
+            "trigger_price": str(ticket.trigger_price),
+            "stop_price": str(ticket.stop_price),
+            "needs_resize": needs_resize,
+        },
+    )
+    await session.commit()
+    await session.refresh(ticket)
+    return ticket
+
+
 async def cancel_ticket(session: AsyncSession, ticket_id: uuid.UUID) -> Ticket:
     ticket = await session.get(Ticket, ticket_id)
     if ticket is None:

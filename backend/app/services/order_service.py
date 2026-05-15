@@ -494,9 +494,13 @@ async def place_scale_out_order(
     session.add(order)
     await session.flush()
 
+    # Paper broker fills instantly — record the fill so callers can detect it.
+    if ack.status == "filled":
+        await _record_fill(session, order, ack.fill_price or sell_price, sell_shares)
+
     await log_event(
         session,
-        actor="user",
+        actor="system",
         event_type="scale_out_placed",
         entity_type="ticket",
         entity_id=ticket.id,
@@ -659,9 +663,8 @@ async def check_filled_tickets_for_close(
         if ticket.is_paper:
             if last is None:
                 continue
-            stop = ticket.stop_price
+            stop   = ticket.stop_price
             target = ticket.target_price
-
             if last <= stop:
                 await close_ticket(session, ticket, stop, "stop_hit")
                 continue
@@ -669,9 +672,14 @@ async def check_filled_tickets_for_close(
                 await close_ticket(session, ticket, target, "target_hit")
                 continue
             else:
-                await _check_exit_ladder(session, ticket, last)
+                await _check_exit_ladder(session, ticket, last, broker)
         else:
+            # Live: poll GTC stop for fills, then check exit ladder for scale-outs.
             await _check_live_stop_order(session, ticket, broker)
+            if ticket.status == TicketStatus.FILLED.value and last is not None:
+                await _check_scale_out_fills(session, ticket, broker)
+                if ticket.status == TicketStatus.FILLED.value:
+                    await _check_exit_ladder(session, ticket, last, broker)
 
         # Queue trailing actions for all filled tickets that have a live quote.
         # Both paper (to coach simulation habits) and live.
@@ -722,44 +730,120 @@ async def _check_live_stop_order(
 
 
 async def _check_exit_ladder(
-    session: AsyncSession, ticket: Ticket, last: Decimal
+    session: AsyncSession, ticket: Ticket, last: Decimal, broker: BrokerInterface
 ) -> None:
-    """Mark exit ladder legs as hit when price reaches them.
-    Does NOT auto-place orders — the user reviews and closes manually or
-    a future sprint adds partial order automation.
+    """Auto-place scale-out sell orders when exit ladder targets are reached.
+
+    For each unhit, un-queued leg whose price <= last:
+    - Places a limit sell via the broker (Day order at the target price).
+    - Sets action_queued=True to prevent duplicate orders on subsequent ticks.
+    - For paper tickets the broker fills instantly, so we also mark hit=True,
+      reduce position_size_shares, and close the ticket if fully exited.
+    - For live tickets the fill is detected next tick by _check_scale_out_fills.
+
+    The GTC stop order at the broker is left as-is. On most brokers a stop for
+    more shares than the remaining position simply fills for what's available.
     """
+    from sqlalchemy.orm.attributes import flag_modified
+
     plan = ticket.exit_plan
     if not plan or not plan.get("targets"):
         return
 
     changed = False
     for leg in plan["targets"]:
-        if leg.get("hit"):
+        if leg.get("hit") or leg.get("action_queued"):
             continue
-        leg_price = Decimal(str(leg["price"]))
-        if last >= leg_price:
-            leg["hit"] = True
+        leg_price  = Decimal(str(leg["price"]))
+        leg_shares = int(leg.get("shares", 0))
+        if leg_shares <= 0 or last < leg_price:
+            continue
+
+        try:
+            order = await place_scale_out_order(
+                session, ticket, leg_price, leg_shares, broker
+            )
+            leg["action_queued"] = True
             changed = True
-            log.info("Exit ladder target hit: %s %s @ %s (label: %s)",
-                     ticket.symbol, ticket.id, leg_price, leg.get("label", ""))
+            log.info("Exit ladder: scale-out queued %s %dsh @ %s (%s)",
+                     ticket.symbol, leg_shares, leg_price, leg.get("label", ""))
+
+            # Paper fills instantly — close the leg immediately.
+            if order.status == OrderStatus.FILLED.value:
+                leg["hit"] = True
+                ticket.position_size_shares = max(0, ticket.position_size_shares - leg_shares)
+                if ticket.position_size_shares <= 0:
+                    await close_ticket(session, ticket, leg_price, "target_hit")
+
             await log_event(
-                session,
-                actor="system",
-                event_type="exit_target_hit",
-                entity_type="ticket",
-                entity_id=ticket.id,
+                session, actor="system", event_type="exit_target_queued",
+                entity_type="ticket", entity_id=ticket.id,
                 payload={
-                    "symbol": ticket.symbol,
-                    "target_price": str(leg_price),
-                    "last_price": str(last),
-                    "label": leg.get("label", ""),
+                    "symbol": ticket.symbol, "label": leg.get("label", ""),
+                    "target_price": str(leg_price), "shares": leg_shares,
+                    "last_price": str(last), "is_paper": ticket.is_paper,
                 },
             )
+        except Exception:
+            log.exception("Scale-out placement failed for %s leg %s",
+                          ticket.symbol, leg.get("label", ""))
+            leg["action_queued"] = False  # let next tick retry
 
     if changed:
-        # Force SQLAlchemy to detect the JSONB mutation
-        from sqlalchemy.orm.attributes import flag_modified
         flag_modified(ticket, "exit_plan")
+
+
+async def _check_scale_out_fills(
+    session: AsyncSession, ticket: Ticket, broker: BrokerInterface
+) -> None:
+    """Poll pending live scale-out orders. On fill: mark leg hit, reduce shares."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    result = await session.execute(
+        select(Order).where(
+            Order.ticket_id == ticket.id,
+            Order.intent == OrderIntent.SCALE_OUT.value,
+            Order.status.in_([OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value]),
+        )
+    )
+    pending = result.scalars().all()
+    if not pending:
+        return
+
+    account = await session.get(Account, ticket.account_id)
+    if account is None:
+        return
+
+    for order in pending:
+        try:
+            ack = await broker.get_order(account.questrade_account_id, order.questrade_order_id)
+        except Exception:
+            log.exception("Failed to poll scale-out order %s", order.questrade_order_id)
+            continue
+
+        order.status = ack.status
+        if ack.status != "filled":
+            continue
+
+        fill_price = ack.fill_price or order.limit_price or ticket.target_price or ticket.trigger_price
+        fill_qty   = ack.fill_quantity or order.quantity
+        await _record_fill(session, order, fill_price, fill_qty)
+
+        # Match ladder leg by quantity (closest match among action_queued, un-hit legs)
+        if ticket.exit_plan and ticket.exit_plan.get("targets"):
+            for leg in ticket.exit_plan["targets"]:
+                if leg.get("action_queued") and not leg.get("hit") and int(leg.get("shares", 0)) == fill_qty:
+                    leg["hit"] = True
+                    flag_modified(ticket, "exit_plan")
+                    break
+
+        ticket.position_size_shares = max(0, ticket.position_size_shares - fill_qty)
+        log.info("Scale-out filled: %s %dsh @ %s, remaining=%d",
+                 ticket.symbol, fill_qty, fill_price, ticket.position_size_shares)
+
+        if ticket.position_size_shares <= 0:
+            await close_ticket(session, ticket, fill_price, "target_hit")
+            return  # ticket closed, stop processing
 
 
 async def _record_fill(
