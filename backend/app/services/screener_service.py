@@ -351,7 +351,11 @@ async def run_screener(
         if p: p.finish(stats={"universe_size": 0})
         return [], stats
 
-    all_symbols = [s.symbol for s in all_sym_rows]
+    # Deduplicate while preserving order — the universe can have the same
+    # ticker on multiple exchange/CIK entries which causes unique-constraint
+    # violations when both hit the persist loop.
+    seen: set[str] = set()
+    all_symbols = [s.symbol for s in all_sym_rows if not (s.symbol in seen or seen.add(s.symbol))]  # type: ignore[func-returns-value]
     sym_row_map = {s.symbol: s for s in all_sym_rows}
 
     # ── Step 2: Incremental EOD download ─────────────────────────────────────
@@ -570,6 +574,7 @@ async def run_screener(
         if score_row is None:
             score_row = ScreenerScore(symbol=sym)
             session.add(score_row)
+            existing_scores[sym] = score_row  # guard against mid-session duplicates
 
         score_row.scored_at = datetime.now(timezone.utc)
         score_row.universe_source = (sym_row.notes or "").split(":")[0] if sym_row else None
