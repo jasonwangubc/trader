@@ -1,7 +1,7 @@
 # trader — Setup guide
 
 Minervini SEPA methodology trading discipline tool.
-Pre-trade tickets · breakout monitor · auto stops · S&P 500/400/600 screener · Questrade integration.
+Pre-trade tickets · breakout monitor · auto stops · S&P 500/400/600 + NASDAQ 100 + TSX 60 screener · wheel-strategy options scanner · Questrade integration.
 
 ---
 
