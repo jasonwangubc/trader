@@ -3,6 +3,7 @@ import { ArrowLeft, TrendingUp } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { StockChart } from "@/components/stock-chart";
+import { CompanySnapshot } from "@/components/company-snapshot";
 import { FundamentalsPanel } from "@/components/fundamentals-panel";
 import { RecommendationsPanel } from "@/components/recommendations-panel";
 import { api, ApiError } from "@/lib/api";
@@ -119,6 +120,13 @@ export default async function ChartPage({
           <Stat label="Composite" value={`${Math.round(parseFloat(score.composite_score) * 100)}/100`} />
         </div>
       )}
+
+      {/* Company snapshot — TradingView-style overview */}
+      <Card className="mb-4">
+        <CardContent className="p-4">
+          <CompanySnapshot symbol={sym} />
+        </CardContent>
+      </Card>
 
       {/* Main chart with stop/target overlays */}
       <Card className="mb-4">
