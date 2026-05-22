@@ -142,7 +142,10 @@ export function CandidatesView({ candidates }: { candidates: WheelCandidate[] })
               <Th label="Spot"    align="right" />
               <Th label="Strike"  align="right" />
               <Th label="OTM %"   align="right" onClick={() => toggleSort("otm_pct")} active={sortKey === "otm_pct"} dir={sortDir} />
+              <Th label="Expiry"  align="right" />
               <Th label="DTE"     align="right" onClick={() => toggleSort("dte")} active={sortKey === "dte"} dir={sortDir} />
+              <Th label="Bid"     align="right" />
+              <Th label="Ask"     align="right" />
               <Th label="Mid"     align="right" />
               <Th label="Yield"   align="right" help="Premium / capital-at-risk" onClick={() => toggleSort("premium_yield_pct")} active={sortKey === "premium_yield_pct"} dir={sortDir} />
               <Th label="Ann."    align="right" help="Annualized: yield × 365/DTE" onClick={() => toggleSort("annualized_yield_pct")} active={sortKey === "annualized_yield_pct"} dir={sortDir} />
@@ -164,7 +167,7 @@ export function CandidatesView({ candidates }: { candidates: WheelCandidate[] })
             ))}
             {sorted.length === 0 && (
               <tr>
-                <td colSpan={16} className="text-muted-foreground py-12 text-center">
+                <td colSpan={19} className="text-muted-foreground py-12 text-center">
                   No candidates match current filters.
                   {candidates.length === 0 && " Run a scan to populate the list."}
                 </td>
@@ -188,6 +191,12 @@ function FilterChip({ active, onClick, label }: { active: boolean; onClick: () =
       {label}
     </button>
   );
+}
+
+function fmtExpiry(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
 function Th({
@@ -240,7 +249,10 @@ function Row({
       <td className="px-2 py-1.5 text-right tabular-nums">{money(c.last_price)}</td>
       <td className="px-2 py-1.5 text-right tabular-nums">{money(c.strike)}</td>
       <td className="px-2 py-1.5 text-right tabular-nums">{pct(c.otm_pct)}</td>
+      <td className="px-2 py-1.5 text-right tabular-nums text-muted-foreground">{fmtExpiry(c.expiry)}</td>
       <td className="px-2 py-1.5 text-right tabular-nums">{c.dte}</td>
+      <td className="px-2 py-1.5 text-right tabular-nums text-muted-foreground">{c.bid ? money(c.bid) : "—"}</td>
+      <td className="px-2 py-1.5 text-right tabular-nums text-muted-foreground">{c.ask ? money(c.ask) : "—"}</td>
       <td className="px-2 py-1.5 text-right tabular-nums">{money(c.mid)}</td>
       <td className="px-2 py-1.5 text-right tabular-nums">{pct(c.premium_yield_pct, 2)}</td>
       <td className={`px-2 py-1.5 text-right tabular-nums font-semibold ${yieldColor}`}>{pct(c.annualized_yield_pct, 1)}</td>
