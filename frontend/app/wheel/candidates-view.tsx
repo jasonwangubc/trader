@@ -1,7 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, ChevronsUpDown, AlertTriangle } from "lucide-react";
+import { ChevronDown, ChevronUp, ChevronsUpDown, AlertTriangle, ExternalLink } from "lucide-react";
 import type { WheelCandidate, CorrelationReport } from "@/lib/wheel";
 import { money, num, pct } from "@/lib/wheel";
 import { API_URL } from "@/lib/api";
@@ -233,7 +234,14 @@ function Row({
         <input type="checkbox" checked={inBasket} onChange={onToggle} className="cursor-pointer" />
       </td>
       <td className="px-2 py-1.5 font-mono font-semibold">
-        {c.symbol}
+        <Link
+          href={`/chart/${c.symbol}`}
+          className="hover:text-primary inline-flex items-center gap-1 group"
+          title={`Open ${c.symbol} chart`}
+        >
+          {c.symbol}
+          <ExternalLink className="h-3 w-3 opacity-0 group-hover:opacity-60" />
+        </Link>
         {c.earnings_before_expiry && (
           <span title={`Earnings ${c.next_earnings_date?.slice(0, 10)} (before expiry)`}>
             <AlertTriangle className="ml-1 inline h-3 w-3 text-amber-500" />
