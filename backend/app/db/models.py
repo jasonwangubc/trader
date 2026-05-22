@@ -498,6 +498,66 @@ class ScreenerScore(Base):
     composite_score: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal(0))
 
 
+class WheelCandidate(Base):
+    """Snapshotted wheel-strategy candidate (CSP or CC) from the latest scan.
+
+    Refreshed by /api/wheel/scan. Per-user; one row per (symbol, strategy, expiry, strike).
+    The whole table is rewritten on each scan for the scanning user (delete-then-insert).
+    """
+    __tablename__ = "wheel_candidates"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    sector: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    strategy: Mapped[str] = mapped_column(String(16))   # "csp" | "cc"
+
+    # Underlying snapshot at scan time
+    last_price: Mapped[Decimal] = mapped_column(_money)
+
+    # Contract
+    expiry: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    dte: Mapped[int] = mapped_column(Integer)
+    strike: Mapped[Decimal] = mapped_column(_money)
+    option_type: Mapped[str] = mapped_column(String(4))  # "put" | "call"
+
+    # Quote
+    bid: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    ask: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    mid: Mapped[Decimal] = mapped_column(_money)
+    last: Mapped[Decimal | None] = mapped_column(_money, nullable=True)
+    bid_ask_spread_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+
+    # Liquidity
+    open_interest: Mapped[int] = mapped_column(Integer, default=0)
+    volume: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Greeks / IV (yfinance provides IV; delta is approximated from moneyness)
+    implied_volatility: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    delta_approx: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+
+    # Yield math
+    premium_yield_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4))         # mid / capital_at_risk
+    annualized_yield_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4))      # × 365/dte
+    otm_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4))                   # |strike-spot|/spot
+    capital_at_risk: Mapped[Decimal] = mapped_column(_money)                  # CSP: strike*100; CC: last*100
+    breakeven: Mapped[Decimal] = mapped_column(_money)
+
+    # Risk flags
+    earnings_before_expiry: Mapped[bool] = mapped_column(Boolean, default=False)
+    next_earnings_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+
+    # Composite ranking score (0-100)
+    score: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=Decimal(0), index=True)
+    score_breakdown: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_wheel_candidates_user_score", "user_id", "score"),
+    )
+
+
 class TrailingAction(Base, TimestampMixin):
     """Pending coaching action created when a trailing milestone or exit ladder leg is hit.
 

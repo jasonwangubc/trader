@@ -14,6 +14,7 @@ import {
   ClipboardList,
   Shield,
   LineChart,
+  CircleDollarSign,
   Eye,
   FlaskConical,
   Settings,
@@ -46,6 +47,7 @@ const NAV_SECTIONS = [
     items: [
       { href: "/tickets",   label: "Tickets",   Icon: FileText },
       { href: "/options",   label: "Options",   Icon: LineChart },
+      { href: "/wheel",     label: "Wheel",     Icon: CircleDollarSign },
       { href: "/positions", label: "Positions", Icon: TrendingUp },
     ],
   },
