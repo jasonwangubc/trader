@@ -2,6 +2,7 @@ import { UserButton } from "@clerk/nextjs";
 import { api, ApiError } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { QuestradConnect } from "./questrade-connect";
+import { BrokerHistorySync } from "./broker-history-sync";
 
 // Never cache — must always reflect the live connection status.
 export const dynamic = "force-dynamic";
@@ -74,6 +75,22 @@ export default async function SettingsPage() {
             <QuestradConnect initialConnected={status.connected} />
           </CardContent>
         </Card>
+
+        {/* Broker trade history — backfill manual trades */}
+        {status.connected && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Broker trade history</CardTitle>
+              <CardDescription>
+                Pull every fill from Questrade and reconstruct your trades — including manual orders.
+                Required for the journal to reflect what you actually traded.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <BrokerHistorySync />
+            </CardContent>
+          </Card>
+        )}
 
         {/* How to get Questrade token */}
         <Card className="bg-muted/30">

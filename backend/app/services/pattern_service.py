@@ -52,7 +52,10 @@ class PatternResult:
 
 # ─── Tunable parameters ───────────────────────────────────────────────────────
 
-_SWING_WINDOW = 5                # bars on either side for swing-high/low
+_SWING_WINDOW = 5                # bars on either side for swing-high/low (fallback)
+_SMOOTH_PERIOD = 5               # EMA span for noise suppression before pivot detection
+_ATR_PERIOD = 14                 # ATR lookback for volatility-scaled zigzag
+_ATR_ZIGZAG_MULT = 1.5           # confirm a reversal only when it exceeds k·ATR
 _MIN_BASE_DAYS = 25              # 5 weeks — minimum to call something a "base"
 _MAX_BASE_DEPTH_PCT = 35.0       # >35% deep = "wide and loose," not buyable
 _MIN_BASE_DEPTH_PCT = 2.5        # <2.5% = acquisition pinning, not a real base
@@ -60,33 +63,259 @@ _AT_PIVOT_RANGE_PCT = (-3.0, 5.0)  # within -3% to +5% of pivot = at_pivot
 _EXTENDED_THRESHOLD_PCT = 5.0    # > 5% past pivot = extended (Minervini's rule)
 _BROKEN_BELOW_50MA_PCT = -3.0    # > 3% below 50ma = broken
 _FROZEN_ADR_PCT = 0.50           # avg daily range < 0.5% of price = frozen/acquired
+_PIVOT_ZONE_TOLERANCE_PCT = 3.0  # swing highs within ±3% form a resistance zone
+_BASE_NEAR_52W_PCT = 0.75        # pivot must be ≥ 75% of 52w high (was 0.88 — widened)
+_QUALITY_FLOOR = 0.25            # below this, fall back to "none"
 
 
-# ─── Swing point detection ────────────────────────────────────────────────────
+# ─── Smoothing + soft-penalty helpers ─────────────────────────────────────────
+# These are the noise-tolerance layer that the literature converges on:
+#   • Lo-Mamaysky-Wang (2000) smooth with kernel regression before extrema detection.
+#   • ATR-scaled zigzag (TrendSpider, AmiBroker, ChartSchool) replaces fixed-bar
+#     swing windows with volatility-adjusted confirmation.
+#   • Soft penalties (gaussian / sigmoid) replace hard `return 0.0` cliffs so a
+#     pattern with one borderline metric is degraded, not deleted.
+
+def _smooth(series: np.ndarray, period: int = _SMOOTH_PERIOD) -> np.ndarray:
+    """EMA smoothing — cheap proxy for Lo-Mamaysky kernel regression.
+
+    We use this to find pivot *locations* on a denoised curve, then read the
+    *raw* OHLC value at that location for downstream geometry. That way the
+    smoother only filters noise; it doesn't bias measured depths.
+    """
+    if len(series) < period:
+        return series
+    return pd.Series(series).ewm(span=period, adjust=False).mean().to_numpy()
+
+
+def _atr(df: pd.DataFrame, period: int = _ATR_PERIOD) -> np.ndarray:
+    """Wilder's ATR. Returns an array same length as df (early values may be NaN)."""
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    close = df["close"].to_numpy()
+    if len(close) < 2:
+        return np.zeros_like(close)
+    prev_c = np.concatenate(([close[0]], close[:-1]))
+    tr = np.maximum.reduce([high - low, np.abs(high - prev_c), np.abs(low - prev_c)])
+    return pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean().to_numpy()
+
+
+def _soft_window(x: float, lo: float, hi: float, *,
+                 falloff: float = 0.5) -> float:
+    """Trapezoidal soft window. Returns 1.0 inside [lo, hi], decays smoothly
+    outside. `falloff` is the fraction of (hi-lo) over which the score drops
+    to ~0 outside the window.
+
+    This replaces hard `if x < lo or x > hi: return 0.0` cliffs. A value just
+    outside the ideal range scores ~0.7-0.9 instead of being deleted.
+    """
+    width = hi - lo
+    if width <= 0:
+        return 0.0
+    if lo <= x <= hi:
+        return 1.0
+    decay = max(width * falloff, 1e-9)
+    if x < lo:
+        d = (lo - x) / decay
+    else:
+        d = (x - hi) / decay
+    return float(np.exp(-d * d))   # gaussian tail beyond the window
+
+
+def _gaussian(x: float, center: float, width: float) -> float:
+    """Gaussian centered at `center`, with characteristic width. Score peaks at 1.0."""
+    if width <= 0:
+        return 0.0
+    d = (x - center) / width
+    return float(np.exp(-d * d))
+
+
+# ─── ATR-scaled zigzag ────────────────────────────────────────────────────────
+
+def _atr_zigzag(df: pd.DataFrame, atr_mult: float = _ATR_ZIGZAG_MULT) -> list[tuple[int, str]]:
+    """Identify swing pivots by ATR-confirmed reversal.
+
+    Walks bars: maintains the latest extreme in the current direction and flips
+    direction only when price reverses by more than k·ATR from that extreme.
+    Returns a list of (index, 'H'|'L') in chronological order.
+
+    This is volatility-adaptive — high-ATR names need larger reversals to count
+    as swings, low-ATR names register tighter swings. Fixed-bar windows miss this.
+    """
+    n = len(df)
+    if n < _ATR_PERIOD + 2:
+        return []
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    atr = _atr(df)
+    pivots: list[tuple[int, str]] = []
+
+    direction = 0           # +1 = looking for higher highs; -1 = lower lows
+    ext_idx = 0
+    ext_price = high[0]
+    for i in range(1, n):
+        thr = atr[i] * atr_mult if np.isfinite(atr[i]) else 0.0
+        if thr <= 0:
+            continue
+        if direction >= 0:
+            # tracking an up-swing — update if higher, flip on enough drop
+            if high[i] >= ext_price:
+                ext_price = high[i]
+                ext_idx = i
+            elif ext_price - low[i] >= thr:
+                pivots.append((ext_idx, "H"))
+                direction = -1
+                ext_price = low[i]
+                ext_idx = i
+        if direction <= 0:
+            # tracking a down-swing — update if lower, flip on enough rise
+            if low[i] <= ext_price:
+                ext_price = low[i]
+                ext_idx = i
+            elif high[i] - ext_price >= thr:
+                pivots.append((ext_idx, "L"))
+                direction = 1
+                ext_price = high[i]
+                ext_idx = i
+
+    # Always close with the running extreme so the most-recent leg is visible
+    if pivots:
+        last_dir = pivots[-1][1]
+        if last_dir == "H":
+            pivots.append((ext_idx, "L"))
+        else:
+            pivots.append((ext_idx, "H"))
+    return pivots
+
+
+# ─── Smoothed swing detection (backward-compatible API) ───────────────────────
 
 def _swing_highs(df: pd.DataFrame, window: int = _SWING_WINDOW) -> list[int]:
-    """Return indices of swing highs (local maxima in `window` bars on each side)."""
-    out: list[int] = []
+    """Swing highs detected on a SMOOTHED high series, then mapped back to the
+    raw bar's index within the window. Removes most gap/spike false swings.
+    """
     n = len(df)
     if n < 2 * window + 1:
-        return out
-    high = df["high"].to_numpy()
+        return []
+    raw_high = df["high"].to_numpy()
+    sm = _smooth(raw_high)
+    out: list[int] = []
     for i in range(window, n - window):
-        if high[i] == high[i - window : i + window + 1].max():
-            out.append(i)
+        if sm[i] == sm[i - window : i + window + 1].max():
+            # Snap to the raw high inside the smoothing window — that's the
+            # true pivot bar (smoothing may shift the peak by 1-2 bars).
+            lo_i = max(0, i - window)
+            hi_i = min(n, i + window + 1)
+            raw_peak = lo_i + int(np.argmax(raw_high[lo_i:hi_i]))
+            if not out or out[-1] != raw_peak:
+                out.append(raw_peak)
     return out
 
 
 def _swing_lows(df: pd.DataFrame, window: int = _SWING_WINDOW) -> list[int]:
-    out: list[int] = []
     n = len(df)
     if n < 2 * window + 1:
-        return out
-    low = df["low"].to_numpy()
+        return []
+    raw_low = df["low"].to_numpy()
+    sm = _smooth(raw_low)
+    out: list[int] = []
     for i in range(window, n - window):
-        if low[i] == low[i - window : i + window + 1].min():
-            out.append(i)
+        if sm[i] == sm[i - window : i + window + 1].min():
+            lo_i = max(0, i - window)
+            hi_i = min(n, i + window + 1)
+            raw_trough = lo_i + int(np.argmin(raw_low[lo_i:hi_i]))
+            if not out or out[-1] != raw_trough:
+                out.append(raw_trough)
     return out
+
+
+# ─── Perceptually Important Points (Chung et al.) ─────────────────────────────
+# PIPs are the n most "visually salient" points on a curve, selected greedily by
+# vertical distance from the line connecting already-chosen neighbours. They are
+# how academic CWH / H&S detectors describe pattern shape independent of length.
+
+def _pip_extract(prices: np.ndarray, n_points: int) -> list[int]:
+    """Extract n perceptually important point INDICES from a price series.
+
+    Greedy: start with endpoints, repeatedly add the point with the largest
+    vertical distance from the line segment between its bracketing PIPs.
+    Returns sorted indices.
+    """
+    n = len(prices)
+    if n < 2 or n_points < 2:
+        return list(range(min(n, max(0, n_points))))
+    if n_points >= n:
+        return list(range(n))
+
+    pips = [0, n - 1]
+    while len(pips) < n_points:
+        best_dist = -1.0
+        best_idx = -1
+        # find segment with point of max vertical distance
+        for a, b in zip(pips[:-1], pips[1:], strict=True):
+            if b - a < 2:
+                continue
+            x = np.arange(a, b + 1, dtype=float)
+            # line between (a, prices[a]) and (b, prices[b])
+            if b == a:
+                continue
+            line = prices[a] + (prices[b] - prices[a]) * (x - a) / (b - a)
+            diffs = np.abs(prices[a:b + 1] - line)
+            local_best = int(np.argmax(diffs))
+            if diffs[local_best] > best_dist:
+                best_dist = float(diffs[local_best])
+                best_idx = a + local_best
+        if best_idx <= 0 or best_idx in pips:
+            break
+        pips.append(best_idx)
+        pips.sort()
+    return pips
+
+
+def _pip_normalize(prices: np.ndarray, idxs: list[int]) -> np.ndarray:
+    """Normalize PIP values to [0, 1] over the local price range so two patterns
+    of different absolute price can be shape-compared."""
+    if not idxs:
+        return np.array([])
+    vals = prices[np.asarray(idxs)]
+    p_min, p_max = float(np.min(vals)), float(np.max(vals))
+    rng = p_max - p_min
+    if rng <= 0:
+        return np.full_like(vals, 0.5, dtype=float)
+    return (vals - p_min) / rng
+
+
+# Template PIPs for a textbook cup-with-handle, 7 points: left-rim, left-slope-down,
+# cup-bottom, right-slope-up, right-rim, handle-low, current. Values are normalized
+# to the [0, 1] price range over the base.
+_CWH_TEMPLATE_PIPS = np.array([
+    1.00,   # left rim (pivot zone top)
+    0.55,   # mid-left descent
+    0.00,   # cup low
+    0.55,   # mid-right ascent
+    0.95,   # right rim (just below left rim)
+    0.75,   # handle low (upper-half of cup)
+    0.90,   # latest price approaching pivot
+])
+
+
+def _pip_match_score(prices: np.ndarray, template: np.ndarray) -> float:
+    """Score 0-1 for how closely a price segment's PIP-shape matches `template`.
+
+    Extracts len(template) PIPs from prices, normalizes both to [0,1], and
+    returns 1 - mean_abs_error (clipped). Length-invariant — handles bases of
+    very different durations naturally.
+    """
+    if len(prices) < len(template) or len(template) < 3:
+        return 0.0
+    idxs = _pip_extract(prices, len(template))
+    if len(idxs) < len(template):
+        return 0.0
+    sample = _pip_normalize(prices, idxs)
+    if sample.size != template.size:
+        return 0.0
+    mae = float(np.mean(np.abs(sample - template)))
+    return float(max(0.0, 1.0 - mae * 1.5))   # mae of 0.67 → score 0
 
 
 # ─── Base / pivot detection ───────────────────────────────────────────────────
@@ -94,17 +323,24 @@ def _swing_lows(df: pd.DataFrame, window: int = _SWING_WINDOW) -> list[int]:
 def _detect_base(df: pd.DataFrame) -> dict | None:
     """Find the most recent meaningful consolidation base.
 
-    Strategy: walk back from the last bar to find the most recent swing high
-    that's near the 52-week high. That high is the candidate pivot. The base
-    is the region between that pivot and now, reaching down to the lowest low
-    in between. Reject if too short, too deep, or trending wrong direction.
+    Strategy:
+      1. Find the most recent swing high within 25% of the 52-week high.
+      2. Group nearby swing highs within ±3% of that bar into a *pivot zone*
+         (Bulkowski: "rims should be near the same price level but be flexible").
+         The pivot price is the mean of the zone's highs — robust to a single
+         spike-bar that's 1% above the rest.
+      3. Base low = min low between earliest zone bar and last bar.
+
+    Soft floors: depth slightly outside [2.5%, 35%] is still returned with a
+    penalty applied downstream — only egregious violations (depth > 50% or
+    < 1%) are hard-rejected. The 12% → 25% widening from 52w high catches
+    textbook bases that form after normal corrections.
     """
     if len(df) < _MIN_BASE_DAYS + _SWING_WINDOW * 2:
         return None
 
     high = df["high"].to_numpy()
     low = df["low"].to_numpy()
-    close = df["close"].to_numpy()
     last_idx = len(df) - 1
 
     high_52w = float(np.max(high[-min(252, len(df)):]))
@@ -112,15 +348,12 @@ def _detect_base(df: pd.DataFrame) -> dict | None:
     if not swing_idxs:
         return None
 
-    # Walk swing highs back; the candidate pivot is the most recent one near
-    # the 52-week high (within 12%) that's at least _MIN_BASE_DAYS old.
+    # Find the most recent swing high near the 52w high
     candidate_idx: int | None = None
     for idx in reversed(swing_idxs):
         if last_idx - idx < _MIN_BASE_DAYS:
             continue
-        pivot_high = float(high[idx])
-        # The pivot must be near recent highs to count as a base
-        if pivot_high < high_52w * 0.85:
+        if float(high[idx]) < high_52w * _BASE_NEAR_52W_PCT:
             continue
         candidate_idx = idx
         break
@@ -128,25 +361,39 @@ def _detect_base(df: pd.DataFrame) -> dict | None:
     if candidate_idx is None:
         return None
 
-    pivot_price = float(high[candidate_idx])
-    base_low = float(np.min(low[candidate_idx : last_idx + 1]))
-    base_length = last_idx - candidate_idx
+    candidate_price = float(high[candidate_idx])
+    # Build the pivot zone: every swing high within ±3% of the candidate.
+    zone_tol = candidate_price * (_PIVOT_ZONE_TOLERANCE_PCT / 100.0)
+    zone_idxs = [
+        idx for idx in swing_idxs
+        if abs(float(high[idx]) - candidate_price) <= zone_tol
+    ]
+    if not zone_idxs:
+        zone_idxs = [candidate_idx]
+
+    earliest_zone_idx = min(zone_idxs)
+    # Pivot price: average of the zone's swing highs (robust to single spike-bars)
+    pivot_price = float(np.mean([high[i] for i in zone_idxs]))
+    base_low = float(np.min(low[earliest_zone_idx : last_idx + 1]))
+    base_length = last_idx - earliest_zone_idx
+    if pivot_price <= 0:
+        return None
     base_depth_pct = (pivot_price - base_low) / pivot_price * 100.0
 
-    # Reject "wide and loose" — Minervini doesn't trade these
-    if base_depth_pct > _MAX_BASE_DEPTH_PCT:
+    # Egregious hard floors only — borderline cases scored softly downstream
+    if base_depth_pct > 50.0:
         return None
-    # Reject impossibly tight — acquisition pinning to an offer price
-    if base_depth_pct < _MIN_BASE_DEPTH_PCT:
+    if base_depth_pct < 1.0:
         return None
 
     return {
-        "pivot_idx": candidate_idx,
+        "pivot_idx": earliest_zone_idx,
         "pivot_price": pivot_price,
         "base_low": base_low,
         "base_high": pivot_price,
         "base_length_days": base_length,
         "base_depth_pct": base_depth_pct,
+        "zone_count": len(zone_idxs),
     }
 
 
@@ -188,237 +435,273 @@ def _classify_buyability(
 
 
 def _score_flat_base(df: pd.DataFrame, base: dict) -> float:
-    """Flat base: 5-15 weeks, depth ≤ 15%, after a prior advance.
+    """Flat base: ~5-15 weeks, shallow depth, after a prior advance.
 
-    The defining quality: tightness. The flatter and tighter, the better.
+    Soft-penalty version — no hard cliffs. Length, depth, and prior advance
+    each contribute a 0-1 score; the worst metric drags the overall score
+    down but doesn't zero it out.
     """
     length = base["base_length_days"]
     depth = base["base_depth_pct"]
 
-    # Length window (5-15 weeks ≈ 25-75 trading days)
-    if length < 25 or length > 75:
-        return 0.0
-    if depth > 15.0:
-        return 0.0
+    # Length: soft window 25-75 bars, gaussian falloff outside (50-bar half-life)
+    length_score = _soft_window(length, lo=25, hi=75, falloff=0.6)
 
-    # Tighter is better. 5% depth = 1.0, 15% = 0.0 linearly
-    depth_score = max(0.0, 1.0 - (depth - 5.0) / 10.0)
-    # Mid-length window is best — not too short, not too long
-    length_score = 1.0 - abs((length - 50) / 50.0) * 0.5
+    # Depth: ideal ~5-12%, gentle falloff beyond. Above 18% the score decays.
+    depth_score = _soft_window(depth, lo=3.0, hi=12.0, falloff=0.7)
 
-    # Require prior advance: 30%+ in the 60 days BEFORE the base
+    # Prior advance: ideal ≥30% in 60 days. Soft penalty below — a 20% advance
+    # still scores ~0.7, a 10% advance ~0.4.
     pivot_idx = base["pivot_idx"]
     if pivot_idx >= 60:
         prior_close_now = float(df["close"].iloc[pivot_idx])
         prior_close_60_back = float(df["close"].iloc[pivot_idx - 60])
-        prior_advance = (prior_close_now - prior_close_60_back) / prior_close_60_back * 100.0
-        if prior_advance < 30.0:
-            return 0.0
-        prior_score = min(1.0, prior_advance / 60.0)  # 60% advance = full credit
+        if prior_close_60_back > 0:
+            prior_advance = (prior_close_now - prior_close_60_back) / prior_close_60_back * 100.0
+        else:
+            prior_advance = 0.0
+        # Sigmoid-ish: 0% → ~0.1, 30% → 0.85, 60% → ~1.0
+        prior_score = float(1.0 / (1.0 + np.exp(-(prior_advance - 15.0) / 12.0)))
     else:
-        prior_score = 0.5
+        prior_score = 0.4
 
-    return float(np.clip(0.4 * depth_score + 0.3 * length_score + 0.3 * prior_score, 0.0, 1.0))
+    return float(np.clip(0.40 * depth_score + 0.30 * length_score + 0.30 * prior_score, 0.0, 1.0))
 
 
 def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
     """Cup-with-Handle: U-shape consolidation with a small downward drift handle.
 
-    Strict definition — the handle is the defining feature. No handle → not a CWH.
-      - 7-65 weeks (35-325 trading days)
-      - Depth 12-35%
-      - Cup low in middle 40% of the base
-      - HANDLE REQUIRED: 5-15% pullback in last 5-15 days, on declining volume,
-        forming a downward-drifting consolidation near the cup's right rim.
+    Soft-penalty version + PIP shape match. Bulkowski says "be flexible" — so
+    handle, depth, symmetry, and right-rim alignment are now all soft. A real
+    CWH with a slightly deep handle or a marginally V-ish cup still scores.
+    The PIP template comparison gives a length-independent shape score.
     """
     length = base["base_length_days"]
     depth = base["base_depth_pct"]
     pivot_idx = base["pivot_idx"]
     last_idx = len(df) - 1
 
-    if length < 35 or length > 325:
-        return 0.0
-    if depth < 12.0 or depth > 35.0:
+    # Soft length window (35-325 bars = 7-65 weeks per Bulkowski)
+    length_score = _soft_window(length, lo=35, hi=325, falloff=0.4)
+    # Soft depth window (Bulkowski 38-62% of prior trend ≈ 15-30% of price typically;
+    # widened to 8-40% with soft falloff)
+    depth_score = _soft_window(depth, lo=8.0, hi=40.0, falloff=0.5)
+    # Bail out if length is clearly wrong (e.g. 10 bars) — saves work
+    if length < 20 or length > 400:
         return 0.0
 
     sub = df.iloc[pivot_idx : last_idx + 1]
-    low_idx_rel = sub["low"].to_numpy().argmin()
-    low_idx = pivot_idx + int(low_idx_rel)
-
-    # Cup symmetry: low must be in middle 30-70% of the base. Otherwise it's
-    # not a U — could be a hockey stick or an inverted-V.
-    cup_position = (low_idx - pivot_idx) / max(length, 1)
-    if cup_position < 0.30 or cup_position > 0.70:
+    if len(sub) < 5:
         return 0.0
-    symmetry_score = 1.0 - abs(cup_position - 0.5) * 2.5
-    symmetry_score = max(0.0, min(1.0, symmetry_score))
+    low_idx_rel = int(sub["low"].to_numpy().argmin())
+    low_idx = pivot_idx + low_idx_rel
 
-    # Need enough bars after the cup low to form a handle
+    # Cup symmetry: ideal low at middle of base; soft penalty for off-center.
+    cup_position = (low_idx - pivot_idx) / max(length, 1)
+    symmetry_score = _gaussian(cup_position, center=0.5, width=0.30)
+
+    # Right side recovery — soft. Full credit at ≥95% of left rim, decays below.
     days_since_low = last_idx - low_idx
-    if days_since_low < 10:
-        return 0.0   # not enough right-side recovery for a handle
-
-    # Right side: must recover to near the cup's left rim (within 10%)
+    if days_since_low < 5:
+        return 0.0   # not enough bars after the low to call it a recovery
     right_side = df.iloc[low_idx : last_idx + 1]
     right_high = float(right_side["high"].max())
-    left_rim   = float(sub["high"].iloc[: min(5, len(sub))].max())
-    if left_rim > 0 and right_high < left_rim * 0.90:
-        return 0.0   # right side didn't recover enough
+    left_rim = float(sub["high"].iloc[: min(8, len(sub))].max())
+    if left_rim <= 0:
+        return 0.0
+    rim_ratio = right_high / left_rim
+    rim_score = float(np.clip((rim_ratio - 0.80) / 0.15, 0.0, 1.0))
 
-    # ── Handle detection (required) ──────────────────────────────────────────
-    # Find the highest point in the right side, then look at the trailing
-    # consolidation: depth 4-15%, lasting 3-15 bars, on declining volume.
-    right_high_rel = right_side["high"].to_numpy().argmax()
-    right_high_idx = low_idx + int(right_high_rel)
+    # Handle: now SOFT. Find the rightmost local high in the right side; the
+    # handle is the trailing window. Missing handle → reduced score, not zero.
+    right_high_rel = int(right_side["high"].to_numpy().argmax())
+    right_high_idx = low_idx + right_high_rel
     handle_bars = last_idx - right_high_idx
-    if handle_bars < 3 or handle_bars > 25:
-        return 0.0   # no clear handle window
 
-    handle = df.iloc[right_high_idx : last_idx + 1]
-    handle_low  = float(handle["low"].min())
-    handle_high = float(handle["high"].max())
-    handle_close = float(handle["close"].iloc[-1])
-    handle_depth = (handle_high - handle_low) / handle_high * 100.0
-    if handle_depth < 4.0 or handle_depth > 15.0:
-        return 0.0   # handle too tight or too deep
+    if handle_bars >= 2:
+        handle = df.iloc[right_high_idx : last_idx + 1]
+        handle_low = float(handle["low"].min())
+        handle_high = float(handle["high"].max())
+        handle_depth = (handle_high - handle_low) / handle_high * 100.0 if handle_high > 0 else 0.0
 
-    # Handle must be in the UPPER half of the cup (not in the lower half — that
-    # would mean the stock retraced back into the cup)
-    cup_low  = float(sub["low"].iloc[low_idx_rel])
-    cup_mid  = (cup_low + right_high) / 2
-    if handle_low < cup_mid:
-        return 0.0   # handle dipped too deep — pattern broken
+        # Handle depth: gaussian centered on 9%, width 6% (so 3-15% gets full credit-ish)
+        handle_depth_score = _gaussian(handle_depth, center=9.0, width=6.0)
+        # Handle bars: gaussian centered ~10, width 8 (3-25 well-supported)
+        handle_bars_score = _gaussian(handle_bars, center=10.0, width=8.0)
 
-    # Volume during handle must be lower than during the cup
-    handle_vol = float(handle["volume"].mean())
-    cup_vol    = float(df.iloc[pivot_idx : right_high_idx]["volume"].mean()) if right_high_idx > pivot_idx else handle_vol
-    if cup_vol > 0 and handle_vol > cup_vol * 1.10:
-        return 0.0   # volume should DRY UP in the handle, not pick up
+        # Handle position: prefer upper half of cup, but degrade smoothly if not
+        cup_low = float(sub["low"].iloc[low_idx_rel])
+        cup_height = right_high - cup_low if right_high > cup_low else 1.0
+        handle_position = (handle_low - cup_low) / cup_height if cup_height > 0 else 0.5
+        handle_pos_score = float(np.clip((handle_position - 0.3) / 0.4, 0.0, 1.0))
 
-    vol_dry_score = max(0.0, min(1.0, (1.0 - handle_vol / cup_vol) * 2.0)) if cup_vol > 0 else 0.5
-    handle_quality = 1.0 - abs(handle_depth - 9.0) / 7.0  # 9% is the sweet spot
-    handle_quality = max(0.0, min(1.0, handle_quality))
+        handle_vol = float(handle["volume"].mean())
+        cup_vol = (float(df.iloc[pivot_idx:right_high_idx]["volume"].mean())
+                   if right_high_idx > pivot_idx else handle_vol)
+        if cup_vol > 0:
+            vol_ratio = handle_vol / cup_vol
+            # Drying = good. ratio of 0.5 → 1.0, ratio of 1.0 → 0.5, 1.3 → 0.1
+            vol_dry_score = float(np.clip(1.5 - vol_ratio, 0.0, 1.0))
+        else:
+            vol_dry_score = 0.5
 
-    depth_score = 1.0 - abs(depth - 22.0) / 13.0
-    return float(np.clip(0.25 * depth_score + 0.25 * symmetry_score + 0.30 * handle_quality + 0.20 * vol_dry_score, 0.0, 1.0))
+        handle_score = (
+            0.35 * handle_depth_score +
+            0.20 * handle_bars_score +
+            0.25 * handle_pos_score +
+            0.20 * vol_dry_score
+        )
+    else:
+        # No handle yet — still a candidate, just downgraded.
+        handle_score = 0.35
+
+    # ── PIP template-match (shape-independent of base length) ─────────────────
+    # Compare the smoothed close curve over the base to the CWH template PIPs.
+    close_arr = df["close"].to_numpy()[pivot_idx : last_idx + 1]
+    smoothed = _smooth(close_arr)
+    pip_score = _pip_match_score(smoothed, _CWH_TEMPLATE_PIPS)
+
+    return float(np.clip(
+        0.15 * length_score +
+        0.15 * depth_score +
+        0.15 * symmetry_score +
+        0.10 * rim_score +
+        0.25 * handle_score +
+        0.20 * pip_score,
+        0.0, 1.0,
+    ))
 
 
 def _score_vcp(df: pd.DataFrame, base: dict) -> float:
     """Volatility Contraction Pattern: successive lower-high contractions.
 
-    Strict definition — requires at least 2 contractions where each is
-    meaningfully tighter than the prior (≤85% of prior depth), AND the
-    most recent contraction is tight (≤8% deep), AND volume has dried up.
+    Soft-penalty version. Uses ATR-confirmed zigzag pivots for contraction
+    detection (volatility-adaptive), and a single contraction is allowed (just
+    scored lower than 2+).
     """
     pivot_idx = base["pivot_idx"]
     last_idx = len(df) - 1
     sub = df.iloc[pivot_idx : last_idx + 1].reset_index(drop=True)
-    if len(sub) < 30:
+    if len(sub) < 25:
         return 0.0
 
-    highs = _swing_highs(sub, window=3)
-    lows = _swing_lows(sub, window=3)
-    if len(highs) < 3 or len(lows) < 3:
+    # Prefer ATR-confirmed pivots, fall back to smoothed swings on short bases.
+    pivots = _atr_zigzag(sub)
+    if len(pivots) < 3:
+        # Fallback: smoothed swings
+        s_highs = _swing_highs(sub, window=3)
+        s_lows = _swing_lows(sub, window=3)
+        # Build alternating sequence by interleaving
+        marked = sorted(
+            [(i, "H") for i in s_highs] + [(i, "L") for i in s_lows],
+            key=lambda x: x[0],
+        )
+        pivots = marked
+
+    if len(pivots) < 3:
         return 0.0
 
-    # Build contraction depths from swing pairs (most recent first)
+    # Build alternating H-L pairs from the pivot sequence
     contractions: list[float] = []
-    h_iter = sorted(highs)
-    l_iter = sorted(lows)
-    for h_idx in reversed(h_iter[-4:]):
-        following = [l for l in l_iter if l > h_idx]
-        if not following:
-            continue
-        l_idx = following[0]
-        h_price = float(sub["high"].iloc[h_idx])
-        l_price = float(sub["low"].iloc[l_idx])
-        depth = (h_price - l_price) / h_price * 100.0
-        contractions.append(depth)
-        if len(contractions) >= 3:
-            break
+    for i in range(len(pivots) - 1):
+        a_idx, a_kind = pivots[i]
+        b_idx, b_kind = pivots[i + 1]
+        if a_kind == "H" and b_kind == "L":
+            h_price = float(sub["high"].iloc[a_idx])
+            l_price = float(sub["low"].iloc[b_idx])
+            if h_price > 0:
+                contractions.append((h_price - l_price) / h_price * 100.0)
+    # Take the last 4 contractions, latest first
+    contractions = contractions[-4:][::-1]
 
-    # Hard requirement: at least 2 contractions to compare
-    if len(contractions) < 2:
+    if not contractions:
         return 0.0
 
-    # Most-recent contraction MUST be meaningfully tighter than the prior.
-    # If the latest contraction isn't tighter, it's not a VCP.
-    if contractions[0] >= contractions[1] * 0.90:
-        return 0.0
+    # Tightness of the latest contraction — gaussian centered on ~4%, generous.
+    # A 10% contraction still scores ~0.5; a 2% scores 1.0.
+    last_depth = contractions[0]
+    tightness_score = _gaussian(last_depth, center=3.0, width=8.0)
 
-    # Most-recent contraction MUST be genuinely tight (≤ 10% depth).
-    # Wider than that and it's not really contracting — it's just a base.
-    if contractions[0] > 10.0:
-        return 0.0
+    # Progression: each successive contraction should be tighter than the prior.
+    # Award partial credit for partial tightening.
+    if len(contractions) >= 2:
+        progression = 0.0
+        for i in range(len(contractions) - 1):
+            prior = contractions[i + 1]
+            curr = contractions[i]
+            if prior <= 0:
+                continue
+            ratio = curr / prior
+            # ratio < 0.75 → 1.0; ratio = 0.85 → 0.6; ratio = 1.0 → 0.2; > 1.1 → 0
+            if ratio <= 0.75:
+                progression += 1.0
+            elif ratio <= 0.85:
+                progression += 0.7
+            elif ratio <= 0.95:
+                progression += 0.4
+            elif ratio <= 1.05:
+                progression += 0.2
+        progression /= max(len(contractions) - 1, 1)
+    else:
+        # Single contraction — partial credit, can't measure progression
+        progression = 0.4
 
-    # Progression score: how many successive tightenings
-    progression = 0.0
-    for i in range(len(contractions) - 1):
-        if contractions[i] < contractions[i + 1] * 0.75:
-            progression += 1.0
-        elif contractions[i] < contractions[i + 1] * 0.85:
-            progression += 0.7
-        elif contractions[i] < contractions[i + 1]:
-            progression += 0.3
-    progression /= max(len(contractions) - 1, 1)
-
-    # Volume must have dried up meaningfully — at least 15% lower than prior
+    # Volume drying — softer than before. ratio of 1.0 → 0.2, 0.7 → 0.85, 0.5 → 1.0.
     if len(sub) >= 40:
         recent_vol = float(sub["volume"].tail(20).mean())
-        prior_vol  = float(sub["volume"].iloc[-40:-20].mean())
-        if prior_vol <= 0:
-            return 0.0
-        vol_ratio = recent_vol / prior_vol
-        if vol_ratio > 0.95:
-            return 0.0   # volume hasn't dried up — not a VCP
-        vol_score = max(0.0, min(1.0, (1.0 - vol_ratio) * 2.5))
+        prior_vol = float(sub["volume"].iloc[-40:-20].mean())
+        if prior_vol > 0:
+            vol_ratio = recent_vol / prior_vol
+            vol_score = float(np.clip(1.5 - vol_ratio, 0.0, 1.0))
+        else:
+            vol_score = 0.3
     else:
-        return 0.0
+        vol_score = 0.4
 
-    last_depth = contractions[0]
-    tightness_score = max(0.0, 1.0 - last_depth / 10.0)  # ≤2% is great, ≥10% is bad
-
-    return float(np.clip(0.45 * progression + 0.30 * tightness_score + 0.25 * vol_score, 0.0, 1.0))
+    return float(np.clip(
+        0.40 * progression + 0.35 * tightness_score + 0.25 * vol_score,
+        0.0, 1.0,
+    ))
 
 
 def _score_high_tight_flag(df: pd.DataFrame) -> tuple[float, dict | None]:
-    """High-Tight Flag: 90-120%+ in 4-8 weeks, then sideways 3-5 weeks within ≤25%.
+    """High-Tight Flag: ~90-120%+ in 4-8 weeks, then sideways 3-5 weeks within ≤25%.
 
-    Bypasses normal base detection — this pattern doesn't form a "base" in the
-    usual sense; it's a tight flag riding a vertical move. Rare but powerful
-    when it works.
+    Soft-penalty version. Thrust < 90% no longer hard-rejects — a 70% thrust
+    still produces a respectable score, just lower. Rare-but-powerful pattern.
     """
     n = len(df)
     if n < 60:
         return (0.0, None)
 
-    close = df["close"].to_numpy()
-
-    # Look at last 15-25 days for the flag (consolidation period)
     flag_lookback = 20
     flag_start_idx = n - flag_lookback
     flag_high = float(df["high"].iloc[flag_start_idx:].max())
     flag_low = float(df["low"].iloc[flag_start_idx:].min())
-    flag_depth_pct = (flag_high - flag_low) / flag_high * 100.0
-    if flag_depth_pct > 25.0:
+    if flag_high <= 0:
         return (0.0, None)
-    if flag_depth_pct < 5.0:
-        # Too tight — probably noise or no real move
+    flag_depth_pct = (flag_high - flag_low) / flag_high * 100.0
+
+    # Egregious-violation early exit only
+    if flag_depth_pct > 40.0:
         return (0.0, None)
 
-    # Prior thrust: 4-8 weeks before the flag, look for 90%+ advance
+    # Soft flag depth: gaussian centered on 12%, width 12 (5-25% well-rewarded)
+    flag_tightness_score = _gaussian(flag_depth_pct, center=12.0, width=12.0)
+
     thrust_window_start = max(0, flag_start_idx - 40)
     thrust_low = float(df["low"].iloc[thrust_window_start:flag_start_idx].min())
     if thrust_low <= 0:
         return (0.0, None)
     thrust_pct = (flag_high - thrust_low) / thrust_low * 100.0
 
-    if thrust_pct < 90.0:
+    # Thrust below 50% is not a HTF — but everything 50-200% scored softly.
+    if thrust_pct < 50.0:
         return (0.0, None)
-    thrust_score = min(1.0, thrust_pct / 150.0)
-    flag_tightness_score = 1.0 - abs(flag_depth_pct - 12.0) / 13.0
+    # Sigmoid: 50% → 0.2, 90% → 0.65, 120% → 0.85, 200% → ~1.0
+    thrust_score = float(1.0 / (1.0 + np.exp(-(thrust_pct - 90.0) / 25.0)))
 
-    quality = float(np.clip(0.6 * thrust_score + 0.4 * flag_tightness_score, 0.0, 1.0))
+    quality = float(np.clip(0.55 * thrust_score + 0.45 * flag_tightness_score, 0.0, 1.0))
     info = {
         "pivot_idx": flag_start_idx + flag_lookback - 1,
         "pivot_price": flag_high,
@@ -433,109 +716,102 @@ def _score_high_tight_flag(df: pd.DataFrame) -> tuple[float, dict | None]:
 def _score_ascending_triangle(df: pd.DataFrame, base: dict) -> float:
     """Ascending Triangle: flat resistance line + rising lows converging toward it.
 
-    Bulkowski rates this as one of the best-performing geometric patterns
-    (~68% upside breakout, avg +40%). The resistance need not be perfect —
-    3+ swing highs within 2% of each other counts.
+    Soft-penalty version. Resistance tightness, rising-lows count, and approach
+    distance each contribute softly.
     """
     pivot_idx = base["pivot_idx"]
     last_idx = len(df) - 1
     sub = df.iloc[pivot_idx : last_idx + 1].reset_index(drop=True)
-    if len(sub) < 30:
+    if len(sub) < 25:
         return 0.0
 
     highs = _swing_highs(sub, window=4)
     lows = _swing_lows(sub, window=4)
-    if len(highs) < 3 or len(lows) < 3:
+    if len(highs) < 2 or len(lows) < 2:
         return 0.0
 
-    # Flat resistance: most recent 3+ swing highs within 2.5% of each other
     recent_highs = [float(sub["high"].iloc[h]) for h in highs[-5:]]
-    if len(recent_highs) < 3:
+    if len(recent_highs) < 2:
         return 0.0
     r_max, r_min = max(recent_highs), min(recent_highs)
-    resistance_tightness = (r_max - r_min) / r_max * 100.0
-    if resistance_tightness > 4.0:
-        return 0.0   # swing highs too scattered — no flat top
+    resistance_tightness = (r_max - r_min) / r_max * 100.0 if r_max > 0 else 100.0
+    # Soft: 0% spread = 1.0, 4% = 0.6, 8% = 0.2
+    resistance_score = float(np.clip(1.0 - resistance_tightness / 8.0, 0.0, 1.0))
 
     resistance_level = (r_max + r_min) / 2.0
-    resistance_score = max(0.0, 1.0 - resistance_tightness / 4.0)
 
-    # Rising lows: each swing low higher than the previous one
     recent_lows = [float(sub["low"].iloc[l]) for l in lows[-4:]]
     if len(recent_lows) < 2:
         return 0.0
-    rising_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i - 1])
-    if rising_count == 0:
-        return 0.0   # lows are not rising
-    rising_score = rising_count / (len(recent_lows) - 1)
+    rising_count = sum(
+        1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i - 1]
+    )
+    rising_score = rising_count / max(len(recent_lows) - 1, 1)
 
-    # Price approaching resistance: current price within 5% below resistance
     current = float(sub["close"].iloc[-1])
-    dist_from_resistance = (resistance_level - current) / resistance_level * 100.0
-    if dist_from_resistance < 0 or dist_from_resistance > 10.0:
-        approach_score = 0.3
+    dist_from_resistance = (resistance_level - current) / resistance_level * 100.0 if resistance_level > 0 else 100.0
+    # Sweet spot 0-8% below resistance; beyond that, soft decay.
+    if -2.0 <= dist_from_resistance <= 8.0:
+        approach_score = 1.0 - abs(dist_from_resistance - 3.0) / 8.0
     else:
-        approach_score = 1.0 - dist_from_resistance / 10.0
+        approach_score = max(0.0, 1.0 - abs(dist_from_resistance - 3.0) / 15.0)
+    approach_score = float(np.clip(approach_score, 0.0, 1.0))
 
-    return float(np.clip(0.35 * resistance_score + 0.40 * rising_score + 0.25 * approach_score, 0.0, 1.0))
+    return float(np.clip(
+        0.35 * resistance_score + 0.40 * rising_score + 0.25 * approach_score,
+        0.0, 1.0,
+    ))
 
 
 def _score_three_weeks_tight(df: pd.DataFrame) -> tuple[float, dict | None]:
-    """Three Weeks Tight (3WT): 3+ consecutive weekly closes within 1.5% of each other.
+    """Three Weeks Tight (3WT): 3+ consecutive weekly closes tightly clustered.
 
-    IBD's favorite setup for stocks pausing after a powerful advance. The tighter
-    the weekly closes, the higher the quality. Often precedes explosive moves.
+    Soft-penalty version. Range > 4% no longer hard-rejects — a 5-6% range still
+    produces a measurable (but lower) score.
     """
     n = len(df)
     if n < 60:
         return (0.0, None)
 
-    # Build weekly bars from daily (ISO week)
-    df_copy = df.copy()
-    df_copy["week"] = pd.to_datetime(df_copy["date"]).dt.isocalendar().week if "date" in df_copy.columns else df_copy.index.map(lambda x: x // 5)
-    # Simpler: group every 5 trading days as a "week"
     closes = df["close"].to_numpy()
-    highs  = df["high"].to_numpy()
-    lows   = df["low"].to_numpy()
+    lows = df["low"].to_numpy()
     n_weeks = n // 5
     if n_weeks < 5:
         return (0.0, None)
 
     weekly_closes = [float(closes[(w + 1) * 5 - 1]) for w in range(n_weeks) if (w + 1) * 5 <= n]
-    weekly_highs  = [float(np.max(highs[w * 5 : (w + 1) * 5])) for w in range(n_weeks) if (w + 1) * 5 <= n]
-    weekly_lows   = [float(np.min(lows[w * 5 : (w + 1) * 5]))  for w in range(n_weeks) if (w + 1) * 5 <= n]
+    weekly_lows = [float(np.min(lows[w * 5:(w + 1) * 5])) for w in range(n_weeks) if (w + 1) * 5 <= n]
 
     if len(weekly_closes) < 5:
         return (0.0, None)
 
-    # Check last 3-4 weeks for tight closes
     tight_window = weekly_closes[-4:]
     wc_max, wc_min = max(tight_window), min(tight_window)
     if wc_min <= 0:
         return (0.0, None)
     range_pct = (wc_max - wc_min) / wc_min * 100.0
 
-    if range_pct > 4.0:
-        return (0.0, None)   # too loose
+    # Egregious cap only
+    if range_pct > 10.0:
+        return (0.0, None)
+    # Soft tightness: 0% → 1.0, 2% → 0.8, 4% → 0.5, 6% → 0.25, 8% → 0.1
+    tightness_score = float(np.exp(-(range_pct / 4.0) ** 2))
 
-    # Prior advance: price should be 15%+ above its level 10 weeks ago
     if len(weekly_closes) >= 12:
         prior_close = weekly_closes[-12]
         advance_pct = (weekly_closes[-4] - prior_close) / prior_close * 100.0 if prior_close > 0 else 0.0
-        if advance_pct < 15.0:
-            return (0.0, None)
-        prior_score = min(1.0, advance_pct / 40.0)
+        # Sigmoid: 0% → 0.1, 15% → 0.55, 30% → 0.85
+        prior_score = float(1.0 / (1.0 + np.exp(-(advance_pct - 12.0) / 8.0)))
     else:
-        prior_score = 0.5
+        prior_score = 0.4
 
-    tightness_score = max(0.0, 1.0 - range_pct / 4.0)
     quality = float(np.clip(0.55 * tightness_score + 0.45 * prior_score, 0.0, 1.0))
 
-    if quality < 0.25:
+    if quality < _QUALITY_FLOOR:
         return (0.0, None)
 
     pivot_price = wc_max
-    base_low    = min(weekly_lows[-4:])
+    base_low = min(weekly_lows[-4:])
     return (quality, {
         "pivot_idx": n - 20,
         "pivot_price": pivot_price,
@@ -547,74 +823,76 @@ def _score_three_weeks_tight(df: pd.DataFrame) -> tuple[float, dict | None]:
 
 
 def _score_bull_flag(df: pd.DataFrame) -> tuple[float, dict | None]:
-    """Bull Flag: a sharp advance (30-100% in 4-8 weeks) followed by an orderly
-    pullback (6-20% over 2-3 weeks) on meaningfully declining volume.
+    """Bull Flag: a sharp advance followed by an orderly pullback on declining volume.
 
-    Strict version — the pole must be SHARP (not a slow grind), the flag must
-    be tight, and volume must contract meaningfully during the consolidation.
+    Soft-penalty version. Pole 20-120%, flag depth 3-25%, retrace ≤50% are all
+    softly bounded with gaussian / sigmoid falloff.
     """
     n = len(df)
     if n < 50:
         return (0.0, None)
 
     close = df["close"].to_numpy()
-    high  = df["high"].to_numpy()
-    low   = df["low"].to_numpy()
-    vol   = df["volume"].to_numpy()
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    vol = df["volume"].to_numpy()
 
-    flag_window = 15  # 3 weeks
-    flag_start  = n - flag_window
-    flag_high   = float(np.max(high[flag_start:]))
-    flag_low    = float(np.min(low[flag_start:]))
-    flag_close  = float(close[-1])
+    flag_window = 15
+    flag_start = n - flag_window
+    flag_high = float(np.max(high[flag_start:]))
+    flag_low = float(np.min(low[flag_start:]))
+    flag_close = float(close[-1])
     if flag_high <= 0:
         return (0.0, None)
 
     flag_depth_pct = (flag_high - flag_low) / flag_high * 100.0
-    # Stricter flag depth: 6-20% (was 3-25%). Below 6% is noise, above 20% is too deep.
-    if flag_depth_pct > 20.0 or flag_depth_pct < 6.0:
+    # Egregious cap only
+    if flag_depth_pct > 35.0:
         return (0.0, None)
+    # Soft flag depth: gaussian centered on 11%, width 10
+    tightness_score = _gaussian(flag_depth_pct, center=11.0, width=10.0)
 
-    # Pole: 30-100% advance in the 4-8 weeks before the flag (stricter than 20-120%)
-    pole_window_end   = flag_start
+    pole_window_end = flag_start
     pole_window_start = max(0, flag_start - 40)
-    pole_low  = float(np.min(low[pole_window_start:pole_window_end]))
+    pole_low = float(np.min(low[pole_window_start:pole_window_end]))
     pole_high = float(np.max(high[pole_window_start:pole_window_end]))
     if pole_low <= 0:
         return (0.0, None)
     pole_advance_pct = (pole_high - pole_low) / pole_low * 100.0
-    if pole_advance_pct < 30.0 or pole_advance_pct > 100.0:
+    if pole_advance_pct < 15.0 or pole_advance_pct > 200.0:
         return (0.0, None)
+    # Sigmoid: 15% → 0.2, 30% → 0.5, 50% → 0.75, 80%+ → ~0.95
+    pole_score = float(1.0 / (1.0 + np.exp(-(pole_advance_pct - 35.0) / 15.0)))
 
-    # The flag should retrace ≤ 38% of the pole (Fibonacci — classic bull-flag)
     if (pole_high - pole_low) <= 0:
         return (0.0, None)
     retrace_pct = (pole_high - flag_low) / (pole_high - pole_low) * 100.0
-    if retrace_pct > 38.0:
-        return (0.0, None)
+    # Soft retrace: ideal ≤38% (Fibonacci), penalize beyond. 25% → 1.0, 38% → 0.85,
+    # 50% → 0.5, 70% → 0.15
+    retrace_score = float(np.clip(1.0 - max(0.0, retrace_pct - 25.0) / 40.0, 0.0, 1.0))
 
-    # Volume must meaningfully contract: flag avg vol ≤ 75% of pole avg vol
     flag_vol = float(np.mean(vol[flag_start:]))
     pole_vol = float(np.mean(vol[pole_window_start:pole_window_end]))
-    if pole_vol <= 0:
-        return (0.0, None)
-    vol_contraction = flag_vol / pole_vol
-    if vol_contraction > 0.75:
-        return (0.0, None)   # volume hasn't dried up enough
+    if pole_vol > 0:
+        vol_contraction = flag_vol / pole_vol
+        vol_score = float(np.clip(1.5 - vol_contraction, 0.0, 1.0))
+    else:
+        vol_score = 0.3
 
-    # Close should be in upper half of the flag (approaching breakout)
-    position_in_flag = (flag_close - flag_low) / (flag_high - flag_low) if (flag_high - flag_low) > 0 else 0.5
-    if position_in_flag < 0.40:
-        return (0.0, None)
+    position_in_flag = ((flag_close - flag_low) / (flag_high - flag_low)
+                       if (flag_high - flag_low) > 0 else 0.5)
+    position_score = float(np.clip(position_in_flag, 0.0, 1.0))
 
-    pole_score       = min(1.0, pole_advance_pct / 60.0)
-    tightness_score  = max(0.0, 1.0 - flag_depth_pct / 18.0)
-    vol_score        = max(0.0, min(1.0, (1.0 - vol_contraction) * 2.0))
-    position_score   = position_in_flag
+    quality = float(np.clip(
+        0.25 * pole_score +
+        0.20 * tightness_score +
+        0.15 * retrace_score +
+        0.20 * vol_score +
+        0.20 * position_score,
+        0.0, 1.0,
+    ))
 
-    quality = float(np.clip(0.30 * pole_score + 0.25 * tightness_score + 0.25 * vol_score + 0.20 * position_score, 0.0, 1.0))
-
-    if quality < 0.35:
+    if quality < _QUALITY_FLOOR:
         return (0.0, None)
 
     return (quality, {
@@ -712,10 +990,11 @@ def detect_pattern(
     candidates.sort(key=lambda x: x[1], reverse=True)
     pattern_type, quality, info = candidates[0]
 
-    if quality < 0.40:
+    if quality < _QUALITY_FLOOR:
         # Even the best match is weak — fall back to base info but no pattern label.
-        # We raised from 0.20 to 0.40: a real pattern should score at least 40/100,
-        # otherwise we're labeling noise as setups.
+        # Lowered from 0.40 → 0.25 to match the soft-penalty regime: with cliffs
+        # removed, the score itself is a meaningful filter and 0.25 catches the
+        # genuinely weak candidates while keeping borderline-textbook setups.
         info = base or info
         if info is None:
             buyability, ext_pct = _classify_buyability(current_price, None, ma_50, ma_200)

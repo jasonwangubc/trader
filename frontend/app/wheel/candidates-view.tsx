@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, ChevronsUpDown, AlertTriangle, ExternalLink } from "lucide-react";
+import { ChevronDown, ChevronUp, ChevronsUpDown, AlertTriangle, ExternalLink, Copy } from "lucide-react";
+import { toast } from "sonner";
 import type { WheelCandidate, CorrelationReport } from "@/lib/wheel";
 import { money, num, pct } from "@/lib/wheel";
 import { API_URL } from "@/lib/api";
@@ -121,6 +122,13 @@ export function CandidatesView({ candidates }: { candidates: WheelCandidate[] })
         <span className="ml-auto text-muted-foreground">
           {sorted.length} of {candidates.length} candidates
         </span>
+        <button
+          onClick={() => copyWheelMarkdown(sorted, strategy, minYield, sectorFilter)}
+          className="border-input hover:bg-muted inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium"
+          title="Copy currently-filtered candidates as a markdown table"
+        >
+          <Copy className="h-3 w-3" /> Copy
+        </button>
       </div>
 
       {/* Basket bar */}
@@ -398,4 +406,33 @@ export function CorrelationReportView({ report }: { report: CorrelationReport })
       )}
     </div>
   );
+}
+
+async function copyWheelMarkdown(
+  rows: WheelCandidate[],
+  strategy: string,
+  minYield: number,
+  sector: string,
+): Promise<void> {
+  const lines: string[] = [];
+  lines.push(`## Wheel candidates (${new Date().toISOString().slice(0, 10)})`);
+  lines.push("");
+  lines.push(`**Filters:** strategy=${strategy} · min annualized yield ≥ ${(minYield * 100).toFixed(0)}% · sector=${sector}`);
+  lines.push(`**Showing:** ${rows.length} candidates`);
+  lines.push("");
+  lines.push(`| Symbol | Strategy | Sector | DTE | Strike | Spot | OTM % | Mid | Premium % | Annualized % | OI | IV | Δ approx | Capital at risk | Score |`);
+  lines.push(`|--------|----------|--------|----:|-------:|-----:|------:|----:|----------:|-------------:|---:|---:|---------:|----------------:|------:|`);
+  for (const c of rows.slice(0, 200)) {
+    const oi = parseInt(String(c.open_interest || 0));
+    lines.push(
+      `| ${c.symbol} | ${c.strategy.toUpperCase()} | ${c.sector || "—"} | ${c.dte} | ${parseFloat(c.strike).toFixed(2)} | ${parseFloat(c.last_price).toFixed(2)} | ${(parseFloat(c.otm_pct) * 100).toFixed(1)}% | ${parseFloat(c.mid).toFixed(2)} | ${(parseFloat(c.premium_yield_pct) * 100).toFixed(2)}% | ${(parseFloat(c.annualized_yield_pct) * 100).toFixed(1)}% | ${oi.toLocaleString()} | ${c.implied_volatility ? (parseFloat(c.implied_volatility) * 100).toFixed(0) + "%" : "—"} | ${c.delta_approx ? parseFloat(c.delta_approx).toFixed(2) : "—"} | $${parseFloat(c.capital_at_risk).toLocaleString("en-US", { maximumFractionDigits: 0 })} | ${parseFloat(String(c.score)).toFixed(1)} |`,
+    );
+  }
+  if (rows.length > 200) lines.push(`\n_…${rows.length - 200} more candidates omitted_`);
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+    toast.success(`Copied ${Math.min(rows.length, 200)} wheel candidates to clipboard`);
+  } catch {
+    toast.error("Couldn't access clipboard");
+  }
 }

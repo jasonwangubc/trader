@@ -13,6 +13,7 @@ Reference: https://www.questrade.com/api/documentation/getting-started
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from app.brokers.base import (
     BrokerBalance,
     BrokerBracketAck,
     BrokerBracketRequest,
+    BrokerExecution,
     BrokerInterface,
     BrokerOpenOrder,
     BrokerOrderAck,
@@ -639,5 +641,156 @@ class QuestradeBroker(BrokerInterface):
                 stop_price=Decimal(str(stop_p))   if stop_p   is not None else None,
                 submitted_at=submitted_at,
                 status=self._map_qt_state(o.get("state", "")),
+            ))
+        return out
+
+    async def get_executions(
+        self,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[BrokerExecution]:
+        """Pull every fill in [start, end] for this account.
+
+        ⚠️ Despite what `startTime`/`endTime` suggest, Questrade's /executions
+        endpoint only retains roughly the last 30 days. For historical backfills,
+        use `get_activities` instead — that endpoint goes back years.
+
+        We keep this around for near-real-time intraday use (per-fill timestamps
+        and exchange execution IDs that activities don't have).
+
+        The Questrade payload uses ISO-8601 with a -05:00 / -04:00 offset
+        depending on DST; we normalize to UTC.
+        """
+        params = {
+            "startTime": start.astimezone(timezone.utc).isoformat(),
+            "endTime":   end.astimezone(timezone.utc).isoformat(),
+        }
+        data = await self._get(f"v1/accounts/{account_id}/executions", **params)
+        out: list[BrokerExecution] = []
+        for ex in data.get("executions", []):
+            ts_str = ex.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_utc = ts.astimezone(timezone.utc)
+            except Exception:
+                continue
+            symbol = ex.get("symbol") or ""
+            qty_raw = ex.get("quantity")
+            price_raw = ex.get("price")
+            if qty_raw is None or price_raw is None or not symbol:
+                continue
+            # Total fees = explicit commission + execution + sec + canadian fees + placement
+            commission = (
+                self._dec(ex.get("commission")) +
+                self._dec(ex.get("executionFee")) +
+                self._dec(ex.get("secFee")) +
+                self._dec(ex.get("canadianExecutionFee")) +
+                self._dec(ex.get("orderPlacementCommission"))
+            )
+            out.append(BrokerExecution(
+                broker_execution_id=str(ex.get("id", "")),
+                broker_order_id=str(ex.get("orderId", "")) if ex.get("orderId") else None,
+                account_id=account_id,
+                symbol=symbol,
+                currency=_infer_currency(symbol),
+                side=(ex.get("side") or "").lower(),  # "buy" | "sell"
+                quantity=Decimal(str(qty_raw)),
+                price=Decimal(str(price_raw)),
+                commission=commission,
+                executed_at=ts_utc,
+                venue=ex.get("venue"),
+                raw=ex,
+            ))
+        return out
+
+    async def get_activities(
+        self,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[BrokerExecution]:
+        """Pull Trade-type activities in [start, end] for this account.
+
+        Unlike /executions (which has ~30-day retention regardless of
+        startTime), /activities goes back to account opening. This is the
+        canonical historical source.
+
+        Trade-offs vs /executions:
+          • Date precision only (Questrade returns tradeDate at midnight,
+            no intra-day time). FIFO matching only needs chronological order
+            within a day so this is fine for the journal use case.
+          • No stable execution id — we synthesize one by SHA-1 hashing the
+            trade fields. Collision risk is negligible in practice (two
+            identical-priced fills on the same calendar day for the same
+            symbol with identical descriptions).
+
+        Activities also include Dividends, Deposits, FX, etc. — we filter
+        to type='Trades'. Quantities in activities are sometimes signed
+        (negative for sells); we take abs() and trust `action` for side.
+        Commissions arrive negative (cost); we store as positive.
+        """
+        params = {
+            "startTime": start.astimezone(timezone.utc).isoformat(),
+            "endTime":   end.astimezone(timezone.utc).isoformat(),
+        }
+        data = await self._get(f"v1/accounts/{account_id}/activities", **params)
+        out: list[BrokerExecution] = []
+        for a in data.get("activities", []):
+            if a.get("type") != "Trades":
+                continue
+            ts_str = a.get("tradeDate")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_utc = ts.astimezone(timezone.utc)
+            except Exception:
+                continue
+
+            symbol = a.get("symbol") or ""
+            if not symbol:
+                continue
+            action = (a.get("action") or "").lower()
+            if action not in ("buy", "sell"):
+                continue
+
+            qty_raw = a.get("quantity")
+            price_raw = a.get("price")
+            if qty_raw is None or price_raw is None:
+                continue
+            try:
+                qty = abs(Decimal(str(qty_raw)))
+                price = Decimal(str(price_raw))
+            except Exception:
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+
+            commission = abs(self._dec(a.get("commission")))
+
+            # Synthetic dedup id — stable across re-syncs of the same window.
+            key_input = (
+                f"{account_id}|{ts_utc.isoformat()}|{symbol}|{action}|"
+                f"{qty}|{price}|{a.get('grossAmount', '')}|"
+                f"{(a.get('description') or '')[:60]}"
+            )
+            synthetic_id = "act_" + hashlib.sha1(key_input.encode()).hexdigest()[:40]
+
+            out.append(BrokerExecution(
+                broker_execution_id=synthetic_id,
+                broker_order_id=None,   # activities don't carry orderId
+                account_id=account_id,
+                symbol=symbol,
+                currency=a.get("currency") or _infer_currency(symbol),
+                side=action,
+                quantity=qty,
+                price=price,
+                commission=commission,
+                executed_at=ts_utc,
+                venue=None,
+                raw=a,
             ))
         return out

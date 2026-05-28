@@ -14,7 +14,7 @@ import io
 from fastapi.responses import StreamingResponse
 
 from app.brokers.registry import get_broker
-from app.db.models import Account, Fill, Order, OrderIntent, Position, Ticket, TicketStatus
+from app.db.models import Account, BrokerTrade, Fill, Order, OrderIntent, Position, Ticket, TicketStatus
 from app.db.session import get_session
 from app.api.auth import get_user_id
 from app.services.accounts_service import get_household_equity
@@ -534,6 +534,211 @@ async def summary(
         by_setup=by_setup,
         by_month=by_month,
         equity_curve=equity_curve,
+    )
+
+
+# ── Broker-truth journal (from broker_trades, includes manual fills) ─────────
+
+
+class BrokerJournalRow(BaseModel):
+    symbol: str
+    currency: str
+    shares: float
+    avg_entry_price: float
+    avg_exit_price: float
+    entry_date: str
+    exit_date: str
+    hold_days: int
+    realized_pnl: float
+    realized_pnl_pct: float | None
+    r_multiple: float | None
+    setup_type: str
+    is_managed: bool          # has linked ticket
+    ticket_id: str | None
+    account_type: str | None
+
+
+class BrokerJournalSummary(BaseModel):
+    total_trades: int
+    wins: int
+    losses: int
+    scratches: int
+    win_rate: float
+    avg_pnl_winner: float    # mean $ P&L of winners (currency-mixed if cross-currency)
+    avg_pnl_loser: float
+    expectancy_dollars: float
+    profit_factor: float
+    total_realized_pnl_by_ccy: dict[str, float]
+    avg_hold_days: float
+    managed_count: int          # trades linked to tickets
+    manual_count: int           # trades with no ticket — i.e. you placed them outside the app
+
+    # R-multiple stats only for trades where we have a stop (linked ticket)
+    r_trades_count: int
+    avg_r: float
+    total_r: float
+
+    by_setup: list[SetupBreakdown]
+    by_month: list[MonthBreakdown]
+    equity_curve: list[dict]    # cumulative $ P&L (sum across currencies — note in UI)
+    trades: list[BrokerJournalRow]
+
+
+@router.get("/broker-summary", response_model=BrokerJournalSummary)
+async def broker_summary(
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> BrokerJournalSummary:
+    """Journal computed from authoritative broker fills (BrokerTrade table).
+
+    This is the source-of-truth view that includes every manual trade you placed
+    at Questrade — not just the ones that came from in-app tickets. R-multiples
+    are only populated for trades reconciled to a ticket that had a stop.
+    """
+    trades_q = await session.execute(
+        select(BrokerTrade)
+        .where(BrokerTrade.user_id == user_id)
+        .order_by(BrokerTrade.exit_date.asc())
+    )
+    trades = trades_q.scalars().all()
+
+    # Account-type lookup
+    accounts_q = await session.execute(
+        select(Account).where(Account.user_id == user_id)
+    )
+    acct_type_by_id = {a.id: a.type for a in accounts_q.scalars().all()}
+
+    n = len(trades)
+    if n == 0:
+        return BrokerJournalSummary(
+            total_trades=0, wins=0, losses=0, scratches=0,
+            win_rate=0.0, avg_pnl_winner=0.0, avg_pnl_loser=0.0,
+            expectancy_dollars=0.0, profit_factor=0.0,
+            total_realized_pnl_by_ccy={}, avg_hold_days=0.0,
+            managed_count=0, manual_count=0,
+            r_trades_count=0, avg_r=0.0, total_r=0.0,
+            by_setup=[], by_month=[], equity_curve=[], trades=[],
+        )
+
+    wins = [t for t in trades if t.realized_pnl > 0]
+    losses = [t for t in trades if t.realized_pnl < 0]
+    scratches = [t for t in trades if t.realized_pnl == 0]
+
+    pnl_by_ccy: dict[str, float] = {}
+    for t in trades:
+        pnl_by_ccy[t.currency] = pnl_by_ccy.get(t.currency, 0.0) + float(t.realized_pnl)
+
+    avg_winner = sum(float(t.realized_pnl) for t in wins) / len(wins) if wins else 0.0
+    avg_loser  = sum(float(t.realized_pnl) for t in losses) / len(losses) if losses else 0.0
+    win_rate   = len(wins) / n
+    expectancy = win_rate * avg_winner + (1 - win_rate) * avg_loser
+
+    gross_wins = sum(float(t.realized_pnl) for t in wins)
+    gross_loss = abs(sum(float(t.realized_pnl) for t in losses))
+    profit_factor = (gross_wins / gross_loss) if gross_loss > 0 else (float("inf") if gross_wins > 0 else 0.0)
+
+    avg_hold = sum(t.hold_days for t in trades) / n if n else 0.0
+
+    managed = sum(1 for t in trades if t.ticket_id is not None)
+    manual = n - managed
+
+    r_trades = [t for t in trades if t.r_multiple is not None]
+    avg_r = (sum(float(t.r_multiple) for t in r_trades) / len(r_trades)) if r_trades else 0.0
+    total_r = sum(float(t.r_multiple) for t in r_trades) if r_trades else 0.0
+
+    # By setup
+    from collections import defaultdict
+    by_setup_map: dict[str, list[BrokerTrade]] = defaultdict(list)
+    for t in trades:
+        by_setup_map[t.setup_type or "manual"].append(t)
+    by_setup: list[SetupBreakdown] = []
+    for st, ts in sorted(by_setup_map.items()):
+        s_wins = [x for x in ts if x.realized_pnl > 0]
+        s_loss = [x for x in ts if x.realized_pnl < 0]
+        s_sc   = [x for x in ts if x.realized_pnl == 0]
+        r_vals = [float(x.r_multiple) for x in ts if x.r_multiple is not None]
+        by_setup.append(SetupBreakdown(
+            setup_type=st,
+            trades=len(ts),
+            wins=len(s_wins),
+            losses=len(s_loss),
+            scratches=len(s_sc),
+            win_rate=len(s_wins) / len(ts) if ts else 0.0,
+            avg_r=(sum(r_vals) / len(r_vals)) if r_vals else 0.0,
+            total_r=round(sum(r_vals), 2),
+        ))
+
+    # By month
+    by_month_map: dict[str, list[BrokerTrade]] = defaultdict(list)
+    for t in trades:
+        by_month_map[t.exit_date.strftime("%Y-%m")].append(t)
+    by_month: list[MonthBreakdown] = []
+    for month in sorted(by_month_map.keys()):
+        ts = by_month_map[month]
+        m_wins = [x for x in ts if x.realized_pnl > 0]
+        r_vals = [float(x.r_multiple) for x in ts if x.r_multiple is not None]
+        by_month.append(MonthBreakdown(
+            month=month,
+            trades=len(ts),
+            win_rate=len(m_wins) / len(ts) if ts else 0.0,
+            avg_r=(sum(r_vals) / len(r_vals)) if r_vals else 0.0,
+            total_r=round(sum(r_vals), 2),
+        ))
+
+    # Equity curve in dollars (cross-currency sum — UI should warn if mixed)
+    cumulative = 0.0
+    equity_curve: list[dict] = []
+    for t in trades:
+        cumulative += float(t.realized_pnl)
+        equity_curve.append({
+            "date": t.exit_date.strftime("%Y-%m-%d"),
+            "symbol": t.symbol,
+            "pnl": round(float(t.realized_pnl), 2),
+            "cumulative_pnl": round(cumulative, 2),
+        })
+
+    rows = [
+        BrokerJournalRow(
+            symbol=t.symbol,
+            currency=t.currency,
+            shares=float(t.shares),
+            avg_entry_price=float(t.avg_entry_price),
+            avg_exit_price=float(t.avg_exit_price),
+            entry_date=t.entry_date.strftime("%Y-%m-%d"),
+            exit_date=t.exit_date.strftime("%Y-%m-%d"),
+            hold_days=t.hold_days,
+            realized_pnl=float(t.realized_pnl),
+            realized_pnl_pct=float(t.realized_pnl_pct) if t.realized_pnl_pct is not None else None,
+            r_multiple=float(t.r_multiple) if t.r_multiple is not None else None,
+            setup_type=t.setup_type or "manual",
+            is_managed=t.ticket_id is not None,
+            ticket_id=str(t.ticket_id) if t.ticket_id else None,
+            account_type=acct_type_by_id.get(t.account_id),
+        )
+        for t in reversed(trades)   # newest first for UI
+    ][:500]
+
+    return BrokerJournalSummary(
+        total_trades=n,
+        wins=len(wins),
+        losses=len(losses),
+        scratches=len(scratches),
+        win_rate=round(win_rate, 4),
+        avg_pnl_winner=round(avg_winner, 2),
+        avg_pnl_loser=round(avg_loser, 2),
+        expectancy_dollars=round(expectancy, 2),
+        profit_factor=round(profit_factor, 3) if profit_factor != float("inf") else 999.0,
+        total_realized_pnl_by_ccy={k: round(v, 2) for k, v in pnl_by_ccy.items()},
+        avg_hold_days=round(avg_hold, 1),
+        managed_count=managed,
+        manual_count=manual,
+        r_trades_count=len(r_trades),
+        avg_r=round(avg_r, 3),
+        total_r=round(total_r, 2),
+        by_setup=by_setup,
+        by_month=by_month,
+        equity_curve=equity_curve,
+        trades=rows,
     )
 
 

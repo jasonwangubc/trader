@@ -2,6 +2,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api, ApiError } from "@/lib/api";
 import { type JournalSummary } from "@/lib/screener";
 import { fmtMoney } from "@/lib/tickets";
+import { JournalTabs } from "./tabs";
 
 export const metadata = { title: 'Journal' };
 
@@ -66,16 +67,18 @@ export default async function JournalPage() {
         </div>
       )}
 
-      {data && data.total_trades === 0 && (
-        <Card>
-          <CardContent className="text-muted-foreground py-16 text-center text-sm">
-            No closed trades yet. Close a filled ticket to start your journal.
-          </CardContent>
-        </Card>
-      )}
-
-      {data && data.total_trades > 0 && (
-        <div className="space-y-6">
+      <JournalTabs ticketView={
+        <>
+          {data && data.total_trades === 0 && (
+            <Card>
+              <CardContent className="text-muted-foreground py-16 text-center text-sm">
+                No closed tickets yet. Close a filled ticket to populate this view, or use the
+                <strong> From broker</strong> tab to see all your real trades.
+              </CardContent>
+            </Card>
+          )}
+          {data && data.total_trades > 0 && (
+            <div className="space-y-6">
           {/* Summary stats */}
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard label="Trades" value={String(data.total_trades)} />
@@ -219,6 +222,8 @@ export default async function JournalPage() {
           )}
         </div>
       )}
+        </>
+      } />
     </main>
   );
 }

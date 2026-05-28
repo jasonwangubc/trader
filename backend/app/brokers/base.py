@@ -106,6 +106,27 @@ class BrokerOpenOrder:
 
 
 @dataclass(frozen=True)
+class BrokerExecution:
+    """One fill at the broker, regardless of source (manual UI, system-placed, mobile).
+
+    This is the journal source-of-truth: every trade you actually did, including
+    the ones you placed by hand outside our ticket system.
+    """
+    broker_execution_id: str          # unique fill id at the broker (dedup key)
+    broker_order_id: str | None       # parent order id (links to BrokerOpenOrder / our orders)
+    account_id: str
+    symbol: str
+    currency: str
+    side: str                         # "buy" | "sell"
+    quantity: Decimal                 # Questrade can report fractional in some products
+    price: Decimal
+    commission: Decimal               # total per-fill cost (commission + fees)
+    executed_at: datetime             # UTC
+    venue: str | None = None
+    raw: dict | None = None           # full broker payload for forensics
+
+
+@dataclass(frozen=True)
 class BrokerQuote:
     symbol: str
     last: Decimal
@@ -169,5 +190,37 @@ class BrokerInterface(ABC):
 
         Default: empty list — useful for paper or limited brokers that don't
         expose order listing. Real broker implementations should override.
+        """
+        return []
+
+    async def get_executions(
+        self,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[BrokerExecution]:
+        """Return every fill in [start, end] for this account, regardless of source.
+
+        Brokers without an executions endpoint should return [] — the sync
+        service will treat that as "no history available". Real brokers should
+        override.
+
+        Note: Questrade's /executions has ~30-day retention. For historical
+        backfills, prefer `get_activities` if the broker provides one.
+        """
+        return []
+
+    async def get_activities(
+        self,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[BrokerExecution]:
+        """Return every Trade-type activity in [start, end] for this account.
+
+        For Questrade this hits /v1/accounts/:id/activities and filters to
+        Trades; goes back to account opening (unlike /executions). Brokers
+        without an activities concept should leave this returning [] and rely
+        on get_executions.
         """
         return []

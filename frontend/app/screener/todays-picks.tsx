@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Plus, ExternalLink, Sparkles, TrendingUp, Eye } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus, ExternalLink, Sparkles, TrendingUp, Eye, Copy } from "lucide-react";
+import { toast } from "sonner";
 import { API_URL } from "@/lib/api";
 import type { ScoreResult } from "@/lib/screener";
 import { ExpandedDetails } from "./results-table";
@@ -107,12 +108,21 @@ export function TodaysPicks() {
         </div>
         <div className="flex items-center gap-3">
           {!collapsed && (
-            <button
-              onClick={toggleAll}
-              className="text-xs text-muted-foreground hover:text-foreground"
-            >
-              {allExpanded ? "Collapse all" : "Expand all"}
-            </button>
+            <>
+              <button
+                onClick={() => copyPicksMarkdown(picks)}
+                className="border-input hover:bg-muted inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium"
+                title="Copy all picks (S/A/B tiers) as markdown — pastes nicely into chat"
+              >
+                <Copy className="h-3 w-3" /> Copy
+              </button>
+              <button
+                onClick={toggleAll}
+                className="text-xs text-muted-foreground hover:text-foreground"
+              >
+                {allExpanded ? "Collapse all" : "Expand all"}
+              </button>
+            </>
           )}
           <button
             onClick={() => setCollapsed(c => !c)}
@@ -302,4 +312,53 @@ function PickCard({
       )}
     </div>
   );
+}
+
+async function copyPicksMarkdown(picks: PicksOut): Promise<void> {
+  const lines: string[] = [];
+  const fmtDate = picks.as_of ? new Date(picks.as_of).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "—";
+  lines.push(`## Screener — Today's picks (as of ${fmtDate})`);
+  lines.push("");
+  const counts = `Tier S: ${picks.tier_s.length} · Tier A: ${picks.tier_a.length} · Tier B: ${picks.tier_b.length}`;
+  lines.push(`**Counts:** ${counts}`);
+  lines.push("");
+  lines.push(`_${picks.note}_`);
+  lines.push("");
+
+  for (const [label, rows] of [["S", picks.tier_s], ["A", picks.tier_a], ["B", picks.tier_b]] as const) {
+    if (rows.length === 0) continue;
+    lines.push(`### Tier ${label} (${rows.length})`);
+    lines.push(`| Symbol | Sector | Pattern | Quality | Buyability | Pivot | Ext % | Last | Composite | EPS rank | RS rank | Accel earnings | Reason |`);
+    lines.push(`|--------|--------|---------|--------:|-----------:|------:|------:|-----:|----------:|---------:|--------:|---------------:|--------|`);
+    for (const p of rows) {
+      const pivot = p.pivot_price !== null ? parseFloat(p.pivot_price).toFixed(2) : "—";
+      const last = p.last_close !== null ? parseFloat(p.last_close).toFixed(2) : "—";
+      const ext = p.extension_pct !== null ? `${parseFloat(p.extension_pct).toFixed(1)}%` : "—";
+      const pattern = prettyPatternName(p.pattern_type);
+      lines.push(`| ${p.symbol} | ${p.sector || "—"} | ${pattern} | ${p.pattern_quality.toFixed(0)} | ${p.buyability} | ${pivot} | ${ext} | ${last} | ${p.composite_score.toFixed(1)} | ${p.eps_rank ?? "—"} | ${p.rs_rank ?? "—"} | ${p.accelerating ? "✓" : "—"} | ${p.reason} |`);
+    }
+    lines.push("");
+  }
+
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+    const total = picks.tier_s.length + picks.tier_a.length + picks.tier_b.length;
+    toast.success(`Copied ${total} picks (3 tiers) to clipboard`);
+  } catch {
+    toast.error("Couldn't access clipboard");
+  }
+}
+
+function prettyPatternName(p: string | null): string {
+  if (!p) return "—";
+  const map: Record<string, string> = {
+    high_tight_flag: "HTF",
+    ascending_triangle: "Asc Triangle",
+    cwh: "Cup w/Handle",
+    vcp: "VCP",
+    flat_base: "Flat base",
+    three_weeks_tight: "3 Weeks Tight",
+    bull_flag: "Bull flag",
+  };
+  return map[p] ?? p;
 }

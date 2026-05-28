@@ -605,6 +605,171 @@ class TrailingAction(Base, TimestampMixin):
     ticket: Mapped["Ticket"] = relationship(backref="trailing_actions")
 
 
+class BacktestSignalScan(Base):
+    """One execution of the heavy Phase-1 signal scan over the symbol universe.
+
+    A scan is a snapshot of every (symbol, bar) where the pattern detector
+    found anything — independent of the trade-simulation parameters (stop,
+    target, time-stop, thresholds). Cheap parameter sweeps reuse the same
+    scan by filtering the candidates and re-running Phase-2 trade simulation.
+
+    Status lifecycle: running → success | failed. Stale "running" rows older
+    than a few hours can be safely ignored (no crash recovery in v1).
+    """
+    __tablename__ = "backtest_signal_scans"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    lookback_days: Mapped[int] = mapped_column(Integer, index=True)
+    symbols_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="running", index=True)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BacktestSignalCandidate(Base):
+    """One pattern-match bar from a scan. Phase-2 (trade sim) filters these by
+    threshold and walks the bars forward to compute outcomes.
+
+    Cached regardless of pattern_quality / tt_score so sweeps over those
+    thresholds don't require re-scanning. ATR snapshot at the signal bar is
+    stored so we don't recompute it during stop calc.
+    """
+    __tablename__ = "backtest_signal_candidates"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    scan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("backtest_signal_scans.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    signal_date: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    bar_index: Mapped[int] = mapped_column(Integer)   # position within the symbol's loaded bar series
+
+    tt_score: Mapped[int] = mapped_column(Integer)
+    vcp_score: Mapped[Decimal] = mapped_column(Numeric(4, 3))
+    pattern_type: Mapped[str] = mapped_column(String(24))
+    pattern_quality: Mapped[Decimal] = mapped_column(Numeric(4, 3))
+    buyability: Mapped[str] = mapped_column(String(16))
+    pivot_price: Mapped[Decimal] = mapped_column(_money)
+    atr_at_signal: Mapped[Decimal] = mapped_column(_money)
+
+    __table_args__ = (
+        Index("ix_backtest_candidates_scan_symbol", "scan_id", "symbol"),
+    )
+
+
+class BrokerExecution(Base):
+    """Raw fill from the broker, regardless of source (manual UI, system-placed, mobile).
+
+    This is the authoritative record of every trade that actually happened in
+    the brokerage account. Stored verbatim and never edited — the FIFO matcher
+    derives BrokerTrade rows from these.
+
+    Dedup key: (user_id, broker_execution_id). Re-syncing the same window is
+    idempotent.
+    """
+    __tablename__ = "broker_executions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+
+    broker_execution_id: Mapped[str] = mapped_column(String(64), index=True)
+    broker_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    currency: Mapped[str] = mapped_column(String(3))
+    side: Mapped[str] = mapped_column(String(8))     # "buy" | "sell"
+    quantity: Mapped[Decimal] = mapped_column(_qty)
+    price: Mapped[Decimal] = mapped_column(_money)
+    commission: Mapped[Decimal] = mapped_column(_money, default=Decimal(0))
+    executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    venue: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    raw: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "broker_execution_id", name="uq_broker_exec_user_id"),
+        Index("ix_broker_exec_user_symbol_time", "user_id", "symbol", "executed_at"),
+    )
+
+
+class BrokerTrade(Base, TimestampMixin):
+    """Derived round-trip trade: one row per sell execution, FIFO-matched to
+    its source buy lot(s).
+
+    Built by services.broker_history_service.rebuild_trades_for_user from the
+    immutable BrokerExecution rows. Re-runnable: deletes and rebuilds.
+
+    A "trade" here is the smallest meaningful unit a journal cares about: how
+    much you closed at one moment, what you paid for those shares originally,
+    the P&L, and how long you held them. Scale-outs naturally appear as
+    multiple trades on the same symbol.
+    """
+    __tablename__ = "broker_trades"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    currency: Mapped[str] = mapped_column(String(3))
+    shares: Mapped[Decimal] = mapped_column(_qty)              # qty closed in this round-trip
+    avg_entry_price: Mapped[Decimal] = mapped_column(_money)   # weighted by per-lot qty
+    avg_exit_price: Mapped[Decimal] = mapped_column(_money)
+    entry_commission: Mapped[Decimal] = mapped_column(_money, default=Decimal(0))  # allocated portion
+    exit_commission: Mapped[Decimal] = mapped_column(_money, default=Decimal(0))
+
+    entry_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    exit_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    hold_days: Mapped[int] = mapped_column(Integer, default=0)
+
+    realized_pnl: Mapped[Decimal] = mapped_column(_money)      # in trade currency, net of commissions
+    realized_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    r_multiple: Mapped[Decimal | None] = mapped_column(Numeric(8, 3), nullable=True)  # if a stop is known
+
+    # Reconciliation
+    ticket_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    setup_type: Mapped[str] = mapped_column(String(32), default=SetupType.MANUAL.value)
+    close_reason_tag: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+
+    # Traceability — execution ids that contributed to this round-trip
+    entry_execution_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    exit_execution_ids: Mapped[list] = mapped_column(JSONB, default=list)
+
+    __table_args__ = (
+        Index("ix_broker_trades_user_exit", "user_id", "exit_date"),
+        Index("ix_broker_trades_user_symbol", "user_id", "symbol"),
+    )
+
+
+class BrokerSyncState(Base):
+    """Per-account high-water mark for incremental execution sync."""
+    __tablename__ = "broker_sync_state"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    last_synced_through: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_status: Mapped[str] = mapped_column(String(16), default="idle")  # idle | running | success | failed
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "account_id", name="uq_broker_sync_user_account"),
+    )
+
+
 class AuditLog(Base):
     """Append-only event log. Every state change in the system goes here."""
     __tablename__ = "audit_log"
