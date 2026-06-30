@@ -1,18 +1,19 @@
 # SaaS Roadmap
 
-This document outlines what needs to change to go from a personal single-user tool
-to a multi-tenant product that other traders can subscribe to.
+This document outlines what needs to change to go from a self-hosted tool
+to a cloud multi-tenant product that other traders can subscribe to.
 
-## Current architecture (personal use)
+## Current architecture (self-hosted)
 
-- Single Questrade account, credentials in `.env`
-- No authentication — anyone with the URL has full access
-- All data in one Postgres schema, no user isolation
-- Runs locally on one machine
+- Multi-user auth via Clerk; per-user Questrade tokens stored in the DB
+- Every query scoped to the Clerk `user_id` — full row-level isolation
+- Runs self-hosted on one machine (FastAPI + Next.js + Postgres in Docker)
+- No cloud deployment, in-app Questrade OAuth, or billing yet
 
-## Phase 1 — Authentication + multi-user data isolation
+## Phase 1 — Authentication + multi-user data isolation ✅ Shipped
 
-**Effort: ~2-3 weeks**
+**Effort: ~2-3 weeks** · *Done — Clerk auth, per-user Questrade tokens, and
+`user_id` row-level isolation are live. Steps below kept for reference.*
 
 ### 1a. Add authentication
 

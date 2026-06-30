@@ -3,7 +3,7 @@
 Personal trading discipline tool — a behavioral-enforcement layer over Questrade.
 Pre-trade tickets · breakout monitor · auto stops · trailing exits · S&P/TSX/NASDAQ screener · journal · covered-call / cash-secured-put income · multi-user (Clerk).
 
-Working name. Single-binary deployment for now; multi-tenant SaaS path laid out in [SAAS_ROADMAP.md](SAAS_ROADMAP.md).
+Working name. Runs self-hosted on a single machine for now (FastAPI + Next.js + Postgres); the cloud multi-tenant SaaS path is laid out in [SAAS_ROADMAP.md](SAAS_ROADMAP.md).
 
 ## What it does
 
