@@ -157,11 +157,19 @@ class PortfolioResult:
 _TIER_RANK = {"S": 0, "A": 1, "B": 2, "": 3}
 
 
+_TIER_S_PATTERNS_BACKTEST = ("bull_flag", "three_weeks_tight", "ascending_triangle", "high_tight_flag")
+
+
 def _classify_tier(pattern_type: str, buyability: str, quality: float) -> str:
     """Same rules as backtest_service._classify_tier — duplicated to avoid
-    circular import. Keep in sync."""
+    circular import. Keep in sync.
+
+    Same caveats as backtest_service: doesn't apply the live screener's
+    RS-rank gate (no historical RS in cache) or accelerating-earnings filter.
+    Backtest tier counts are upper-bound vs what live screener surfaces.
+    """
     if buyability == "at_pivot":
-        if pattern_type in ("high_tight_flag", "ascending_triangle") and quality >= 0.50:
+        if pattern_type in _TIER_S_PATTERNS_BACKTEST and quality >= 0.50:
             return "S"
         if quality >= 0.60:
             return "A"

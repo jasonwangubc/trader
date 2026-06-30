@@ -552,17 +552,63 @@ def _pick_row(r: ScreenerScore, tier: str) -> PickRow:
     )
 
 
+# Tier eligibility rules — revised 2026-05-28 based on backtest evidence:
+#   1. Hard RS-rank gate per tier. Backtest showed financials and other
+#      low-momentum names dominate the picks because they easily satisfy
+#      geometric pattern criteria. Requiring RS ≥ 70-85 selects for actual
+#      market leaders — Minervini orthodoxy.
+#   2. Tier S premium-pattern set widened. Backtest showed HTF (the
+#      previous S-tier headliner) was actually the worst pattern by
+#      batting avg (30%) and total $. Bull Flag and 3 Weeks Tight were
+#      the standout per-trade performers. So Tier S now requires one of
+#      {bull_flag, three_weeks_tight, ascending_triangle, high_tight_flag},
+#      with HTF kept in only because its win/loss ratio (2.35×) is real
+#      when it does work — just rare.
+#   3. Tier B's framing changed from "watch for breakout" to "highest
+#      per-trade returns historically — set buy-stops at pivot." The
+#      backtest data showed Tier B (in_base) at +0.24R/trade vs S +0.10R
+#      and A +0.15R, because the breakout filter at the pivot self-selects
+#      for genuine momentum.
+#   4. Sector concentration cap per tier (max 3) to prevent any one
+#      sector dominating the limited picks slots.
+
+_TIER_S_PATTERNS = ("bull_flag", "three_weeks_tight", "ascending_triangle", "high_tight_flag")
+_RS_MIN_S = 85
+_RS_MIN_A = 75
+_RS_MIN_B = 70
+_MAX_PER_SECTOR_PER_TIER = 3
+_TIER_MAX = 10
+
+
+def _rs_ok(r: ScreenerScore, threshold: int) -> bool:
+    """RS rank gate — requires a populated rs_rank ≥ threshold."""
+    if r.rs_rank is None:
+        return False
+    return int(r.rs_rank) >= threshold
+
+
+def _sector_room(picks: list[PickRow], sector: str | None, max_per_sector: int) -> bool:
+    """Returns True if we can still add another pick from this sector."""
+    if not sector:
+        return True   # unknown sector — don't penalize
+    count = sum(1 for p in picks if p.sector == sector)
+    return count < max_per_sector
+
+
 @router.get("/picks", response_model=PicksOut)
 async def todays_picks(
     session: AsyncSession = Depends(get_session),
 ) -> PicksOut:
     """Tiered curated picks — designed to eliminate decision paralysis.
 
-    Tier S (≤ 3):  HTF or Ascending Triangle at pivot, q ≥ 50 — highest EV
-    Tier A (≤ 3):  Other patterns at pivot, q ≥ 65 AND accelerating earnings
-    Tier B (≤ 4):  Quality patterns in-base (watch list, may break out today)
+    Tier S:  Premium-pattern at pivot, RS ≥ 85 (proven market leaders)
+             Patterns: Bull Flag, 3 Weeks Tight, Asc Triangle, HTF
+    Tier A:  Other patterns at pivot, quality ≥ 0.60, RS ≥ 75, accel earnings
+    Tier B:  Quality patterns in-base, RS ≥ 70 — highest per-trade returns
+             in backtest (breakout filter selects for real momentum)
 
-    Returns at most ~10 picks total, all already filtered for buyability.
+    All tiers cap at 3 picks per sector to force diversity.
+    Returns at most ~10 picks per tier; usually fewer after gates.
     """
     q = (
         select(ScreenerScore)
@@ -576,38 +622,44 @@ async def todays_picks(
 
     used: set[str] = set()
 
-    # Tier S: HTF or Ascending Triangle at pivot
+    # Tier S: Premium-pattern at pivot + RS leader (≥ 85)
     tier_s: list[PickRow] = []
     for r in rows:
         if r.symbol in used: continue
         if r.buyability != "at_pivot": continue
-        if r.pattern_type not in ("high_tight_flag", "ascending_triangle"): continue
+        if r.pattern_type not in _TIER_S_PATTERNS: continue
         if float(r.pattern_quality) < 0.50: continue
+        if not _rs_ok(r, _RS_MIN_S): continue
+        if not _sector_room(tier_s, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
         tier_s.append(_pick_row(r, "S"))
         used.add(r.symbol)
-        if len(tier_s) >= 10: break
+        if len(tier_s) >= _TIER_MAX: break
 
-    # Tier A: Other patterns at pivot, quality ≥ 0.60, accelerating earnings
+    # Tier A: Other patterns at pivot + quality ≥ 0.60 + RS ≥ 75 + accelerating earnings
     tier_a: list[PickRow] = []
     for r in rows:
         if r.symbol in used: continue
         if r.buyability != "at_pivot": continue
-        if r.pattern_type in ("high_tight_flag", "ascending_triangle"): continue  # already in S
+        if r.pattern_type in _TIER_S_PATTERNS: continue   # eligible for S, not duplicated here
         if float(r.pattern_quality) < 0.60: continue
+        if not _rs_ok(r, _RS_MIN_A): continue
         if not _is_accelerating(r): continue
+        if not _sector_room(tier_a, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
         tier_a.append(_pick_row(r, "A"))
         used.add(r.symbol)
-        if len(tier_a) >= 10: break
+        if len(tier_a) >= _TIER_MAX: break
 
-    # Tier B: In-base watchlist
+    # Tier B: In-base watchlist + RS ≥ 70
     tier_b: list[PickRow] = []
     for r in rows:
         if r.symbol in used: continue
         if r.buyability != "in_base": continue
         if float(r.pattern_quality) < 0.55: continue
+        if not _rs_ok(r, _RS_MIN_B): continue
+        if not _sector_room(tier_b, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
         tier_b.append(_pick_row(r, "B"))
         used.add(r.symbol)
-        if len(tier_b) >= 10: break
+        if len(tier_b) >= _TIER_MAX: break
 
     # Most recent scored_at as the "as of" timestamp
     as_of_q = await session.execute(select(func.max(ScreenerScore.scored_at)))
@@ -618,7 +670,12 @@ async def todays_picks(
         tier_a=tier_a,
         tier_b=tier_b,
         as_of=as_of,
-        note="Tier S = highest expected value (HTF / Ascending Triangle). Tier A = quality bases at pivot with accelerating earnings. Tier B = quality bases in-base (watch for breakout).",
+        note=(
+            "Tier S = premium patterns (Bull Flag / 3WT / Asc Triangle / HTF) at pivot, RS ≥ 85. "
+            "Tier A = other quality bases at pivot, RS ≥ 75, accelerating earnings. "
+            "Tier B = in-base, RS ≥ 70 — backtest shows BEST per-trade R (breakout filter selects for momentum). "
+            "Set buy-stops at the pivot for Tier B. Max 3 per sector per tier."
+        ),
     )
 
 

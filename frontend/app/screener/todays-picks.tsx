@@ -138,7 +138,7 @@ export function TodaysPicks() {
           {picks.tier_s.length > 0 && (
             <TierBlock
               label="Tier S"
-              sublabel="Highest EV — HTF / Ascending Triangle at pivot (take these always)"
+              sublabel="Premium patterns at pivot, RS ≥ 85 — Bull Flag / 3WT / Asc Triangle / HTF"
               tone="emerald"
               picks={picks.tier_s}
               expandedSymbols={expandedSymbols}
@@ -150,7 +150,7 @@ export function TodaysPicks() {
           {picks.tier_a.length > 0 && (
             <TierBlock
               label="Tier A"
-              sublabel="Quality bases at pivot, earnings accelerating"
+              sublabel="Other quality bases at pivot, RS ≥ 75, earnings accelerating"
               tone="amber"
               picks={picks.tier_a}
               expandedSymbols={expandedSymbols}
@@ -162,7 +162,7 @@ export function TodaysPicks() {
           {picks.tier_b.length > 0 && (
             <TierBlock
               label="Tier B"
-              sublabel="In-base — watch for breakout"
+              sublabel="In-base, RS ≥ 70 — best per-trade R in backtest. Set buy-stops at pivot."
               tone="sky"
               picks={picks.tier_b}
               expandedSymbols={expandedSymbols}

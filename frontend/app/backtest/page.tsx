@@ -572,8 +572,12 @@ export default function BacktestPage() {
                     </table>
                   </div>
                   <p className="text-muted-foreground mt-3 text-xs">
-                    Tier A here doesn&apos;t apply the live screener&apos;s &quot;accelerating earnings&quot; filter
-                    (no historical earnings snapshots in DB), so its numbers may be slightly worse than what live S/A would show.
+                    <strong>Vs live screener:</strong> backtest tier counts will be larger because we
+                    can&apos;t apply the live screener&apos;s RS-rank gate (S≥85, A≥75, B≥70) — historical RS
+                    rank isn&apos;t stored per-bar. The pattern set and quality thresholds match. Tier A
+                    also doesn&apos;t apply the &quot;accelerating earnings&quot; filter (no historical
+                    earnings snapshots). So the backtest measures pattern edge, not the full
+                    live-screener funnel.
                   </p>
                 </CardContent>
               </Card>

@@ -164,14 +164,27 @@ class BacktestResult:
 
 
 # ─── Tier classification ──────────────────────────────────────────────────────
+#
+# Mirror of api/screener.py:todays_picks tier rules, with two unavoidable
+# differences vs the live screener:
+#   1. RS-rank gate (S≥85, A≥75, B≥70) is NOT applied — the cached signal
+#      candidates don't store historical RS rank, and recomputing it per
+#      (symbol, bar) would require ranking the whole universe at every
+#      historical date. So backtest tier counts will be LARGER than what
+#      the live screener would actually surface.
+#   2. Accelerating-earnings filter for Tier A is NOT applied — no
+#      historical earnings snapshots in DB.
+#
+# The pattern-set and quality thresholds are applied identically. So this
+# backtest measures the edge of the *pattern definitions*, not the full
+# live-screener funnel. RS-gate impact has to be evaluated live.
+
+_TIER_S_PATTERNS_BACKTEST = ("bull_flag", "three_weeks_tight", "ascending_triangle", "high_tight_flag")
 
 
 def _classify_tier(pattern_type: str, buyability: str, quality: float) -> Tier:
-    """Mirror of api/screener.py:todays_picks tier rules — minus the
-    accelerating-earnings filter for Tier A (no historical earnings data).
-    """
     if buyability == "at_pivot":
-        if pattern_type in ("high_tight_flag", "ascending_triangle") and quality >= 0.50:
+        if pattern_type in _TIER_S_PATTERNS_BACKTEST and quality >= 0.50:
             return "S"
         if quality >= 0.60:
             return "A"
