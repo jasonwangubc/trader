@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api, ApiError } from "@/lib/api";
+import { ActiveAccountButton } from "./active-account-button";
 import { LiveToggle } from "./live-toggle";
 
 export const metadata = { title: 'Accounts' };
@@ -28,6 +29,7 @@ interface Account {
 interface HouseholdData {
   accounts: Account[];
   household_equity: Record<string, string>;
+  active_account_id: string | null;
 }
 
 function fmt(value: string, currency: string) {
@@ -86,9 +88,23 @@ export default async function AccountsPage() {
       {data && (
         <>
           <HouseholdSummary equity={data.household_equity} />
+          {!data.active_account_id && data.accounts.length > 1 && (
+            <div className="mt-4 rounded-md border border-amber-500/40 bg-amber-500/5 px-4 py-3 text-sm">
+              <span className="font-medium">No trading account set.</span>{" "}
+              <span className="text-muted-foreground">
+                Sizing and risk currently count every account below. Pick the one account you
+                actually trade (e.g. your RRSP) so the rest stay out of the math.
+              </span>
+            </div>
+          )}
           <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {data.accounts.map((account) => (
-              <AccountCard key={account.id} account={account} />
+              <AccountCard
+                key={account.id}
+                account={account}
+                isActive={account.id === data.active_account_id}
+                anyActive={data.active_account_id !== null}
+              />
             ))}
           </div>
         </>
@@ -116,21 +132,37 @@ function HouseholdSummary({ equity }: { equity: Record<string, string> }) {
   );
 }
 
-function AccountCard({ account }: { account: Account }) {
+function AccountCard({
+  account,
+  isActive,
+  anyActive,
+}: {
+  account: Account;
+  isActive: boolean;
+  anyActive: boolean;
+}) {
   const usd = account.balances.find((b) => b.currency === "USD");
   const cad = account.balances.find((b) => b.currency === "CAD");
+  const dimmed = anyActive && !isActive;
 
   return (
-    <Card className={account.real_money_enabled ? "border-destructive/40" : ""}>
+    <Card
+      className={`${account.real_money_enabled ? "border-destructive/40" : ""} ${
+        isActive ? "border-primary/60 ring-1 ring-primary/30" : dimmed ? "opacity-60" : ""
+      }`}
+    >
       <CardHeader>
         <div className="flex items-start justify-between gap-2">
           <div>
             <CardTitle className="text-base">{account.nickname ?? account.type}</CardTitle>
             <CardDescription>#{account.questrade_account_id}</CardDescription>
           </div>
-          <Badge variant={account.real_money_enabled ? "destructive" : "secondary"}>
-            {account.real_money_enabled ? "LIVE" : "paper"}
-          </Badge>
+          <div className="flex gap-1">
+            {isActive && <Badge>ACTIVE</Badge>}
+            <Badge variant={account.real_money_enabled ? "destructive" : "secondary"}>
+              {account.real_money_enabled ? "LIVE" : "paper"}
+            </Badge>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
@@ -155,6 +187,15 @@ function AccountCard({ account }: { account: Account }) {
             </div>
           </div>
         ))}
+
+        {/* Trading-account scope */}
+        <div className="border-t pt-3">
+          <ActiveAccountButton
+            accountId={account.id}
+            isActive={isActive}
+            anyActive={anyActive}
+          />
+        </div>
 
         {/* Live toggle */}
         <div className="border-t pt-3">

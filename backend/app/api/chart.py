@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth import get_user_id
 from app.db.session import get_session
 from app.services.eod_service import get_bars_df
 
@@ -56,55 +57,27 @@ def _sma(closes: np.ndarray, period: int) -> np.ndarray:
     return result
 
 
-def _detect_pivot(df) -> tuple[float | None, str | None]:
-    """Identify the pivot breakout price within the current VCP base.
-
-    Algorithm: look at the last 15-65 bars for a tightening range. The pivot
-    is the intraday high of the most recent tight contraction (last 3-10 bars
-    where the daily range < 1% of the high). Failing that, use the 52-week high
-    of the most recent 25-bar window.
+def _pattern_pivot(df, sma50_vals: np.ndarray, sma200_vals: np.ndarray) -> tuple[float | None, str | None]:
+    """Pivot + base start via pattern_service.detect_pattern — the same
+    single source of truth the screener persists, so the chart page and the
+    screener table can never disagree.
     """
+    from app.services.pattern_service import detect_pattern
+
     if df.empty or len(df) < 20:
         return None, None
 
-    closes = df["close"].values.astype(float)
-    highs  = df["high"].values.astype(float)
-    lows   = df["low"].values.astype(float)
-    dates  = df["date"].tolist()
+    ma50_last = float(sma50_vals[-1]) if len(sma50_vals) and not np.isnan(sma50_vals[-1]) else None
+    ma200_last = float(sma200_vals[-1]) if len(sma200_vals) and not np.isnan(sma200_vals[-1]) else None
+    pat = detect_pattern(df, ma_50=ma50_last, ma_200=ma200_last)
 
-    # Look at last 65 bars for the base
-    window = min(65, len(closes))
-    h = highs[-window:]
-    l = lows[-window:]
-    c = closes[-window:]
-    d = dates[-window:]
-
-    # Find a contraction: rolling 5-bar range < 8% from the base high
-    base_high = float(np.max(h))
-    base_low  = float(np.min(l))
-    base_depth = (base_high - base_low) / base_high if base_high > 0 else 1.0
-
-    # Base start: first bar where price dipped from the base high
-    peak_idx = int(np.argmax(h))
-    raw = d[peak_idx] if peak_idx < len(d) else None
-    base_start_date = (
-        raw.strftime("%Y-%m-%d") if hasattr(raw, "strftime")
-        else str(raw)[:10] if raw else None
-    )
-
-    # Recent tightest 10-bar window — pivot is the high of that window
-    if len(h) >= 10:
-        tight_window = 10
-        ranges = [(i, (h[i] - l[i]) / h[i]) for i in range(len(h) - tight_window, len(h))]
-        avg_range = float(np.mean([r for _, r in ranges]))
-        if avg_range < 0.02:  # very tight
-            pivot = float(max(h[-(tight_window):]))
-        else:
-            pivot = float(np.max(h[-25:])) if len(h) >= 25 else float(np.max(h))
-    else:
-        pivot = float(np.max(h))
-
-    return round(pivot * 1.005, 2), base_start_date  # pivot = base high + 0.5% buffer
+    base_start_date: str | None = None
+    if pat.base_length_days is not None and pat.base_length_days < len(df):
+        raw = df["date"].iloc[len(df) - 1 - pat.base_length_days]
+        base_start_date = (
+            raw.strftime("%Y-%m-%d") if hasattr(raw, "strftime") else str(raw)[:10]
+        )
+    return pat.pivot_price, base_start_date
 
 
 class StopOptionOut(BaseModel):
@@ -162,6 +135,151 @@ async def recommendations(
         annual_vol_pct=rec.annual_vol_pct,
         daily_drift=rec.daily_drift,
         expected_value_20d=rec.expected_value_20d,
+    )
+
+
+class TradePlanOddsOut(BaseModel):
+    available: bool
+    reason: str | None
+    cohort: str
+    widened: bool
+    n_setups: int
+    n_triggered: int
+    trigger_rate: float
+    target_pct: float
+    stop_pct: float
+    time_pct: float
+    avg_r: float
+    time_avg_r: float
+    stop_atr: float
+    target_r: float
+    time_stop_days: int
+    scan_date: str | None
+    caveats: list[str]
+
+
+class TradePlanSizingOut(BaseModel):
+    shares: int
+    risk_amount: float
+    risk_pct: float
+    equity_basis: float
+    equity_currency: str
+    warnings: list[str]
+
+
+class TradePlanOut(BaseModel):
+    symbol: str
+    pattern_type: str | None
+    pattern_quality: float | None
+    buyability: str | None
+    tier: str                      # S / A / B / "" for this setup
+    pivot: float | None            # buy trigger (breakout point)
+    stop: float | None
+    stop_method: str | None        # base_low / atr / pct
+    target: float | None
+    target_r: float | None         # target expressed as an R-multiple of risk
+    last_close: float | None
+    atr14: float | None
+    sizing: TradePlanSizingOut | None   # from the active trading account, if set
+    odds: TradePlanOddsOut
+
+
+@router.get("/{symbol}/trade-plan", response_model=TradePlanOut)
+async def trade_plan(
+    symbol: str,
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
+) -> TradePlanOut:
+    """One-stop trade plan for a ticker: pivot / stop / first target, position
+    size from the active trading account, and the empirical odds of hitting
+    the target before the stop based on similar historical setups."""
+    from decimal import Decimal
+
+    from sqlalchemy import select as sa_select
+
+    from app.api.screener import suggest_entry
+    from app.db.models import ScreenerScore
+    from app.services.accounts_service import get_active_account_id
+    from app.services.backtest_service import _classify_tier
+    from app.services.odds_service import compute_outcome_odds
+    from app.services.tickets_service import TicketValidationError, preview_ticket
+
+    sym = symbol.upper()
+    suggest = await suggest_entry(sym, session)  # raises 404 if nothing known
+
+    row = (
+        await session.execute(sa_select(ScreenerScore).where(ScreenerScore.symbol == sym))
+    ).scalar_one_or_none()
+    pattern_quality = float(row.pattern_quality) if row and row.pattern_quality is not None else None
+    buyability = row.buyability if row else None
+    tier = _classify_tier(
+        (row.pattern_type if row else None) or "",
+        buyability or "",
+        pattern_quality or 0.0,
+    )
+
+    target_r = None
+    if suggest.target_price and suggest.stop_price and suggest.trigger_price:
+        risk = suggest.trigger_price - suggest.stop_price
+        if risk > 0:
+            target_r = round((suggest.target_price - suggest.trigger_price) / risk, 2)
+
+    # Empirical odds from the backtest signal cache
+    if suggest.stop_price and suggest.target_price and suggest.atr14:
+        odds = await compute_outcome_odds(
+            session,
+            pattern_type=row.pattern_type if row else None,
+            buyability=buyability,
+            pattern_quality=pattern_quality,
+            entry_price=suggest.trigger_price,
+            stop_price=suggest.stop_price,
+            target_price=suggest.target_price,
+            atr=suggest.atr14,
+        )
+    else:
+        from app.services.odds_service import OddsEstimate
+        odds = OddsEstimate(available=False, reason="Plan is incomplete (missing stop/target/ATR).")
+
+    # Position size from the active trading account, when one is set
+    sizing_out: TradePlanSizingOut | None = None
+    active_id = await get_active_account_id(session, user_id)
+    if active_id is not None and suggest.stop_price and suggest.trigger_price:
+        currency = "CAD" if sym.endswith((".TO", ".NE", ".V")) else "USD"
+        try:
+            sizing, _streak, _bp = await preview_ticket(
+                session,
+                account_id=active_id,
+                currency=currency,
+                trigger_price=Decimal(str(suggest.trigger_price)),
+                stop_price=Decimal(str(suggest.stop_price)),
+                user_id=user_id,
+            )
+            sizing_out = TradePlanSizingOut(
+                shares=sizing.shares,
+                risk_amount=float(sizing.risk_amount),
+                risk_pct=float(sizing.risk_pct),
+                equity_basis=float(sizing.equity_basis),
+                equity_currency=sizing.equity_currency,
+                warnings=sizing.warnings,
+            )
+        except TicketValidationError:
+            sizing_out = None
+
+    return TradePlanOut(
+        symbol=sym,
+        pattern_type=row.pattern_type if row else None,
+        pattern_quality=pattern_quality,
+        buyability=buyability,
+        tier=tier,
+        pivot=suggest.trigger_price,
+        stop=suggest.stop_price,
+        stop_method=suggest.stop_method,
+        target=suggest.target_price,
+        target_r=target_r,
+        last_close=suggest.last_close,
+        atr14=suggest.atr14,
+        sizing=sizing_out,
+        odds=TradePlanOddsOut(**odds.__dict__),
     )
 
 
@@ -226,7 +344,11 @@ async def chart(
                 if first_ratio and first_ratio > 0:
                     rs_line.append(LinePoint(time=dt, value=round(ratio / first_ratio * 100, 4)))
 
-    pivot, base_start = _detect_pivot(df)
+    import asyncio
+    loop = asyncio.get_event_loop()
+    pivot, base_start = await loop.run_in_executor(
+        None, _pattern_pivot, df, sma50_vals, sma200_vals
+    )
 
     bars = [
         CandleBar(

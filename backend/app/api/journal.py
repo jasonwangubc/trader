@@ -17,7 +17,7 @@ from app.brokers.registry import get_broker
 from app.db.models import Account, BrokerTrade, Fill, Order, OrderIntent, Position, Ticket, TicketStatus
 from app.db.session import get_session
 from app.api.auth import get_user_id
-from app.services.accounts_service import get_household_equity
+from app.services.accounts_service import get_active_account_id, get_household_equity
 from app.services.coach_service import Insight, compute_insights
 from app.services.positions_service import fetch_broker_stop_targets, is_cash_equivalent
 
@@ -129,13 +129,18 @@ async def open_risk(
     """
     MAX_RISK_PCT = Decimal("0.08")
 
+    # Active-account scope: when set, risk/equity/positions all narrow to that
+    # one account so sibling accounts (RESP etc.) don't distort the picture.
+    active_account_id = await get_active_account_id(session, user_id)
+
     # ── Filled tickets — split paper vs real, exclude cash equivalents ──────
-    filled_result = await session.execute(
-        select(Ticket).where(
-            Ticket.status == TicketStatus.FILLED.value,
-            Ticket.user_id == user_id,
-        )
+    filled_stmt = select(Ticket).where(
+        Ticket.status == TicketStatus.FILLED.value,
+        Ticket.user_id == user_id,
     )
+    if active_account_id is not None:
+        filled_stmt = filled_stmt.where(Ticket.account_id == active_account_id)
+    filled_result = await session.execute(filled_stmt)
     filled_tickets = [t for t in filled_result.scalars().all() if not is_cash_equivalent(t.symbol)]
 
     equity = await get_household_equity(session, user_id=user_id)
@@ -195,15 +200,16 @@ async def open_risk(
                 real_cad += open_risk_dollars
 
     # ── Unmanaged broker positions (real, no ticket linked) ─────────────────
-    unmanaged_q = await session.execute(
-        select(Position).join(Account).where(
-            Account.user_id == user_id,
-            Position.ticket_id.is_(None),
-            Position.is_managed == False,             # noqa: E712
-            Position.is_buy_and_hold == False,        # noqa: E712
-            Position.quantity > 0,
-        )
+    unmanaged_stmt = select(Position).join(Account).where(
+        Account.user_id == user_id,
+        Position.ticket_id.is_(None),
+        Position.is_managed == False,             # noqa: E712
+        Position.is_buy_and_hold == False,        # noqa: E712
+        Position.quantity > 0,
     )
+    if active_account_id is not None:
+        unmanaged_stmt = unmanaged_stmt.where(Account.id == active_account_id)
+    unmanaged_q = await session.execute(unmanaged_stmt)
     unmanaged_rows = [p for p in unmanaged_q.scalars().all() if not is_cash_equivalent(p.symbol)]
 
     # Best-effort lookup of broker-side stops/targets to distinguish
@@ -249,9 +255,12 @@ async def open_risk(
 
     try:
         broker = get_broker(user_id=user_id)
-        accounts_q = await session.execute(
-            select(Account).where(Account.user_id == user_id, Account.is_active == True)  # noqa: E712
+        accounts_stmt = select(Account).where(
+            Account.user_id == user_id, Account.is_active == True  # noqa: E712
         )
+        if active_account_id is not None:
+            accounts_stmt = accounts_stmt.where(Account.id == active_account_id)
+        accounts_q = await session.execute(accounts_stmt)
         accounts = accounts_q.scalars().all()
 
         # Map our DB ticket id ↔ broker_order_id, so a broker order placed by
@@ -421,14 +430,16 @@ async def summary(
     session: AsyncSession = Depends(get_session),
     user_id: str = Depends(get_user_id),
 ) -> JournalSummary:
-    result = await session.execute(
-        select(Ticket).where(
-            Ticket.outcome.isnot(None),
-            Ticket.r_multiple.isnot(None),
-            Ticket.user_id == user_id,
-            Ticket.is_paper == False,  # noqa: E712
-        ).order_by(Ticket.closed_at.asc().nullslast())
-    )
+    summary_stmt = select(Ticket).where(
+        Ticket.outcome.isnot(None),
+        Ticket.r_multiple.isnot(None),
+        Ticket.user_id == user_id,
+        Ticket.is_paper == False,  # noqa: E712
+    ).order_by(Ticket.closed_at.asc().nullslast())
+    active_account_id = await get_active_account_id(session, user_id)
+    if active_account_id is not None:
+        summary_stmt = summary_stmt.where(Ticket.account_id == active_account_id)
+    result = await session.execute(summary_stmt)
     tickets = result.scalars().all()
 
     if not tickets:
@@ -595,11 +606,15 @@ async def broker_summary(
     at Questrade — not just the ones that came from in-app tickets. R-multiples
     are only populated for trades reconciled to a ticket that had a stop.
     """
-    trades_q = await session.execute(
+    trades_stmt = (
         select(BrokerTrade)
         .where(BrokerTrade.user_id == user_id)
         .order_by(BrokerTrade.exit_date.asc())
     )
+    active_account_id = await get_active_account_id(session, user_id)
+    if active_account_id is not None:
+        trades_stmt = trades_stmt.where(BrokerTrade.account_id == active_account_id)
+    trades_q = await session.execute(trades_stmt)
     trades = trades_q.scalars().all()
 
     # Account-type lookup

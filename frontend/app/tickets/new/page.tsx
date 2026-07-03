@@ -24,6 +24,7 @@ export default async function NewTicketPage({
 
       <TicketForm
         accounts={household.accounts}
+        defaultAccountId={household.active_account_id ?? undefined}
         prefillSymbol={symbol?.toUpperCase()}
         prefillTrigger={trigger}
         prefillStop={stop}

@@ -26,6 +26,7 @@ from app.brokers.base import (
     BrokerBalance,
     BrokerBracketAck,
     BrokerBracketRequest,
+    BrokerCashFlow,
     BrokerExecution,
     BrokerInterface,
     BrokerOpenOrder,
@@ -791,6 +792,66 @@ class QuestradeBroker(BrokerInterface):
                 commission=commission,
                 executed_at=ts_utc,
                 venue=None,
+                raw=a,
+            ))
+        return out
+
+    _CASH_FLOW_TYPES = {
+        "Deposits": "deposit",
+        "Withdrawals": "withdrawal",
+        "Transfers": "transfer",
+    }
+
+    async def get_cash_activities(
+        self,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[BrokerCashFlow]:
+        """Deposits / withdrawals / transfers from /activities.
+
+        Same feed and same synthetic-SHA1 dedup approach as get_activities;
+        amounts come from netAmount and keep their sign (+ inflow, − outflow).
+        """
+        params = {
+            "startTime": start.astimezone(timezone.utc).isoformat(),
+            "endTime":   end.astimezone(timezone.utc).isoformat(),
+        }
+        data = await self._get(f"v1/accounts/{account_id}/activities", **params)
+        out: list[BrokerCashFlow] = []
+        for a in data.get("activities", []):
+            flow_type = self._CASH_FLOW_TYPES.get(a.get("type") or "")
+            if flow_type is None:
+                continue
+            ts_str = a.get("transactionDate") or a.get("tradeDate")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_utc = ts.astimezone(timezone.utc)
+            except Exception:
+                continue
+
+            amount = self._dec(a.get("netAmount"))
+            if amount == 0:
+                continue
+            currency = a.get("currency") or "CAD"
+            description = (a.get("description") or "")[:200] or None
+
+            key_input = (
+                f"{account_id}|{ts_utc.isoformat()}|{flow_type}|{currency}|"
+                f"{amount}|{(a.get('description') or '')[:60]}"
+            )
+            synthetic_id = "cf_" + hashlib.sha1(key_input.encode()).hexdigest()[:40]
+
+            out.append(BrokerCashFlow(
+                broker_activity_id=synthetic_id,
+                account_id=account_id,
+                flow_type=flow_type,
+                currency=currency,
+                amount=amount,
+                occurred_at=ts_utc,
+                description=description,
                 raw=a,
             ))
         return out

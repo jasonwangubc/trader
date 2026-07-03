@@ -293,6 +293,10 @@ async def simulate_from_candidates(
     lookback_days: int = 504,
     account_size: float = 100_000.0,
     risk_pct: float = 0.0075,
+    pattern_types: set[str] | None = None,
+    buyabilities: set[str] | None = None,
+    tiers: set[str] | None = None,
+    quality_range: tuple[float, float] | None = None,
 ) -> BacktestResult:
     """Fast Phase-2 simulation.
 
@@ -300,9 +304,33 @@ async def simulate_from_candidates(
     each forward through the trigger window + stop/target/time-stop simulation.
     Reuses in-process bars cache populated by Phase 1.
 
+    The optional cohort filters (`pattern_types`, `buyabilities`, `tiers`,
+    `quality_range`) restrict the simulation to "similar setups" — used by
+    odds_service to compute empirical base rates for a specific trade plan.
+
     Typical runtime: ~30s for the full ~7k-symbol universe.
     """
     candidates = await load_candidates(session, scan_id)
+
+    # Static per-candidate filters run before bars loading so cohort queries
+    # only hydrate the symbols they actually walk.
+    def _passes(c: BacktestSignalCandidate) -> bool:
+        if c.tt_score < tt_min:
+            return False
+        q = float(c.pattern_quality)
+        if q < pattern_quality_min:
+            return False
+        if pattern_types is not None and c.pattern_type not in pattern_types:
+            return False
+        if buyabilities is not None and c.buyability not in buyabilities:
+            return False
+        if quality_range is not None and not (quality_range[0] <= q <= quality_range[1]):
+            return False
+        if tiers is not None and _classify_tier(c.pattern_type, c.buyability, q) not in tiers:
+            return False
+        return True
+
+    candidates = [c for c in candidates if _passes(c)]
     if not candidates:
         return BacktestResult(symbols_scanned=0)
 
@@ -342,11 +370,7 @@ async def simulate_from_candidates(
             i = c.bar_index
             if i < next_eligible:
                 continue
-            # Apply post-hoc threshold filters
-            if c.tt_score < tt_min:
-                continue
-            if float(c.pattern_quality) < pattern_quality_min:
-                continue
+            # Threshold/cohort filters already applied pre-loop (_passes)
 
             tier = _classify_tier(c.pattern_type, c.buyability, float(c.pattern_quality))
             pivot = float(c.pivot_price)

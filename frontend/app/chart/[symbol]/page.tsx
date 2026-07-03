@@ -6,6 +6,7 @@ import { StockChart } from "@/components/stock-chart";
 import { CompanySnapshot } from "@/components/company-snapshot";
 import { FundamentalsPanel } from "@/components/fundamentals-panel";
 import { RecommendationsPanel } from "@/components/recommendations-panel";
+import { TradePlanCard } from "@/components/trade-plan-card";
 import { api, ApiError } from "@/lib/api";
 
 interface ChartData {
@@ -146,6 +147,20 @@ export default async function ChartPage({
               <span className="flex items-center gap-1"><span className="inline-block h-0.5 w-4 bg-emerald-400" />T3</span>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Trade plan: pivot / stop / first target + empirical odds */}
+      <Card className="mb-4">
+        <CardHeader>
+          <CardTitle className="text-base">Trade plan</CardTitle>
+          <CardDescription className="text-xs">
+            Pivot · stop · first target · position size — plus the historical odds of similar
+            setups hitting the target before the stop, replayed from the backtest signal cache
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <TradePlanCard symbol={sym} />
         </CardContent>
       </Card>
 

@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.db.models import Account, Position, Ticket, TicketStatus, TriggerType, SetupType
 from app.services.accounts_service import get_household_equity
 from app.services.audit_service import log_event
+from app.services.guardrail_service import get_drawdown_state
 from app.services.positions_service import buying_power_breakdown
 from app.services.sizing_service import SizingResult, compute_sizing
 from app.services.streak_service import StreakSnapshot, get_snapshot
@@ -34,24 +35,40 @@ async def preview_ticket(
     trigger_price: Decimal,
     stop_price: Decimal,
     max_shares: int | None = None,
+    user_id: str | None = None,
 ) -> tuple[SizingResult, StreakSnapshot, dict[str, Decimal]]:
     """Compute sizing + streak snapshot + buying-power breakdown for the
-    trade currency. Nothing is persisted."""
+    trade currency. Nothing is persisted.
+
+    Sizing is based on the *ticket's own account* equity — risking 1% means
+    1% of the account the trade lives in, never inflated by sibling accounts.
+    """
     account = await session.get(Account, account_id)
-    if account is None:
+    if account is None or (user_id is not None and account.user_id != user_id):
         raise TicketValidationError(f"Account {account_id} not found.")
 
-    streak = await get_snapshot(session)
-    equity = await get_household_equity(session)
+    streak = await get_snapshot(session, user_id=account.user_id)
+    equity = await get_household_equity(
+        session, user_id=account.user_id, account_id=account.id,
+    )
+    # Effective multiplier = anti-martingale streak x drawdown breaker.
+    drawdown = await get_drawdown_state(session, account.user_id)
     sizing = compute_sizing(
         trigger_price=trigger_price,
         stop_price=stop_price,
         currency=currency,
         equity_by_currency=equity,
-        multiplier=streak.multiplier,
+        multiplier=streak.multiplier * drawdown.risk_multiplier,
         max_shares=max_shares,
     )
-    buying_power = await buying_power_breakdown(session, currency=currency)
+    if drawdown.risk_multiplier < 1:
+        sizing.warnings.append(
+            f"Drawdown breaker: per-trade risk halved — account is down "
+            f"{drawdown.drawdown_pct * 100:.1f}% from its peak."
+        )
+    buying_power = await buying_power_breakdown(
+        session, currency=currency, user_id=account.user_id, account_id=account.id,
+    )
     return sizing, streak, buying_power
 
 
@@ -92,6 +109,7 @@ async def create_ticket(
         trigger_price=trigger_price,
         stop_price=stop_price,
         max_shares=max_shares,
+        user_id=user_id,
     )
 
     if sizing.shares <= 0:
@@ -200,7 +218,9 @@ async def create_retroactive_ticket(
     # Compute risk for journaling, but never block.
     per_share_risk = entry_price - stop_price
     risk_amount = per_share_risk * pos.quantity
-    equity = await get_household_equity(session, user_id=user_id)
+    equity = await get_household_equity(
+        session, user_id=user_id, account_id=pos.account_id,
+    )
     equity_basis = equity.get(pos.currency, Decimal(0))
     risk_pct = (risk_amount / equity_basis) if equity_basis > 0 else Decimal(0)
 
@@ -336,14 +356,17 @@ async def patch_ticket(
         ticket.is_paper = not current_account.real_money_enabled or get_settings().paper_mode_default
 
     if needs_resize:
-        streak = await get_snapshot(session)
-        equity = await get_household_equity(session)
+        streak = await get_snapshot(session, user_id=user_id)
+        equity = await get_household_equity(
+            session, user_id=user_id, account_id=ticket.account_id,
+        )
+        drawdown = await get_drawdown_state(session, user_id)
         sizing = compute_sizing(
             trigger_price=ticket.trigger_price,
             stop_price=ticket.stop_price,
             currency=ticket.currency,
             equity_by_currency=equity,
-            multiplier=streak.multiplier,
+            multiplier=streak.multiplier * drawdown.risk_multiplier,
         )
         if sizing.shares <= 0:
             raise TicketValidationError(

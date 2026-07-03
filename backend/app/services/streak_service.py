@@ -97,4 +97,4 @@ async def record_outcome(
     mult, _ = _multiplier_for(row.consecutive_wins, row.consecutive_losses)
     row.current_multiplier = mult
     await session.flush()
-    return await get_snapshot(session)
+    return await get_snapshot(session, user_id=user_id)

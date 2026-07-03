@@ -12,6 +12,7 @@ import {
   Search,
   BookOpen,
   ClipboardList,
+  ScrollText,
   Shield,
   LineChart,
   CircleDollarSign,
@@ -56,6 +57,7 @@ const NAV_SECTIONS = [
     items: [
       { href: "/journal",  label: "Journal",  Icon: BookOpen },
       { href: "/backtest", label: "Backtest", Icon: FlaskConical },
+      { href: "/charter",  label: "Charter",  Icon: ScrollText },
     ],
   },
   {

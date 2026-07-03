@@ -22,6 +22,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -165,6 +166,94 @@ class AccountBalance(Base):
 
     __table_args__ = (
         UniqueConstraint("account_id", "currency", name="uq_account_balance_currency"),
+    )
+
+
+class EquitySnapshot(Base):
+    """One equity data point per (account, currency, day).
+
+    AccountBalance is overwrite-on-sync (current state only) and Questrade has
+    no historical-balances endpoint — so account history builds forward from
+    these rows. They power the drawdown circuit breaker (peak equity) and the
+    charter honesty page (actual equity curve vs benchmark counterfactual).
+
+    source: "sync" (user-triggered accounts sync), "nightly" (from cached
+    balances — may be stale if the user hasn't synced), "manual_seed" (user
+    backfill of a known historical value).
+    """
+    __tablename__ = "equity_snapshots"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    currency: Mapped[str] = mapped_column(String(3))
+    snapshot_date: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True)
+    cash: Mapped[Decimal] = mapped_column(_money, default=Decimal(0))
+    market_value: Mapped[Decimal] = mapped_column(_money, default=Decimal(0))
+    total_equity: Mapped[Decimal] = mapped_column(_money, default=Decimal(0))
+    source: Mapped[str] = mapped_column(String(16), default="sync")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "currency", "snapshot_date",
+            name="uq_equity_snapshot_account_ccy_date",
+        ),
+    )
+
+
+class CharterVersion(Base):
+    """One immutable version of the user's trading charter (pre-commitment).
+
+    APPEND-ONLY by design: there are no update or delete endpoints. The whole
+    point of a charter is that its rules were written *before* the drawdown —
+    revising it must leave a visible trail (new version + audit event), never
+    a silent rewrite. Active version = highest version number.
+    """
+    __tablename__ = "charter_versions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    version: Mapped[int] = mapped_column(Integer)
+    content_md: Mapped[str] = mapped_column(Text)          # the written plan, markdown
+    # Structured, machine-checkable rules: evaluation horizon, review cadence,
+    # kill/scale criteria, and the guardrail thresholds this charter locks.
+    rules: Mapped[dict] = mapped_column(JSONB, default=dict)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)  # why this revision
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "version", name="uq_charter_user_version"),
+    )
+
+
+class AccountCashFlow(Base):
+    """External cash movement (deposit / withdrawal / transfer) from broker
+    activities. Powers the honesty page's deposit-timing-matched benchmark:
+    every deposit is replayed into a buy-and-hold index counterfactual.
+
+    Dedup: synthetic SHA-1 id per activity (same pattern as broker_executions).
+    """
+    __tablename__ = "account_cash_flows"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    broker_activity_id: Mapped[str] = mapped_column(String(64), index=True)
+    flow_type: Mapped[str] = mapped_column(String(16))      # deposit | withdrawal | transfer
+    currency: Mapped[str] = mapped_column(String(3))
+    amount: Mapped[Decimal] = mapped_column(_money)          # signed: + inflow, − outflow
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    description: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    raw: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "broker_activity_id", name="uq_cash_flow_user_activity"),
     )
 
 

@@ -796,8 +796,15 @@ async def get_screener_results(
     buyability: str | None = None,    # comma-separated buyability values
     pattern: str | None = None,       # comma-separated pattern values
     sector: str | None = None,
+    max_age_days: int = 5,
 ) -> list[ScreenerScore]:
     q = select(ScreenerScore).order_by(ScreenerScore.composite_score.desc())
+    # Freshness cutoff: symbols that dropped out of recent scans keep their old
+    # rows (with stale pivots/extensions computed from old closes) — never show
+    # them. 5 days spans weekends + holidays between nightly scans.
+    if max_age_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        q = q.where(ScreenerScore.scored_at >= cutoff)
     result = await session.execute(q)
     rows = result.scalars().all()
 

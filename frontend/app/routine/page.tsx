@@ -1,4 +1,5 @@
 import { CheckCircle, XCircle, AlertTriangle, Clock } from "lucide-react";
+import { DrawdownCard } from "@/components/drawdown-card";
 import { RiskGauge } from "@/components/risk-gauge";
 import { TrailingActionsCard } from "@/components/trailing-actions-card";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -150,7 +151,10 @@ export default async function RoutinePage() {
           </Card>
         )}
 
-        {/* 2. Monitor status */}
+        {/* 2. Account drawdown circuit breaker */}
+        <DrawdownCard />
+
+        {/* 3. Monitor status */}
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Breakout monitor</CardTitle>

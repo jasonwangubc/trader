@@ -23,7 +23,13 @@ from app.db.models import (
 )
 from app.db.session import get_session
 from app.api.auth import get_user_id
-from app.services.guardrail_service import GuardrailViolation, check_all
+from app.services.audit_service import log_event
+from app.services.guardrail_service import (
+    DRAWDOWN_OVERRIDE_PHRASE,
+    GuardrailViolation,
+    check_all,
+    get_drawdown_state,
+)
 from app.services.order_service import close_ticket
 from app.services.regime_service import get_regime
 from app.services.trailing_service import TrailingSuggestion, compute_trailing_suggestion
@@ -83,11 +89,22 @@ class GuardrailWarningOut(BaseModel):
     message: str
 
 
+class DrawdownOut(BaseModel):
+    peak_equity: Decimal
+    current_equity: Decimal
+    currency: str
+    drawdown_pct: float          # 0.12 = down 12% from peak
+    tier: str                    # ok | warn | half_risk | block
+    risk_multiplier: Decimal
+    has_history: bool
+
+
 class TicketPreviewOut(BaseModel):
     sizing: SizingOut
     streak: StreakOut
     buying_power: BuyingPowerOut
     regime: str
+    drawdown: DrawdownOut | None = None
     guardrail_warnings: list[GuardrailWarningOut] = []
 
 
@@ -108,6 +125,8 @@ class TicketIn(BaseModel):
     is_paper: bool | None = None
     override_regime: bool = False   # explicitly proceed despite bear regime
     override_streak: bool = False   # explicitly proceed despite loss-streak block
+    override_drawdown: bool = False  # proceed despite drawdown circuit breaker
+    drawdown_confirmation: str | None = None  # must equal the typed phrase when overriding
 
 
 class TicketOut(BaseModel):
@@ -216,6 +235,7 @@ class TicketDetailOut(TicketOut):
 async def preview(
     body: TicketPreviewIn,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> TicketPreviewOut:
     try:
         sizing, streak, buying_power = await preview_ticket(
@@ -225,6 +245,7 @@ async def preview(
             currency=body.currency,
             trigger_price=body.trigger_price,
             stop_price=body.stop_price,
+            user_id=user_id,
         )
     except TicketValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -257,6 +278,7 @@ async def preview(
             freeable_total=buying_power["freeable_total"],
         ),
         regime=(await get_regime(session)).regime,
+        drawdown=DrawdownOut(**(await get_drawdown_state(session, user_id)).__dict__),
         guardrail_warnings=[],  # guardrails run on actual create, not preview
     )
 
@@ -280,17 +302,52 @@ async def create(
             detail="Stop must be strictly below trigger for long entries.",
         )
 
+    # Drawdown override requires the exact typed phrase — no checkbox override
+    # for the account-level breaker.
+    if body.override_drawdown and (body.drawdown_confirmation or "").strip() != DRAWDOWN_OVERRIDE_PHRASE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "drawdown_confirmation_required",
+                "message": f"To override the drawdown breaker, type exactly: {DRAWDOWN_OVERRIDE_PHRASE}",
+            },
+        )
+
     # Behavioral guardrails
     regime = await get_regime(session)
     try:
         guardrail_warnings = await check_all(
             session,
+            user_id=user_id,
             regime=regime,
             override_regime=body.override_regime,
             override_streak=body.override_streak,
+            override_drawdown=body.override_drawdown,
         )
     except GuardrailViolation as exc:
         raise HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)})
+
+    if body.override_drawdown:
+        dd = await get_drawdown_state(session, user_id)
+        await log_event(
+            session,
+            actor="user",
+            event_type="drawdown_override",
+            entity_type="ticket",
+            entity_id=None,
+            payload={
+                "symbol": body.symbol,
+                "drawdown_pct": dd.drawdown_pct,
+                "peak_equity": str(dd.peak_equity),
+                "current_equity": str(dd.current_equity),
+                "currency": dd.currency,
+                "confirmation": body.drawdown_confirmation,
+            },
+        )
+
+    thesis = body.thesis
+    if body.override_drawdown:
+        thesis = f"{thesis}\n[Drawdown circuit breaker overridden at ticket creation]"
 
     try:
         ticket = await create_ticket(
@@ -307,7 +364,7 @@ async def create(
             time_stop_days=body.time_stop_days,
             valid_for_days=body.valid_for_days,
             volume_confirm_multiple=body.volume_confirm_multiple,
-            thesis=body.thesis,
+            thesis=thesis,
             is_paper=body.is_paper,
             max_shares=body.max_shares,
         )

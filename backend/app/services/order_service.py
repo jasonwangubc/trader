@@ -611,7 +611,7 @@ async def close_ticket(
     ticket.r_multiple = r_multiple
     ticket.outcome = outcome.value
 
-    await record_outcome(session, outcome=outcome, ticket_id=ticket.id)
+    await record_outcome(session, outcome=outcome, ticket_id=ticket.id, user_id=ticket.user_id)
 
     await log_event(
         session,

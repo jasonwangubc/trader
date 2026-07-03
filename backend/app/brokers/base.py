@@ -127,6 +127,23 @@ class BrokerExecution:
 
 
 @dataclass(frozen=True)
+class BrokerCashFlow:
+    """External cash movement: deposit, withdrawal, or transfer.
+
+    Powers the deposit-timing-matched benchmark counterfactual — the honest
+    answer to "what if I had just indexed this money instead".
+    """
+    broker_activity_id: str           # synthetic dedup id (activities have no stable id)
+    account_id: str
+    flow_type: str                    # "deposit" | "withdrawal" | "transfer"
+    currency: str
+    amount: Decimal                   # signed: + inflow, − outflow
+    occurred_at: datetime             # UTC
+    description: str | None = None
+    raw: dict | None = None
+
+
+@dataclass(frozen=True)
 class BrokerQuote:
     symbol: str
     last: Decimal
@@ -222,5 +239,16 @@ class BrokerInterface(ABC):
         Trades; goes back to account opening (unlike /executions). Brokers
         without an activities concept should leave this returning [] and rely
         on get_executions.
+        """
+        return []
+
+    async def get_cash_activities(
+        self,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[BrokerCashFlow]:
+        """Return deposits/withdrawals/transfers in [start, end] for this
+        account. Default: empty — brokers with an activities feed override.
         """
         return []

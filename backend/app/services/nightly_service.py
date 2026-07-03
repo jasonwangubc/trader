@@ -72,6 +72,7 @@ async def run_nightly_loop() -> None:
                     )
                     symbols = [r for (r,) in sym_result.all()]
                 await _do_sync(symbols)
+                await _snapshot_equity_all_users()
                 last_synced = today
                 log.info("Nightly EOD sync complete for %s (%d symbols)", today, len(symbols))
 
@@ -125,14 +126,41 @@ async def startup_stale_check() -> None:
         log.exception("Startup stale-check failed")
 
 
+async def _snapshot_equity_all_users() -> None:
+    """Daily equity snapshot per user from *cached* balances (no broker call).
+
+    Guarantees at most one gap-free row per day even if the user never opens
+    the accounts page. Values are only as fresh as the last account sync —
+    the source='nightly' tag lets the UI say so.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import Account
+    from app.db.session import SessionLocal
+    from app.services.accounts_service import capture_equity_snapshots
+
+    try:
+        async with SessionLocal() as session:
+            users_q = await session.execute(select(Account.user_id).distinct())
+            for (user_id,) in users_q.all():
+                await capture_equity_snapshots(session, user_id, source="nightly")
+            await session.commit()
+    except Exception:
+        log.exception("Nightly equity snapshot failed")
+
+
 async def _do_sync(symbols: list[str]) -> None:
     """Download incremental EOD bars then immediately rescore the universe."""
     from app.db.session import SessionLocal
     from app.services.eod_service import sync_eod_incremental
     from app.services.screener_service import run_screener
 
+    # Benchmarks ride along: SPY/XIU for the regime model, ZSP.TO for the
+    # charter honesty page's CAD counterfactual.
+    benchmarks = [s for s in ("SPY", "XIU.TO", "ZSP.TO") if s not in symbols]
+
     async with SessionLocal() as session:
-        counts = await sync_eod_incremental(session, symbols, delta_days=5)
+        counts = await sync_eod_incremental(session, symbols + benchmarks, delta_days=5)
     downloaded = sum(v for v in counts.values() if v > 0)
     log.info("EOD sync: %d/%d symbols updated — running screener rescore", downloaded, len(symbols))
 

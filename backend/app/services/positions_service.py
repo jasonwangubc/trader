@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.brokers.base import BrokerInterface, BrokerOpenOrder
 from app.db.models import Account, AccountBalance, Position
+from app.services.accounts_service import get_active_account_id
 from app.services.audit_service import log_event
 
 log = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ async def list_positions(
     session: AsyncSession,
     user_id: str = "user_default",
 ) -> list[Position]:
-    result = await session.execute(
+    stmt = (
         select(Position)
         .join(Account)
         .where(
@@ -127,6 +128,10 @@ async def list_positions(
         )
         .order_by(Position.symbol)
     )
+    active_id = await get_active_account_id(session, user_id)
+    if active_id is not None:
+        stmt = stmt.where(Account.id == active_id)
+    result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
@@ -157,12 +162,14 @@ async def fetch_broker_stop_targets(
     Never raises — this is a best-effort annotation, not authoritative data.
     """
     out: dict[tuple[uuid.UUID, str], BrokerStopTarget] = {}
-    accounts_q = await session.execute(
-        select(Account).where(
-            Account.is_active == True,  # noqa: E712
-            Account.user_id == user_id,
-        )
+    accounts_stmt = select(Account).where(
+        Account.is_active == True,  # noqa: E712
+        Account.user_id == user_id,
     )
+    active_id = await get_active_account_id(session, user_id)
+    if active_id is not None:
+        accounts_stmt = accounts_stmt.where(Account.id == active_id)
+    accounts_q = await session.execute(accounts_stmt)
     for acct in accounts_q.scalars().all():
         try:
             orders = await broker.get_open_orders(acct.questrade_account_id)
@@ -192,9 +199,17 @@ async def buying_power_breakdown(
     *,
     currency: str,
     user_id: str = "user_default",
+    account_id: uuid.UUID | None = None,
 ) -> dict[str, Decimal]:
-    """Return {cash, cash_equivalents, freeable_total} for this user's accounts."""
-    bal_result = await session.execute(
+    """Return {cash, cash_equivalents, freeable_total} for this user's accounts.
+
+    Pass `account_id` to scope to one account (e.g. the ticket's own account);
+    otherwise the user's active-account setting applies when set.
+    """
+    if account_id is None:
+        account_id = await get_active_account_id(session, user_id)
+
+    bal_stmt = (
         select(AccountBalance)
         .join(Account)
         .where(
@@ -203,12 +218,15 @@ async def buying_power_breakdown(
             Account.user_id == user_id,
         )
     )
+    if account_id is not None:
+        bal_stmt = bal_stmt.where(Account.id == account_id)
+    bal_result = await session.execute(bal_stmt)
     cash = sum(
         (b.cash for b in bal_result.scalars().all()),
         start=Decimal(0),
     )
 
-    pos_result = await session.execute(
+    pos_stmt = (
         select(Position)
         .join(Account)
         .where(
@@ -217,6 +235,9 @@ async def buying_power_breakdown(
             Account.user_id == user_id,
         )
     )
+    if account_id is not None:
+        pos_stmt = pos_stmt.where(Account.id == account_id)
+    pos_result = await session.execute(pos_stmt)
     cash_equiv = Decimal(0)
     for p in pos_result.scalars().all():
         if is_cash_equivalent(p.symbol):

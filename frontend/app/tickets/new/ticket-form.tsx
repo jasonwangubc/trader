@@ -21,6 +21,21 @@ import {
   fmtPct,
 } from "@/lib/tickets";
 
+/** The currency the account actually holds its equity in — an RRSP whose
+ * primary currency is CAD but whose money sits in USD should default USD. */
+function dominantCurrency(account: Account | undefined): "CAD" | "USD" {
+  if (!account) return "USD";
+  let best: { currency: string; equity: number } | null = null;
+  for (const b of account.balances ?? []) {
+    const eq = parseFloat(b.total_equity);
+    if (Number.isFinite(eq) && (best === null || eq > best.equity)) {
+      best = { currency: b.currency, equity: eq };
+    }
+  }
+  const c = best?.currency ?? account.primary_currency;
+  return c === "CAD" || c === "USD" ? c : "USD";
+}
+
 type FormState = {
   account_id: string;
   symbol: string;
@@ -39,22 +54,27 @@ type FormState = {
 
 export function TicketForm({
   accounts,
+  defaultAccountId,
   prefillSymbol,
   prefillTrigger,
   prefillStop,
   prefillTarget,
 }: {
   accounts: Account[];
+  defaultAccountId?: string;
   prefillSymbol?: string;
   prefillTrigger?: string;
   prefillStop?: string;
   prefillTarget?: string;
 }) {
   const router = useRouter();
+  // Default to the user's active trading account when one is set.
+  const defaultAccount =
+    accounts.find((a) => a.id === defaultAccountId) ?? accounts[0];
   const [form, setForm] = useState<FormState>(() => ({
-    account_id: accounts[0]?.id ?? "",
+    account_id: defaultAccount?.id ?? "",
     symbol: prefillSymbol ?? "",
-    currency: "USD",
+    currency: dominantCurrency(defaultAccount),
     setup_type: "VCP",
     trigger_type: "price_above_with_volume",
     trigger_price: prefillTrigger ?? "",
@@ -73,6 +93,10 @@ export function TicketForm({
   const [guardrailBlock, setGuardrailBlock] = useState<{ code: string; message: string } | null>(null);
   const [overrideRegime, setOverrideRegime] = useState(false);
   const [overrideStreak, setOverrideStreak] = useState(false);
+  // Drawdown breaker override requires typing the exact phrase — no checkbox.
+  const DRAWDOWN_PHRASE = "OVERRIDE DRAWDOWN BLOCK";
+  const [drawdownConfirmText, setDrawdownConfirmText] = useState("");
+  const drawdownOverrideValid = drawdownConfirmText.trim() === DRAWDOWN_PHRASE;
   const [isPaper, setIsPaper] = useState<boolean>(false);
   const [earningsWarning, setEarningsWarning] = useState<string | null>(null);
   const [suggest, setSuggest] = useState<{
@@ -195,7 +219,14 @@ export function TicketForm({
       const res = await fetch(`${API_URL}/api/tickets`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...body, is_paper: isPaper, override_regime: overrideRegime, override_streak: overrideStreak }),
+        body: JSON.stringify({
+          ...body,
+          is_paper: isPaper,
+          override_regime: overrideRegime,
+          override_streak: overrideStreak,
+          override_drawdown: drawdownOverrideValid,
+          drawdown_confirmation: drawdownOverrideValid ? drawdownConfirmText.trim() : null,
+        }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => null);
@@ -281,7 +312,7 @@ export function TicketForm({
                 onChange={(e) => {
                   const acc = accounts.find((a) => a.id === e.target.value);
                   set("account_id", e.target.value);
-                  if (acc) set("currency", acc.primary_currency as "CAD" | "USD");
+                  if (acc) set("currency", dominantCurrency(acc));
                 }}
                 className="border-input bg-background h-9 rounded-md border px-3 text-sm"
               >
@@ -514,6 +545,22 @@ export function TicketForm({
                 I have reviewed my recent trades — override loss-streak block
               </label>
             )}
+            {(guardrailBlock.code === "drawdown_block" || guardrailBlock.code === "drawdown_confirmation_required") && (
+              <div className="space-y-1.5">
+                <p className="text-xs text-muted-foreground">
+                  The account-level circuit breaker exists to stop death-by-a-thousand-cuts drawdowns.
+                  To proceed anyway, type <span className="font-mono font-semibold">{DRAWDOWN_PHRASE}</span> below.
+                  The override is written to the audit log and sizing stays halved.
+                </p>
+                <input
+                  type="text"
+                  value={drawdownConfirmText}
+                  onChange={(e) => setDrawdownConfirmText(e.target.value)}
+                  placeholder={DRAWDOWN_PHRASE}
+                  className="border-input bg-background h-9 w-full rounded-md border px-3 font-mono text-sm"
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -534,7 +581,7 @@ export function TicketForm({
           </button>
           <button
             type="submit"
-            disabled={!canSubmit && !(guardrailBlock && (overrideRegime || overrideStreak))}
+            disabled={!canSubmit && !(guardrailBlock && (overrideRegime || overrideStreak || drawdownOverrideValid))}
             className="bg-primary text-primary-foreground inline-flex h-10 items-center rounded-md px-5 text-sm font-medium transition-colors hover:bg-primary/90 disabled:opacity-50"
           >
             {submitting ? "Arming…" : "Arm ticket"}

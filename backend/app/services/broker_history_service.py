@@ -519,6 +519,7 @@ class FullSyncResult:
     trades_built: int
     trades_reconciled: int
     errors: list[str]
+    cash_flows_inserted: int = 0
 
 
 async def full_sync_for_user(
@@ -542,6 +543,18 @@ async def full_sync_for_user(
     trades_built = await rebuild_trades_for_user(session, user_id=user_id)
     reconciled = await reconcile_with_tickets(session, user_id=user_id)
 
+    # Cash flows (deposits/withdrawals/transfers) ride along with the same
+    # sync button — they power the charter honesty page's counterfactual.
+    from app.services.charter_service import sync_cash_flows_for_user
+    try:
+        cash_flows = await sync_cash_flows_for_user(
+            session, user_id=user_id, backfill_years=backfill_years,
+        )
+    except Exception as exc:
+        log.exception("Cash-flow sync failed for user=%s", user_id)
+        errors.append(f"cash flows: {exc}")
+        cash_flows = 0
+
     return FullSyncResult(
         accounts_synced=len(progresses),
         executions_fetched=sum(p.fetched for p in progresses),
@@ -549,4 +562,5 @@ async def full_sync_for_user(
         trades_built=trades_built,
         trades_reconciled=reconciled,
         errors=errors,
+        cash_flows_inserted=cash_flows,
     )

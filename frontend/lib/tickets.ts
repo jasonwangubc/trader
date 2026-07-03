@@ -11,6 +11,7 @@ export interface Account {
 export interface HouseholdData {
   accounts: Account[];
   household_equity: Record<string, string>;
+  active_account_id: string | null;
 }
 
 export interface SizingPreview {

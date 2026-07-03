@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { ArrowRight, Activity, TrendingUp, FileText, AlertTriangle, CheckCircle, XCircle, Search, BookOpen, BarChart2 } from "lucide-react";
+import { DrawdownCard } from "@/components/drawdown-card";
 import { api, type Health, type HealthDb, ApiError } from "@/lib/api";
 
 type Status = { ok: boolean };
@@ -202,6 +203,9 @@ export default async function DashboardPage() {
           </div>
         )}
       </div>
+
+      {/* Account drawdown circuit breaker */}
+      <DrawdownCard />
 
       {/* Quick actions */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

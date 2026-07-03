@@ -320,6 +320,43 @@ def _pip_match_score(prices: np.ndarray, template: np.ndarray) -> float:
 
 # ─── Base / pivot detection ───────────────────────────────────────────────────
 
+def compute_buy_pivot(df: pd.DataFrame, *, base_high: float | None = None) -> float | None:
+    """Buy-point pivot: the high of the most recent contraction.
+
+    This is the single pivot definition shared by the screener and the chart
+    page (the chart page's historical algorithm, which matched how traders
+    actually mark pivots): within the last ~65 bars, if the last 10 bars are
+    tight (average daily range < 2%), the pivot is that tight window's high;
+    otherwise the high of the last 25 bars.
+
+    When the recent high sits deep below the base rim (< 90% of `base_high`),
+    the rim remains the actionable buy point — a mid-base local high is not a
+    pivot. No breakout buffer is applied here: a trigger margin is an order
+    concern, not part of the pivot definition. Rounded to 2 decimals.
+    """
+    if df is None or df.empty or len(df) < 20:
+        return None
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+    window = min(65, len(highs))
+    h = highs[-window:]
+    low_w = lows[-window:]
+    if len(h) >= 10:
+        tight_h = h[-10:]
+        tight_l = low_w[-10:]
+        safe_h = np.where(tight_h > 0, tight_h, 1.0)
+        avg_range = float(np.mean((tight_h - tight_l) / safe_h))
+        if avg_range < 0.02:  # very tight — final contraction
+            pivot = float(np.max(tight_h))
+        else:
+            pivot = float(np.max(h[-25:])) if len(h) >= 25 else float(np.max(h))
+    else:
+        pivot = float(np.max(h))
+    if base_high is not None and base_high > 0 and pivot < base_high * 0.90:
+        pivot = float(base_high)
+    return round(pivot, 2)
+
+
 def _detect_base(df: pd.DataFrame) -> dict | None:
     """Find the most recent meaningful consolidation base.
 
@@ -327,8 +364,8 @@ def _detect_base(df: pd.DataFrame) -> dict | None:
       1. Find the most recent swing high within 25% of the 52-week high.
       2. Group nearby swing highs within ±3% of that bar into a *pivot zone*
          (Bulkowski: "rims should be near the same price level but be flexible").
-         The pivot price is the mean of the zone's highs — robust to a single
-         spike-bar that's 1% above the rest.
+         The base top is the max of the zone's highs; the actionable buy pivot
+         comes from compute_buy_pivot (most recent contraction high).
       3. Base low = min low between earliest zone bar and last bar.
 
     Soft floors: depth slightly outside [2.5%, 35%] is still returned with a
@@ -372,13 +409,13 @@ def _detect_base(df: pd.DataFrame) -> dict | None:
         zone_idxs = [candidate_idx]
 
     earliest_zone_idx = min(zone_idxs)
-    # Pivot price: average of the zone's swing highs (robust to single spike-bars)
-    pivot_price = float(np.mean([high[i] for i in zone_idxs]))
+    # Base top: max of the zone's swing highs. Depth is measured from here.
+    base_high = float(np.max([high[i] for i in zone_idxs]))
     base_low = float(np.min(low[earliest_zone_idx : last_idx + 1]))
     base_length = last_idx - earliest_zone_idx
-    if pivot_price <= 0:
+    if base_high <= 0:
         return None
-    base_depth_pct = (pivot_price - base_low) / pivot_price * 100.0
+    base_depth_pct = (base_high - base_low) / base_high * 100.0
 
     # Egregious hard floors only — borderline cases scored softly downstream
     if base_depth_pct > 50.0:
@@ -386,11 +423,17 @@ def _detect_base(df: pd.DataFrame) -> dict | None:
     if base_depth_pct < 1.0:
         return None
 
+    # Actionable buy point: most recent contraction high (shared definition
+    # with the chart page), falling back to the rim when price is deep in base.
+    pivot_price = compute_buy_pivot(df, base_high=base_high)
+    if pivot_price is None:
+        pivot_price = round(base_high, 2)
+
     return {
         "pivot_idx": earliest_zone_idx,
         "pivot_price": pivot_price,
         "base_low": base_low,
-        "base_high": pivot_price,
+        "base_high": base_high,
         "base_length_days": base_length,
         "base_depth_pct": base_depth_pct,
         "zone_count": len(zone_idxs),
@@ -1003,6 +1046,8 @@ def detect_pattern(
         quality = 0.0
 
     pivot_price = info["pivot_price"] if info else None
+    if pivot_price is not None:
+        pivot_price = round(float(pivot_price), 2)
     buyability, ext_pct = _classify_buyability(current_price, pivot_price, ma_50, ma_200)
 
     detail_dict: dict = {"all_scores": {c[0]: round(c[1], 3) for c in candidates}}
