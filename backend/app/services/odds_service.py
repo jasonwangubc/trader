@@ -28,7 +28,6 @@ from app.services.signal_scan_service import latest_successful_scan
 log = logging.getLogger(__name__)
 
 MIN_COHORT_TRADES = 30
-_DEFAULT_LOOKBACK = 504
 
 
 @dataclass
@@ -73,9 +72,12 @@ async def compute_outcome_odds(
     target_price: float,
     atr: float,
     time_stop_days: int = 20,
-    lookback_days: int = _DEFAULT_LOOKBACK,
 ) -> OddsEstimate:
-    """Empirical P(target before stop) for this plan, from similar cached setups."""
+    """Empirical P(target before stop) for this plan, from similar cached setups.
+
+    Uses the newest successful scan regardless of its lookback (504-day and
+    1260-day scans are both valid cohort sources; freshest wins).
+    """
     if atr <= 0:
         return _unavailable("No ATR available for this symbol.")
     risk = entry_price - stop_price
@@ -85,7 +87,7 @@ async def compute_outcome_odds(
     if reward <= 0:
         return _unavailable("Target must be above entry.")
 
-    scan = await latest_successful_scan(session, lookback_days=lookback_days)
+    scan = await latest_successful_scan(session)
     if scan is None:
         return _unavailable(
             "No backtest signal scan cached yet — run a backtest (Phase 1 scan) "
@@ -132,7 +134,7 @@ async def compute_outcome_odds(
             stop_atr=stop_atr,
             target_r=target_r,
             time_stop=time_stop_days,
-            lookback_days=lookback_days,
+            lookback_days=scan.lookback_days,
             **filters,
         )
         if result.total_trades >= MIN_COHORT_TRADES:

@@ -37,6 +37,7 @@ from app.db.models import (
     ScreenerSymbol,
 )
 from app.services.eod_service import get_bars_df
+from app.services.ml_features import atr_scalar, extract_features
 from app.services.pattern_service import detect_pattern
 from app.services.trend_template import MIN_BARS, score_trend_template
 from app.services.vcp_scorer import score_vcp
@@ -48,19 +49,6 @@ log = logging.getLogger(__name__)
 # Keyed by (symbol, lookback_days). Loaded lazily by Phase 1, reused by Phase 2.
 # Cleared when a new scan starts or process restarts.
 _bars_cache: dict[tuple[str, int], pd.DataFrame] = {}
-
-
-def _atr(df: pd.DataFrame, period: int = 14) -> float:
-    if len(df) < period + 1:
-        return float(df["close"].iloc[-1]) * 0.02
-    h = df["high"].values.astype(float)
-    l = df["low"].values.astype(float)
-    c = df["close"].values.astype(float)
-    trs = []
-    for i in range(-period, 0):
-        tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
-        trs.append(tr)
-    return float(np.mean(trs))
 
 
 def _ma(closes: np.ndarray, n: int) -> float | None:
@@ -85,6 +73,7 @@ class CandidateRow:
     buyability: str
     pivot_price: float
     atr_at_signal: float
+    features: dict | None = None
 
 
 # Minimum signal-bar gap — same symbol can't fire on every consecutive bar even
@@ -138,6 +127,10 @@ async def scan_universe(
     candidates: list[CandidateRow] = []
     completed = 0
 
+    # SPY date array for point-in-time benchmark slicing (no look-ahead: the
+    # benchmark window must end at the signal bar's date, not at "now").
+    spy_dates = spy_df["date"].to_numpy() if not spy_df.empty else None
+
     try:
         for sym in symbols:
             df = await get_bars_df(session, sym, days=lookback_days)
@@ -149,7 +142,12 @@ async def scan_universe(
             _bars_cache[(sym, lookback_days)] = df
 
             closes = df["close"].values.astype(float)
-            dates  = df["date"].tolist()
+            sym_dates = df["date"].to_numpy()
+            # Per-bar SPY alignment: spy_cut[i] = number of SPY bars dated ≤ bar i.
+            spy_cut = (
+                np.searchsorted(spy_dates, sym_dates, side="right")
+                if spy_dates is not None else None
+            )
             last_signal_bar = -1
             scan_end = len(df) - 35   # leave room for trigger_window + time_stop in Phase 2
 
@@ -157,8 +155,9 @@ async def scan_universe(
                 if i - last_signal_bar < SCAN_DEDUP_BARS:
                     continue
                 hist = df.iloc[:i + 1]
+                spy_hist = spy_df.iloc[:int(spy_cut[i])] if spy_cut is not None else None
 
-                tt = score_trend_template(hist, benchmark_df=spy_df if not spy_df.empty else None)
+                tt = score_trend_template(hist, benchmark_df=spy_hist)
                 if tt.score < 2:   # rock-bottom cutoff; sweepable threshold lives in Phase 2
                     continue
 
@@ -174,7 +173,15 @@ async def scan_universe(
                     continue
 
                 vcp = score_vcp(hist, tt)
-                atr = _atr(hist)
+                atr = atr_scalar(hist)
+
+                try:
+                    features = extract_features(
+                        hist, spy_hist=spy_hist, tt=tt, vcp=vcp, pat=pat, atr=atr,
+                    )
+                except Exception:
+                    log.exception("feature extraction failed for %s @ bar %d", sym, i)
+                    features = None
 
                 candidates.append(CandidateRow(
                     symbol=sym,
@@ -187,6 +194,7 @@ async def scan_universe(
                     buyability=pat.buyability,
                     pivot_price=float(pat.pivot_price),
                     atr_at_signal=atr,
+                    features=features,
                 ))
                 last_signal_bar = i
 
@@ -209,6 +217,7 @@ async def scan_universe(
                     "buyability": c.buyability,
                     "pivot_price": c.pivot_price,
                     "atr_at_signal": c.atr_at_signal,
+                    "features": c.features,
                 }
                 for c in candidates
             ]
@@ -238,14 +247,17 @@ async def scan_universe(
 async def latest_successful_scan(
     session: AsyncSession,
     *,
-    lookback_days: int,
+    lookback_days: int | None = None,
 ) -> BacktestSignalScan | None:
+    """Newest successful scan. lookback_days=None matches any lookback —
+    callers that just want "the freshest scan" (odds card, training) use that
+    and read scan.lookback_days off the returned row."""
+    conds = [BacktestSignalScan.status == "success"]
+    if lookback_days is not None:
+        conds.append(BacktestSignalScan.lookback_days == lookback_days)
     q = await session.execute(
         select(BacktestSignalScan)
-        .where(
-            BacktestSignalScan.lookback_days == lookback_days,
-            BacktestSignalScan.status == "success",
-        )
+        .where(*conds)
         .order_by(BacktestSignalScan.finished_at.desc())
         .limit(1)
     )

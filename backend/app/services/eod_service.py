@@ -4,7 +4,8 @@ Downloads adjusted OHLCV for all active screener symbols plus benchmark tickers
 (SPY for US, XIU.TO for TSX). Stores in daily_bars. Safe to run repeatedly — uses
 upsert logic so re-runs are idempotent.
 
-Lookback: 2 years (504 trading days) to support 200-day MA and 52-week stats.
+Lookback: 5 years (~1260 trading days) to support 200-day MA, 52-week stats,
+and multi-regime training data for the ML ranker.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ from app.db.session import SessionLocal
 log = logging.getLogger(__name__)
 
 BENCHMARKS = ["SPY", "XIU.TO"]   # RS comparison universe
-LOOKBACK_YEARS = 2
+LOOKBACK_YEARS = 5
 
 # yfinance bulk-download tuning.  A single yf.download() call for thousands of
 # symbols can trigger rate limits and partial failures.  We split into chunks
@@ -38,12 +39,21 @@ _INTER_CHUNK_DELAY = 2.0   # seconds between chunks
 _MAX_RETRIES = 2
 _RETRY_DELAY = 10.0        # seconds before first retry (doubled on second)
 
+# A one-off 5-year full-history pull is a much heavier request per chunk than
+# the usual 5-day incremental delta (~250x the rows). Observed in practice:
+# Yahoo doesn't raise an error for oversized bulk+long-range requests, it
+# silently truncates the returned date range — so a 500-symbol/5-year chunk
+# can come back "successful" but only cover the last ~2 years. Smaller,
+# slower-paced chunks avoid this.
+_FULL_HISTORY_CHUNK_SIZE = 100
+_FULL_HISTORY_INTER_CHUNK_DELAY = 6.0
+
 
 async def sync_eod_incremental(
     session: AsyncSession,
     symbols: list[str],
     *,
-    full_years: int = 2,
+    full_years: int = LOOKBACK_YEARS,
     delta_days: int = 35,
     on_chunk: Callable[[int], None] | None = None,
 ) -> dict[str, int]:
@@ -81,6 +91,42 @@ async def sync_eod_incremental(
         log.info("Delta download for %d existing symbols (last %d days)", len(existing_symbols), delta_days)
         counts.update(await _bulk_download_and_store(session, existing_symbols, cutoff_delta, today, on_chunk=on_chunk))
 
+    await session.commit()
+    return counts
+
+
+async def resync_full_history(
+    session: AsyncSession,
+    symbols: list[str] | None = None,
+    *,
+    years: int = LOOKBACK_YEARS,
+    on_chunk: Callable[[int], None] | None = None,
+) -> dict[str, int]:
+    """One-off full-history re-ingest for every symbol (default: all active + benchmarks).
+
+    Unlike sync_eod_incremental, existing symbols also get the full `years` of
+    history — used when extending the retention horizon. Chunked + retried so a
+    rate limit only loses one chunk. Upserts, so the freshly adjusted series
+    overwrites older rows consistently.
+    """
+    if symbols is None:
+        result = await session.execute(
+            select(ScreenerSymbol.symbol).where(ScreenerSymbol.is_active == True)  # noqa: E712
+        )
+        symbols = [r for (r,) in result.all()]
+    all_symbols = sorted(set(symbols) | set(BENCHMARKS))
+    if not all_symbols:
+        return {}
+
+    start = (datetime.now(timezone.utc) - timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
+    end = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+    log.info("Full-history resync: %d symbols from %s", len(all_symbols), start)
+
+    counts = await _bulk_download_and_store(
+        session, all_symbols, start, end, on_chunk=on_chunk,
+        chunk_size=_FULL_HISTORY_CHUNK_SIZE,
+        inter_chunk_delay=_FULL_HISTORY_INTER_CHUNK_DELAY,
+    )
     await session.commit()
     return counts
 
@@ -131,6 +177,9 @@ async def _bulk_download_and_store(
     start: str,
     end: str,
     on_chunk: Callable[[int], None] | None = None,
+    *,
+    chunk_size: int = _CHUNK_SIZE,
+    inter_chunk_delay: float = _INTER_CHUNK_DELAY,
 ) -> dict[str, int]:
     """Download symbols in chunks and upsert bars into daily_bars.
 
@@ -143,16 +192,17 @@ async def _bulk_download_and_store(
     if not symbols:
         return {}
 
+    requested_start = datetime.strptime(start, "%Y-%m-%d").date()
     counts: dict[str, int] = {s: 0 for s in symbols}
-    chunks = [symbols[i : i + _CHUNK_SIZE] for i in range(0, len(symbols), _CHUNK_SIZE)]
+    chunks = [symbols[i : i + chunk_size] for i in range(0, len(symbols), chunk_size)]
     log.info(
         "Downloading %d symbols in %d chunk(s) of up to %d",
-        len(symbols), len(chunks), _CHUNK_SIZE,
+        len(symbols), len(chunks), chunk_size,
     )
 
     for chunk_idx, chunk in enumerate(chunks):
         if chunk_idx > 0:
-            await asyncio.sleep(_INTER_CHUNK_DELAY)
+            await asyncio.sleep(inter_chunk_delay)
 
         raw = await _download_chunk(chunk, start, end)
         if raw is None:
@@ -169,6 +219,20 @@ async def _bulk_download_and_store(
                 "Chunk %d/%d: %d/%d symbols had data",
                 chunk_idx + 1, len(chunks), stored, len(chunk),
             )
+            # Yahoo can silently truncate an oversized bulk+long-range request
+            # instead of erroring — surface it instead of failing quiet.
+            try:
+                earliest_in_chunk = min(
+                    (idx.date() for idx in raw.index if pd.notna(idx)), default=None
+                )
+                if earliest_in_chunk is not None and earliest_in_chunk > requested_start + timedelta(days=30):
+                    log.warning(
+                        "Chunk %d/%d: data starts at %s but %s was requested — "
+                        "response may have been truncated (rate limit / oversized request)",
+                        chunk_idx + 1, len(chunks), earliest_in_chunk, requested_start,
+                    )
+            except Exception:
+                pass
 
         if on_chunk is not None:
             try:

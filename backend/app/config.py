@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     # Format: "AppName/version contact@example.com"
     edgar_user_agent: str = "trader-screener/1.0 contact@example.com"
 
+    # ML ranker — where trained model artifacts (joblib) are written,
+    # relative to the backend working directory unless absolute.
+    ml_artifact_dir: str = "model_artifacts"
+
 
 @lru_cache
 def get_settings() -> Settings:

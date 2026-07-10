@@ -102,6 +102,32 @@ def alert_target_hit(symbol: str, target_label: str, target_price: Decimal, is_p
     _telegram(body)
 
 
+def alert_watchlist_near_pivot(
+    symbol: str, last_close: Decimal, pivot_price: Decimal, extension_pct: float,
+) -> None:
+    """Early heads-up: an in-base watchlist stock is approaching its pivot
+    with rising volume. Not a trigger — just a nudge to start paying attention."""
+    body = (
+        f"*[WATCH] {symbol} approaching pivot*\n"
+        f"Last: {last_close}  |  Pivot: {pivot_price}  |  {extension_pct:+.1f}% from pivot\n"
+        "Rising volume. Watch for the breakout — arm a ticket when it clears the pivot with volume."
+    )
+    _send(f"[WATCH] {symbol} approaching pivot ({extension_pct:+.1f}%)", body.replace("*", ""))
+    _telegram(body)
+
+
+def alert_watchlist_at_pivot(symbol: str, last_close: Decimal, pivot_price: Decimal) -> None:
+    """A watchlist stock's buyability just flipped to at_pivot — it's in the
+    actionable zone now."""
+    body = (
+        f"*[WATCH] {symbol} AT PIVOT*\n"
+        f"Last: {last_close}  |  Pivot: {pivot_price}\n"
+        "In the buy zone now. Arm a ticket if you want this one."
+    )
+    _send(f"[WATCH] {symbol} AT PIVOT @ {last_close}", body.replace("*", ""))
+    _telegram(body)
+
+
 def alert_trailing_action(
     symbol: str,
     action_type: str,

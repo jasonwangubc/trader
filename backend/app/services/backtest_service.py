@@ -213,6 +213,136 @@ def _ma(closes: np.ndarray, n: int) -> float | None:
     return float(np.mean(closes[-n:]))
 
 
+# ─── Shared per-candidate trade simulation ────────────────────────────────────
+# Single source of truth for entry/exit conventions. Used by Phase-2
+# (simulate_from_candidates → odds card, sweeps) and by the ML label builder.
+
+
+@dataclass
+class TradeSim:
+    """Outcome of walking one candidate forward from its signal bar.
+
+    Conventions (mirror the user's real EOD workflow):
+      - Buy-stop resting at the pivot; watch starts the bar AFTER the signal.
+      - Fill = max(open, pivot) on the trigger bar (gap-ups fill at the open).
+      - Exits: gap through stop/target exits at the open; intraday touch exits
+        at the stop/target price; stop is checked before target on the same
+        bar (conservative — intraday order is unknowable from daily bars).
+      - MAE/MFE (when record_excursions=True): measured from entry_price over
+        bars trigger_bar..exit_bar inclusive. The trigger bar's full range is
+        included (conservative — its low may predate the intraday fill).
+      - censored=True when the outcome window ran off the end of the data
+        (unfinished trigger watch, or a time-stop that wasn't the full
+        time_stop bars). Training must exclude censored rows.
+    """
+    triggered: bool
+    invalid: bool = False              # risk <= 0 at fill — no simulatable trade
+    censored: bool = False
+    trigger_bar: int | None = None
+    days_to_trigger: int | None = None
+    entry_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+    exit_bar: int | None = None
+    exit_price: float | None = None
+    exit_reason: str | None = None     # "stop" | "target" | "time" | None
+    r_multiple: float | None = None
+    bars_held: int | None = None
+    mae_r: float | None = None
+    mfe_r: float | None = None
+    mae_pct: float | None = None
+    mfe_pct: float | None = None
+
+
+def simulate_candidate(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    i: int,
+    pivot: float,
+    atr: float,
+    *,
+    stop_atr: float,
+    target_r: float,
+    time_stop: int,
+    trigger_window: int,
+    record_excursions: bool = False,
+) -> TradeSim:
+    """Walk one candidate at signal bar `i` forward. Pure — no DB, no pandas."""
+    n_bars = len(closes)
+
+    # Stage 1: trigger watch (bar after signal onward)
+    triggered = False
+    trigger_bar: int | None = None
+    for j in range(i + 1, min(i + 1 + trigger_window, n_bars)):
+        if highs[j] >= pivot:
+            triggered = True
+            trigger_bar = j
+            break
+
+    if not triggered:
+        # If the watch window was cut short by the end of data, "never
+        # triggered" is not a settled outcome.
+        return TradeSim(triggered=False, censored=(i + trigger_window > n_bars - 1))
+
+    # Stage 2: simulate the trade
+    entry_price = max(float(opens[trigger_bar]), pivot)
+    stop_price = entry_price - stop_atr * atr
+    risk = entry_price - stop_price
+    if risk <= 0:
+        return TradeSim(triggered=True, invalid=True, trigger_bar=trigger_bar,
+                        days_to_trigger=trigger_bar - i)
+    target_price = entry_price + target_r * risk
+
+    exit_bar = min(trigger_bar + time_stop, n_bars - 1)
+    exit_price = float(closes[exit_bar])
+    exit_reason = "time"
+
+    for k in range(trigger_bar + 1, min(trigger_bar + time_stop + 1, n_bars)):
+        bar_open = float(opens[k])
+        if bar_open <= stop_price:
+            exit_price = bar_open; exit_reason = "stop"; exit_bar = k; break
+        if bar_open >= target_price:
+            exit_price = bar_open; exit_reason = "target"; exit_bar = k; break
+        if lows[k] <= stop_price:
+            exit_price = stop_price; exit_reason = "stop"; exit_bar = k; break
+        if highs[k] >= target_price:
+            exit_price = target_price; exit_reason = "target"; exit_bar = k; break
+
+    censored = exit_reason == "time" and trigger_bar + time_stop > n_bars - 1
+
+    mae_r = mfe_r = mae_pct = mfe_pct = None
+    if record_excursions:
+        seg_lows = lows[trigger_bar : exit_bar + 1]
+        seg_highs = highs[trigger_bar : exit_bar + 1]
+        lo = float(np.min(seg_lows))
+        hi = float(np.max(seg_highs))
+        mae_r = round((lo - entry_price) / risk, 4)
+        mfe_r = round((hi - entry_price) / risk, 4)
+        mae_pct = round((lo - entry_price) / entry_price * 100.0, 4)
+        mfe_pct = round((hi - entry_price) / entry_price * 100.0, 4)
+
+    return TradeSim(
+        triggered=True,
+        censored=censored,
+        trigger_bar=trigger_bar,
+        days_to_trigger=trigger_bar - i,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        exit_bar=exit_bar,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        r_multiple=(exit_price - entry_price) / risk,
+        bars_held=exit_bar - trigger_bar,
+        mae_r=mae_r,
+        mfe_r=mfe_r,
+        mae_pct=mae_pct,
+        mfe_pct=mfe_pct,
+    )
+
+
 # ─── Public entry point (Phase 1 + Phase 2 orchestrator) ────────────────────
 
 
@@ -381,16 +511,13 @@ async def simulate_from_candidates(
             if latest_date is None or signal_date > latest_date:
                 latest_date = signal_date
 
-            # Stage 1: trigger watch
-            triggered = False
-            trigger_bar = None
-            for j in range(i + 1, min(i + 1 + trigger_window, n_bars)):
-                if highs[j] >= pivot:
-                    triggered = True
-                    trigger_bar = j
-                    break
+            sim = simulate_candidate(
+                opens, highs, lows, closes, i, pivot, float(c.atr_at_signal),
+                stop_atr=stop_atr, target_r=target_r,
+                time_stop=time_stop, trigger_window=trigger_window,
+            )
 
-            if not triggered:
+            if not sim.triggered:
                 trades.append(BacktestTrade(
                     symbol=sym, signal_date=signal_date,
                     pivot_price=round(pivot, 2),
@@ -410,33 +537,9 @@ async def simulate_from_candidates(
                 next_eligible = i + trigger_window + 1
                 continue
 
-            # Stage 2: simulate the trade
-            entry_price = max(float(opens[trigger_bar]), pivot)
-            atr = float(c.atr_at_signal)
-            stop_price = entry_price - stop_atr * atr
-            risk = entry_price - stop_price
-            if risk <= 0:
-                next_eligible = trigger_bar + 1
+            if sim.invalid:
+                next_eligible = sim.trigger_bar + 1
                 continue
-            target_price = entry_price + target_r * risk
-
-            exit_bar = min(trigger_bar + time_stop, n_bars - 1)
-            exit_price = float(closes[exit_bar])
-            exit_reason = "time"
-
-            for k in range(trigger_bar + 1, min(trigger_bar + time_stop + 1, n_bars)):
-                bar_open = float(opens[k])
-                if bar_open <= stop_price:
-                    exit_price = bar_open; exit_reason = "stop"; exit_bar = k; break
-                if bar_open >= target_price:
-                    exit_price = bar_open; exit_reason = "target"; exit_bar = k; break
-                if lows[k] <= stop_price:
-                    exit_price = stop_price; exit_reason = "stop"; exit_bar = k; break
-                if highs[k] >= target_price:
-                    exit_price = target_price; exit_reason = "target"; exit_bar = k; break
-
-            r_multiple = (exit_price - entry_price) / risk
-            dollar_pnl = r_multiple * dollars_per_trade
 
             trades.append(BacktestTrade(
                 symbol=sym,
@@ -449,20 +552,20 @@ async def simulate_from_candidates(
                 tt_score=c.tt_score,
                 vcp_score=round(float(c.vcp_score), 3),
                 triggered=True,
-                days_to_trigger=trigger_bar - i,
-                entry_date=str(dates[trigger_bar])[:10],
-                entry_price=round(entry_price, 2),
-                stop_price=round(stop_price, 2),
-                target_price=round(target_price, 2),
-                exit_date=str(dates[exit_bar])[:10],
-                exit_price=round(exit_price, 2),
-                exit_reason=exit_reason,
-                r_multiple=round(r_multiple, 3),
-                dollar_pnl=round(dollar_pnl, 2),
-                bars_held=exit_bar - trigger_bar,
+                days_to_trigger=sim.days_to_trigger,
+                entry_date=str(dates[sim.trigger_bar])[:10],
+                entry_price=round(sim.entry_price, 2),
+                stop_price=round(sim.stop_price, 2),
+                target_price=round(sim.target_price, 2),
+                exit_date=str(dates[sim.exit_bar])[:10],
+                exit_price=round(sim.exit_price, 2),
+                exit_reason=sim.exit_reason,
+                r_multiple=round(sim.r_multiple, 3),
+                dollar_pnl=round(sim.r_multiple * dollars_per_trade, 2),
+                bars_held=sim.bars_held,
             ))
 
-            next_eligible = exit_bar + 1
+            next_eligible = sim.exit_bar + 1
 
     # Aggregate
     result.trades = sorted(trades, key=lambda t: t.signal_date)

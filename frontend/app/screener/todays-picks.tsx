@@ -18,6 +18,7 @@ interface PickRow {
   pivot_price: string | null;
   extension_pct: string | null;
   composite_score: number;
+  ml_score: number | null;   // 0-100 model win estimate; null = no trained model
   eps_rank: number | null;
   rs_rank: number | null;
   accelerating: boolean;
@@ -273,6 +274,16 @@ function PickCard({
         <span className="text-xs tabular-nums w-14 text-right font-bold text-foreground/90">
           {p.composite_score.toFixed(0)}
         </span>
+        {p.ml_score != null && (
+          <span
+            className={`text-[10px] tabular-nums w-14 text-right ${
+              p.ml_score >= 45 ? "text-emerald-400" : p.ml_score >= 33 ? "text-amber-400" : "text-muted-foreground"
+            }`}
+            title={`Model win estimate: ${p.ml_score.toFixed(0)}% chance of reaching a 2-to-1 profit target before the stop loss after a breakout, learned from this screener's own historical setups. Breakeven at a 2-to-1 target is 33%.`}
+          >
+            win {p.ml_score.toFixed(0)}%
+          </span>
+        )}
         {p.pivot_price && (
           <span className={`text-[10px] tabular-nums w-20 text-right ${
             ext === null ? "text-muted-foreground/60"

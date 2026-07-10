@@ -131,3 +131,17 @@ def test_mid_base_falls_back_to_rim():
 def test_no_pivot_on_tiny_dataframe():
     df = _flat_base_df().head(10)
     assert compute_buy_pivot(df) is None
+
+
+def test_detect_pattern_surfaces_scorer_internals():
+    """The ML feature extractor reads pattern internals from details — the
+    refactor that exposed them must keep populating these keys."""
+    result = detect_pattern(_flat_base_df())
+    assert result.details["zone_count"] >= 1
+    vm = result.details["vcp_metrics"]
+    assert {"n_contractions", "last_contraction_pct", "progression",
+            "tightness_score", "vol_score"} <= set(vm.keys())
+    assert vm["n_contractions"] >= 1
+    cm = result.details["cwh_metrics"]
+    assert {"handle_depth_pct", "handle_bars", "handle_position",
+            "handle_vol_ratio", "rim_ratio", "symmetry_score", "pip_score"} <= set(cm.keys())

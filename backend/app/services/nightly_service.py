@@ -149,24 +149,68 @@ async def _snapshot_equity_all_users() -> None:
         log.exception("Nightly equity snapshot failed")
 
 
+_do_sync_lock = asyncio.Lock()
+
+
 async def _do_sync(symbols: list[str]) -> None:
-    """Download incremental EOD bars then immediately rescore the universe."""
+    """Download incremental EOD bars then immediately rescore the universe.
+
+    Guarded: the nightly loop and the startup stale check can both decide to
+    sync within seconds of each other on an evening restart — the second
+    trigger is skipped instead of double-downloading and double-scanning.
+    """
     from app.db.session import SessionLocal
     from app.services.eod_service import sync_eod_incremental
-    from app.services.screener_service import run_screener
+    from app.services.screener_service import ScanInProgressError, run_screener
 
-    # Benchmarks ride along: SPY/XIU for the regime model, ZSP.TO for the
-    # charter honesty page's CAD counterfactual.
-    benchmarks = [s for s in ("SPY", "XIU.TO", "ZSP.TO") if s not in symbols]
+    if _do_sync_lock.locked():
+        log.info("EOD sync already in progress — skipping duplicate trigger")
+        return
 
-    async with SessionLocal() as session:
-        counts = await sync_eod_incremental(session, symbols + benchmarks, delta_days=5)
-    downloaded = sum(v for v in counts.values() if v > 0)
-    log.info("EOD sync: %d/%d symbols updated — running screener rescore", downloaded, len(symbols))
+    async with _do_sync_lock:
+        # Benchmarks ride along: SPY/XIU for the regime model, ZSP.TO for the
+        # charter honesty page's CAD counterfactual.
+        benchmarks = [s for s in ("SPY", "XIU.TO", "ZSP.TO") if s not in symbols]
 
-    async with SessionLocal() as session:
-        _, stats = await run_screener(session, mode="auto")
-    log.info(
-        "Nightly rescore complete: %d scored, %d TT-passing, %d with fundamentals",
-        stats.scored, stats.tt_passing, stats.with_fundamentals,
-    )
+        async with SessionLocal() as session:
+            counts = await sync_eod_incremental(session, symbols + benchmarks, delta_days=5)
+        downloaded = sum(v for v in counts.values() if v > 0)
+        log.info("EOD sync: %d/%d symbols updated — running screener rescore", downloaded, len(symbols))
+
+        try:
+            async with SessionLocal() as session:
+                _, stats = await run_screener(session, mode="auto")
+        except ScanInProgressError:
+            log.info("Rescore skipped — a manually triggered scan is already running")
+            return
+        log.info(
+            "Nightly rescore complete: %d scored, %d TT-passing, %d with fundamentals, "
+            "%d skipped for a stale price feed",
+            stats.scored, stats.tt_passing, stats.with_fundamentals, stats.stale_bar_skips,
+        )
+
+        await _sync_watchlist_all_users()
+
+
+async def _sync_watchlist_all_users() -> None:
+    """Stage-2 watchlist auto-sync from the fresh Tier S/A picks above.
+    Per-user (WatchlistItem is user-scoped), wrapped so one user's failure
+    doesn't block others — same resilience pattern as equity snapshots."""
+    from sqlalchemy import select
+
+    from app.db.models import Account
+    from app.db.session import SessionLocal
+    from app.services.watchlist_service import sync_watchlist_from_picks
+
+    try:
+        async with SessionLocal() as session:
+            users_q = await session.execute(select(Account.user_id).distinct())
+            user_ids = [uid for (uid,) in users_q.all()]
+            for user_id in user_ids:
+                try:
+                    await sync_watchlist_from_picks(session, user_id=user_id)
+                except Exception:
+                    log.exception("Watchlist sync failed for user %s", user_id)
+        log.info("Watchlist sync complete for %d users", len(user_ids))
+    except Exception:
+        log.exception("Watchlist sync loop failed")

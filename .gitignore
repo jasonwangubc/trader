@@ -47,6 +47,7 @@ postgres-data/
 # Build artifacts
 dist/
 build/
+backend/model_artifacts/
 
 # Local databases (we use Postgres in Docker, but just in case)
 *.sqlite

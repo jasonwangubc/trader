@@ -32,6 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import ScreenerScore, ScreenerSymbol
 from app.services.eod_service import BENCHMARKS, get_bars_df, sync_eod_incremental
+from app.services.ml_features import atr_scalar, extract_features
+from app.services.ml_ranker import load_active_model, predict_proba
 from app.services.pattern_service import detect_pattern
 from app.services.trend_template import MIN_BARS, score_trend_template
 from app.services.universe_service import build_universe
@@ -66,6 +68,18 @@ YF_FUNDAMENTALS_CONCURRENCY = 3
 YF_FUNDAMENTALS_DELAY = 0.4       # seconds between each completed call
 YF_FUNDAMENTALS_RETRY_DELAY = 5.0 # seconds before retry on exception
 YF_FUNDAMENTALS_STALE_DAYS = 5    # re-fetch fundamentals after this many days
+
+# A symbol whose latest bar is more than this many days behind the benchmark's
+# (SPY) latest bar is treated as having a dead/stalled price feed — delisting,
+# trading halt, ticker rename, or an exotic security type (SPAC unit/warrant)
+# yfinance has stopped serving. len(df) >= MIN_BARS alone doesn't catch this:
+# a symbol can have 500+ historical rows and still not have updated in months.
+# Rescoring it anyway would stamp a fresh scored_at on stale prices, which
+# defeats the scored_at freshness filter everything downstream relies on
+# (get_screener_results, get_tiered_picks, the watchlist auto-sync). Skipping
+# the rescan instead leaves the existing ScreenerScore row's old scored_at in
+# place, so it ages out via the normal freshness cutoff.
+MAX_BAR_STALENESS_DAYS = 5
 
 
 def _yf_info_sync(sym: str) -> dict:
@@ -222,6 +236,7 @@ class PipelineStats:
     universe_size: int = 0
     eod_downloaded: int = 0
     liquidity_filtered: int = 0   # skipped due to avg volume < 100k
+    stale_bar_skips: int = 0      # skipped: price feed hasn't updated in MAX_BAR_STALENESS_DAYS
     tt_passing: int = 0
     scored: int = 0
     with_fundamentals: int = 0
@@ -319,6 +334,21 @@ class ScreenerProgress:
         return (completed_weight + current_w * within) * 100.0
 
 
+class ScanInProgressError(RuntimeError):
+    """A universe scan is already running in this process."""
+
+
+# One universe scan at a time. Three triggers exist (API /scan, the nightly
+# loop, the startup stale check) and only the API had a guard — a backend
+# restart after 17:30 ET fired nightly + startup concurrently, and the loser
+# died on the screener_scores unique(symbol) constraint at commit.
+_scan_lock = asyncio.Lock()
+
+
+def scan_in_progress() -> bool:
+    return _scan_lock.locked()
+
+
 async def run_screener(
     session: AsyncSession,
     *,
@@ -327,10 +357,28 @@ async def run_screener(
 ) -> tuple[list[ScreenerScore], PipelineStats]:
     """Run full screener pipeline. Returns (results, stats).
 
+    Raises ScanInProgressError instead of queueing when a scan is already
+    running — a second concurrent scan is pure waste and the interleaved
+    inserts collide on unique(symbol).
+
     If `progress` is supplied, the pipeline updates it after each stage and
     per-symbol within long stages (TT scoring, VCP scoring, fundamentals)
     so the API can drive a live progress bar.
     """
+    if _scan_lock.locked():
+        raise ScanInProgressError(
+            "A universe scan is already running — wait for it to finish and retry."
+        )
+    async with _scan_lock:
+        return await _run_screener_impl(session, mode=mode, progress=progress)
+
+
+async def _run_screener_impl(
+    session: AsyncSession,
+    *,
+    mode: str = "auto",
+    progress: ScreenerProgress | None = None,
+) -> tuple[list[ScreenerScore], PipelineStats]:
     stats = PipelineStats()
     p = progress  # alias
 
@@ -405,11 +453,23 @@ async def run_screener(
             p.stage_label = f"Scoring trend template ({len(cached_rows)} resuming from today)"
     MIN_AVG_VOLUME = 100_000
     spy_df = await get_bars_df(session, "SPY", days=504)
+    spy_latest_bar = spy_df["date"].max() if not spy_df.empty else None
 
     tt_results = {}
+    stale_bar_skips = 0
     for sym in symbols_to_score:
         df = await get_bars_df(session, sym, days=MIN_BARS + 30)
         if df.empty or len(df) < MIN_BARS:
+            if p: p.tick()
+            continue
+        # Bar-recency gate: a stalled price feed still has plenty of historical
+        # rows, so the length check above doesn't catch it. Compare against the
+        # benchmark (SPY essentially never fails to download) rather than
+        # "today," so weekends/holidays don't false-positive.
+        if spy_latest_bar is not None and (spy_latest_bar - df["date"].max()).days > MAX_BAR_STALENESS_DAYS:
+            log.debug("%s bars stale (latest=%s, benchmark=%s) — skipping rescan",
+                      sym, df["date"].max(), spy_latest_bar)
+            stale_bar_skips += 1
             if p: p.tick()
             continue
         # Liquidity check: 20-day average volume
@@ -434,9 +494,11 @@ async def run_screener(
         1 for r in cached_rows
         if r.tt_criteria and all(r.tt_criteria.get(c) for c in ESSENTIAL_TT_CRITERIA)
     )
+    stats.stale_bar_skips = stale_bar_skips
     log.info(
-        "TT essentials filter: %d fresh passed (out of %d scored), %d cached carried forward",
-        len(passing), len(tt_results), len(cached_rows),
+        "TT essentials filter: %d fresh passed (out of %d scored), %d cached carried forward, "
+        "%d skipped for a stale price feed (>%dd behind benchmark)",
+        len(passing), len(tt_results), len(cached_rows), stale_bar_skips, MAX_BAR_STALENESS_DAYS,
     )
 
     # ── Step 4: VCP scoring ──────────────────────────────────────────────────
@@ -449,7 +511,7 @@ async def run_screener(
     if vcp_symbols:
         # VCP top-up: no progress ticking here — the VCP scoring loop below
         # provides per-symbol ticks once this bulk download finishes.
-        vcp_counts = await sync_eod_incremental(session, vcp_symbols, full_years=2)
+        vcp_counts = await sync_eod_incremental(session, vcp_symbols)
         log.info("VCP EOD top-up: %d symbols", len(vcp_counts))
 
     scored: list[tuple[str, any, any, any]] = []  # (sym, df2yr, tt, vcp)
@@ -567,6 +629,10 @@ async def run_screener(
     if p: p.begin_stage("persist", total=len(scored))
 
     result_rows: list[ScreenerScore] = []
+    # Feature dicts for the ML ranker, per fresh symbol with a usable setup.
+    # Same extract_features code path as the Phase-1 scan = train/serve parity.
+    ml_feature_map: dict[str, dict] = {}
+    spy_dates_srv = spy_df["date"].to_numpy() if not spy_df.empty else None
     for sym, df, tt, vcp in scored:
         sym_row = sym_row_map.get(sym)
 
@@ -609,6 +675,22 @@ async def run_screener(
         score_row.base_length_days = pat.base_length_days
         score_row.base_depth_pct  = Decimal(str(round(pat.base_depth_pct, 2))) if pat.base_depth_pct is not None else None
         score_row.extension_pct   = Decimal(str(round(pat.extension_pct, 2)))  if pat.extension_pct  is not None else None
+
+        # ML ranker features — reset first (rows are reused across runs; a
+        # setup that dissolved must not keep yesterday's score).
+        score_row.ml_score = None
+        score_row.ml_details = None
+        if pat.buyability in ("at_pivot", "in_base") and pat.pivot_price:
+            try:
+                spy_hist_srv = (
+                    spy_df.iloc[:int(np.searchsorted(spy_dates_srv, df["date"].to_numpy()[-1], side="right"))]
+                    if spy_dates_srv is not None else None
+                )
+                ml_feature_map[sym] = extract_features(
+                    df, spy_hist=spy_hist_srv, tt=tt, vcp=vcp, pat=pat, atr=atr_scalar(df),
+                )
+            except Exception:
+                log.exception("ML feature extraction failed for %s", sym)
 
         fund = fundamental_map.get(sym)
         if fund:
@@ -770,6 +852,27 @@ async def run_screener(
 
         s.composite_score = Decimal(str(round(min(composite, 1.0), 3)))
 
+    # ── Step 10: ML ranker score (fresh rows with usable setups) ─────────────
+    # Displayed alongside composite; does not affect composite or tier gates.
+    if ml_feature_map:
+        try:
+            model = await load_active_model(session)
+        except Exception:
+            model = None
+            log.exception("ML ranker: failed to load active model")
+        if model is not None:
+            syms = list(ml_feature_map.keys())
+            probs = predict_proba(model, [ml_feature_map[s] for s in syms])
+            prob_by_sym = dict(zip(syms, probs))
+            for s in result_rows:
+                p_win = prob_by_sym.get(s.symbol)
+                if p_win is not None:
+                    s.ml_score = Decimal(str(round(p_win, 4)))
+                    s.ml_details = {"model_id": str(model.id), "fv": model.feature_version}
+            log.info("ML ranker: scored %d setups with model %s", len(prob_by_sym), model.id)
+        else:
+            log.info("ML ranker: no active model (or ml deps missing) — ml_score left empty")
+
     if p: p.set_processed(len(all_ranked_rows))
     await session.commit()
     all_ranked_rows.sort(key=lambda s: float(s.composite_score), reverse=True)
@@ -781,8 +884,27 @@ async def run_screener(
             "tt_passing": stats.tt_passing,
             "scored": stats.scored,
             "with_fundamentals": stats.with_fundamentals,
+            "stale_bar_skips": stats.stale_bar_skips,
         })
     return all_ranked_rows, stats
+
+
+# Allow-listed sort columns — mirrors the frontend's SortKey union exactly.
+# NEVER interpolate a client-supplied column name directly into SQL; look it
+# up here first and fall back to composite_score for anything unrecognized.
+_SORT_COLUMNS = {
+    "composite_score": ScreenerScore.composite_score,
+    "ml_score":        ScreenerScore.ml_score,
+    "eps_rank":        ScreenerScore.eps_rank,
+    "rs_rank":         ScreenerScore.rs_rank,
+    "vcp_score":       ScreenerScore.vcp_score,
+    "tt_score":        ScreenerScore.tt_score,
+    "smr_rank":        ScreenerScore.smr_rank,
+    "last_close":      ScreenerScore.last_close,
+    "extension_pct":   ScreenerScore.extension_pct,
+    "symbol":          ScreenerScore.symbol,
+    "sector":          ScreenerScore.sector,
+}
 
 
 async def get_screener_results(
@@ -797,8 +919,17 @@ async def get_screener_results(
     pattern: str | None = None,       # comma-separated pattern values
     sector: str | None = None,
     max_age_days: int = 5,
+    sort_by: str = "composite_score",
+    sort_dir: str = "desc",
 ) -> list[ScreenerScore]:
-    q = select(ScreenerScore).order_by(ScreenerScore.composite_score.desc())
+    column = _SORT_COLUMNS.get(sort_by, ScreenerScore.composite_score)
+    order = column.asc() if sort_dir == "asc" else column.desc()
+    # Nullable numeric columns (ml_score, ranks, extension_pct, ...) must never
+    # let NULLs dominate either extreme — always push them to the end. Symbol
+    # is a stable tiebreaker so paginated results don't reorder across ties.
+    if sort_by not in ("symbol", "sector"):
+        order = order.nullslast()
+    q = select(ScreenerScore).order_by(order, ScreenerScore.symbol.asc())
     # Freshness cutoff: symbols that dropped out of recent scans keep their old
     # rows (with stale pivots/extensions computed from old closes) — never show
     # them. 5 days spans weekends + holidays between nightly scans.
@@ -829,3 +960,134 @@ async def get_screener_results(
         rows = [r for r in rows if (r.sector or "").lower() == sector.lower()]
 
     return rows
+
+
+# ─── Tiered picks — Tier S/A/B eligibility (single source of truth) ────────────
+# Consumed by GET /api/screener/picks (backend/app/api/screener.py) AND the
+# nightly watchlist auto-sync (backend/app/services/watchlist_service.py).
+# Tier-eligibility logic must live here ONLY — computing it separately in two
+# places is exactly how the S/A/B rules and the watchlist rules would silently
+# drift apart.
+#
+# Rules (revised 2026-07-03 after a Tier S false-positive: a stock reached
+# Tier S while trading below its 50-day MA on a stale scored_at row):
+#   1. Freshness — only rows scored within max_age_days are eligible. Without
+#      this, a row computed while a stock genuinely was at-pivot keeps showing
+#      as a live pick after it has since broken down.
+#   2. price_above_50 required for Tier S/A. Not required for Tier B — in_base
+#      names are still forming and may legitimately sit at/under the 50-day
+#      before the pivot breaks.
+#   3. Hard RS-rank gate per tier (S >= 85, A >= 75, B >= 70) — selects for
+#      actual market leaders, not just geometric pattern matches.
+#   4. Sector concentration cap per tier (max 3) to force diversity.
+_TIER_S_PATTERNS = ("bull_flag", "three_weeks_tight", "ascending_triangle", "high_tight_flag")
+_RS_MIN_S = 85
+_RS_MIN_A = 75
+_RS_MIN_B = 70
+_MAX_PER_SECTOR_PER_TIER = 3
+_TIER_MAX = 10
+
+
+def is_accelerating(r: ScreenerScore) -> bool:
+    """Return True if earnings show acceleration or are strongly positive.
+
+    Preferred: compare quarterly (most-recent) vs annual (trend).
+    Fallback: if annual data is missing (common after a migration before rescan),
+    accept any stock with quarterly EPS growth > 25% — still a strong signal.
+    """
+    q = float(r.net_income_growth) if r.net_income_growth is not None else None
+    a = float(r.earnings_annual_growth) if r.earnings_annual_growth is not None else None
+
+    if q is None:
+        return False
+    if a is not None:
+        return q > a + 0.05 and q > 0.10
+    return q > 0.25
+
+
+def _rs_ok(r: ScreenerScore, threshold: int) -> bool:
+    """RS rank gate — requires a populated rs_rank >= threshold."""
+    if r.rs_rank is None:
+        return False
+    return int(r.rs_rank) >= threshold
+
+
+def _above_50ma(r: ScreenerScore) -> bool:
+    return bool((r.tt_criteria or {}).get("price_above_50"))
+
+
+def _sector_room(picks: list[ScreenerScore], sector: str | None, max_per_sector: int) -> bool:
+    """Returns True if we can still add another pick from this sector."""
+    if not sector:
+        return True   # unknown sector — don't penalize
+    count = sum(1 for p in picks if p.sector == sector)
+    return count < max_per_sector
+
+
+async def get_tiered_picks(
+    session: AsyncSession, *, max_age_days: int = 5,
+) -> dict[str, list[ScreenerScore]]:
+    """Returns {'S': [...], 'A': [...], 'B': [...]} — Tier S/A/B eligible rows.
+
+    Tier S: Premium-pattern at pivot, RS >= 85, price > 50MA (proven leaders)
+    Tier A: Other patterns at pivot, quality >= 0.60, RS >= 75, price > 50MA,
+            accelerating earnings
+    Tier B: Quality patterns in-base, RS >= 70 — highest per-trade R in
+            backtest (breakout filter selects for real momentum)
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    q = (
+        select(ScreenerScore)
+        .where(ScreenerScore.scored_at >= cutoff)
+        .where(ScreenerScore.buyability.in_(["at_pivot", "in_base"]))
+        .where(ScreenerScore.pattern_quality.isnot(None))
+        .where(ScreenerScore.pattern_quality > 0.40)
+        .order_by(ScreenerScore.composite_score.desc())
+    )
+    result = await session.execute(q)
+    rows = result.scalars().all()
+
+    used: set[str] = set()
+
+    # Tier S: Premium-pattern at pivot + RS leader (>= 85) + above 50MA
+    tier_s: list[ScreenerScore] = []
+    for r in rows:
+        if r.symbol in used: continue
+        if r.buyability != "at_pivot": continue
+        if r.pattern_type not in _TIER_S_PATTERNS: continue
+        if float(r.pattern_quality) < 0.50: continue
+        if not _rs_ok(r, _RS_MIN_S): continue
+        if not _above_50ma(r): continue
+        if not _sector_room(tier_s, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
+        tier_s.append(r)
+        used.add(r.symbol)
+        if len(tier_s) >= _TIER_MAX: break
+
+    # Tier A: Other patterns at pivot + quality >= 0.60 + RS >= 75 + above 50MA + accelerating
+    tier_a: list[ScreenerScore] = []
+    for r in rows:
+        if r.symbol in used: continue
+        if r.buyability != "at_pivot": continue
+        if r.pattern_type in _TIER_S_PATTERNS: continue
+        if float(r.pattern_quality) < 0.60: continue
+        if not _rs_ok(r, _RS_MIN_A): continue
+        if not _above_50ma(r): continue
+        if not is_accelerating(r): continue
+        if not _sector_room(tier_a, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
+        tier_a.append(r)
+        used.add(r.symbol)
+        if len(tier_a) >= _TIER_MAX: break
+
+    # Tier B: In-base watchlist + RS >= 70 (price_above_50 NOT required — still forming)
+    tier_b: list[ScreenerScore] = []
+    for r in rows:
+        if r.symbol in used: continue
+        if r.buyability != "in_base": continue
+        if float(r.pattern_quality) < 0.55: continue
+        if not _rs_ok(r, _RS_MIN_B): continue
+        if not _sector_room(tier_b, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
+        tier_b.append(r)
+        used.add(r.symbol)
+        if len(tier_b) >= _TIER_MAX: break
+
+    return {"S": tier_s, "A": tier_a, "B": tier_b}

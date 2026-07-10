@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useCallback, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronRight, ChevronUp, Plus, ExternalLink, Bookmark, BookmarkCheck } from "lucide-react";
 import { API_URL } from "@/lib/api";
 import { StockChart } from "@/components/stock-chart";
@@ -14,6 +15,7 @@ import {
 
 type SortKey =
   | "composite_score"
+  | "ml_score"
   | "eps_rank"
   | "rs_rank"
   | "vcp_score"
@@ -32,6 +34,7 @@ const COLUMNS: { key: SortKey; label: string; align?: "left" | "right" | "center
   { key: "last_close",      label: "Price",   align: "right", width: "5rem" },
   { key: "extension_pct",   label: "Ext",     align: "right", width: "4.5rem", help: "Extension from pivot in %. Strict Minervini: >5% past pivot is not buyable." },
   { key: "composite_score", label: "Comp",    align: "right", width: "4.5rem", help: "Composite 0-100. Extended/broken stocks score 0." },
+  { key: "ml_score",        label: "Win %",   align: "right", width: "4.5rem", help: "Machine-learned estimate of the chance this setup reaches a 2-to-1 profit target before hitting its stop loss, if price breaks out past the pivot (buy point). Trained on this screener's own historical setups. Breakeven at a 2-to-1 target is 33%. Blank = model not trained yet or no clean setup." },
   { key: "eps_rank",        label: "EPS",     align: "right", width: "4rem",   help: "IBD-style EPS rank 0-99 (qtrly EPS growth + TTM EPS)" },
   { key: "rs_rank",         label: "RS",      align: "right", width: "4rem",   help: "Relative strength rank 0-99 (1Y return vs SPY)" },
   { key: "vcp_score",       label: "VCP",     align: "right", width: "4rem",   help: "VCP setup quality 0-10" },
@@ -39,45 +42,41 @@ const COLUMNS: { key: SortKey; label: string; align?: "left" | "right" | "center
   { key: "smr_rank",        label: "SMR",     align: "right", width: "4rem",   help: "Sales/Margin/ROE rank 0-99" },
 ];
 
+// Results arrive from the server already sorted+paginated (see
+// screener_service.get_screener_results) across the FULL universe — sorting
+// here must trigger a new server fetch, not just reorder the current page,
+// or a column like Win % could never surface a stock ranked outside the
+// page that the default Composite sort happened to fetch.
 export function ResultsTable({ results }: { results: ScoreResult[] }) {
-  const [sortKey, setSortKey] = useState<SortKey>("composite_score");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  const sorted = useMemo(() => {
-    const arr = [...results];
-    arr.sort((a, b) => {
-      const va = sortVal(a, sortKey);
-      const vb = sortVal(b, sortKey);
-      if (va == null && vb == null) return 0;
-      if (va == null) return 1;
-      if (vb == null) return -1;
-      if (typeof va === "string" && typeof vb === "string") {
-        return sortDir === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
-      }
-      return sortDir === "asc" ? (va as number) - (vb as number) : (vb as number) - (va as number);
-    });
-    return arr;
-  }, [results, sortKey, sortDir]);
+  const sortKey = (searchParams.get("sort_by") as SortKey) || "composite_score";
+  const sortDir = (searchParams.get("sort_dir") as SortDir) || "desc";
 
-  const allExpanded = sorted.length > 0 && expanded.size === sorted.length;
+  const allExpanded = results.length > 0 && expanded.size === results.length;
   const toggleAll   = () => {
     if (allExpanded) {
       setExpanded(new Set());
     } else {
-      setExpanded(new Set(sorted.map(r => r.symbol)));
+      setExpanded(new Set(results.map(r => r.symbol)));
     }
   };
 
-  const toggleSort = (key: SortKey) => {
-    if (sortKey === key) {
-      setSortDir(d => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
+  const toggleSort = useCallback((key: SortKey) => {
+    const q = new URLSearchParams(searchParams.toString());
+    q.delete("page");   // sort change invalidates the current page position
+    const nextDir: SortDir = sortKey === key
+      ? (sortDir === "asc" ? "desc" : "asc")
       // Symbol/sector default to ascending alphabetical; everything else descending (high = good)
-      setSortDir(key === "symbol" || key === "sector" ? "asc" : "desc");
-    }
-  };
+      : (key === "symbol" || key === "sector" ? "asc" : "desc");
+    if (key === "composite_score") q.delete("sort_by"); else q.set("sort_by", key);
+    if (nextDir === "desc")        q.delete("sort_dir"); else q.set("sort_dir", nextDir);
+    // Re-sorting keeps you looking at "the same table," just reordered —
+    // don't yank the viewport back to the header on every click.
+    router.push(`/screener${q.size ? "?" + q : ""}`, { scroll: false });
+  }, [router, searchParams, sortKey, sortDir]);
 
   if (results.length === 0) {
     return (
@@ -129,7 +128,7 @@ export function ResultsTable({ results }: { results: ScoreResult[] }) {
             </tr>
           </thead>
           <tbody>
-            {sorted.map(r => (
+            {results.map(r => (
               <ResultRow
                 key={r.symbol}
                 r={r}
@@ -148,21 +147,6 @@ export function ResultsTable({ results }: { results: ScoreResult[] }) {
   );
 }
 
-function sortVal(r: ScoreResult, key: SortKey): number | string | null {
-  switch (key) {
-    case "symbol":          return r.symbol;
-    case "sector":          return r.sector ?? "";
-    case "last_close":      return r.last_close ? parseFloat(r.last_close) : null;
-    case "composite_score": return parseFloat(r.composite_score);
-    case "eps_rank":        return r.eps_rank;
-    case "rs_rank":         return r.rs_rank;
-    case "vcp_score":       return parseFloat(r.vcp_score);
-    case "tt_score":        return r.tt_score;
-    case "smr_rank":        return r.smr_rank;
-    case "extension_pct":   return r.extension_pct ? parseFloat(r.extension_pct) : null;
-  }
-}
-
 function buyabilityDot(b: string | null): { color: string; label: string } {
   switch (b) {
     case "at_pivot": return { color: "bg-emerald-500",         label: "At pivot — buyable now" };
@@ -176,6 +160,7 @@ function buyabilityDot(b: string | null): { color: string; label: string } {
 
 function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolean; onToggle: () => void }) {
   const composite = Math.round(parseFloat(r.composite_score) * 100);
+  const mlPct = r.ml_score != null ? Math.round(parseFloat(r.ml_score) * 100) : null;
   const vcp10 = Math.round(parseFloat(r.vcp_score) * 10);
   const ext = r.extension_pct ? parseFloat(r.extension_pct) : null;
   const dot = buyabilityDot(r.buyability);
@@ -238,6 +223,7 @@ function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolea
           {ext === null ? "—" : `${ext > 0 ? "+" : ""}${ext.toFixed(1)}%`}
         </td>
         <td className={`px-2 py-2 text-right tabular-nums font-bold ${rankColor(composite)}`}>{composite}</td>
+        <td className={`px-2 py-2 text-right tabular-nums ${mlColor(mlPct)}`}>{mlPct != null ? `${mlPct}%` : "—"}</td>
         <td className={`px-2 py-2 text-right tabular-nums ${rankColor(r.eps_rank)}`}>{r.eps_rank ?? "—"}</td>
         <td className={`px-2 py-2 text-right tabular-nums ${rankColor(r.rs_rank)}`}>{r.rs_rank ?? "—"}</td>
         <td className={`px-2 py-2 text-right tabular-nums ${rankColor(vcp10 * 10)}`}>{vcp10}</td>
@@ -275,7 +261,7 @@ function ResultRow({ r, expanded, onToggle }: { r: ScoreResult; expanded: boolea
       </tr>
       {expanded && (
         <tr className="bg-muted/10 border-b border-border/40">
-          <td colSpan={12} className="px-4 py-4">
+          <td colSpan={13} className="px-4 py-4">
             <ExpandedDetails r={r} />
           </td>
         </tr>
@@ -461,6 +447,16 @@ function FundCell({
       {hint && <div className="text-[10px] text-muted-foreground/60 mt-0.5">{hint}</div>}
     </div>
   );
+}
+
+// Color the model win-probability by trade economics, not percentile:
+// at a 2-to-1 reward:risk target the breakeven win rate is 33%.
+function mlColor(v: number | null): string {
+  if (v == null) return "text-muted-foreground/40";
+  if (v >= 45) return "text-emerald-400 font-semibold";
+  if (v >= 38) return "text-emerald-400/80";
+  if (v >= 33) return "text-amber-400";
+  return "text-muted-foreground";
 }
 
 // Color a 0-99 percentile cell by tier (IBD-style)

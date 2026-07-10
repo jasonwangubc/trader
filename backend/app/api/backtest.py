@@ -31,7 +31,7 @@ class BacktestParams(BaseModel):
     target_r:            float = Field(default=3.0, ge=1.0, le=10.0)
     time_stop:           int   = Field(default=20, ge=5, le=60)
     trigger_window:      int   = Field(default=30, ge=5, le=120)
-    lookback_days:       int   = Field(default=504, ge=126, le=504)
+    lookback_days:       int   = Field(default=504, ge=126, le=1300)
     account_size:        float = Field(default=100_000.0, ge=1000.0, le=10_000_000.0)
     risk_pct:            float = Field(default=0.0075, ge=0.001, le=0.05)
     symbols: list[str] | None = None
@@ -425,7 +425,7 @@ class PortfolioParams(BaseModel):
     target_r:                float = Field(default=3.0, ge=1.0, le=10.0)
     time_stop:               int   = Field(default=20, ge=5, le=60)
     trigger_window:          int   = Field(default=30, ge=5, le=120)
-    lookback_days:           int   = Field(default=504, ge=126, le=504)
+    lookback_days:           int   = Field(default=504, ge=126, le=1300)
     account_size:            float = Field(default=100_000.0, ge=1000.0, le=10_000_000.0)
     risk_pct:                float = Field(default=0.0075, ge=0.001, le=0.05)
     max_concurrent_positions: int  = Field(default=10, ge=1, le=50, description="Cap on simultaneous open positions")

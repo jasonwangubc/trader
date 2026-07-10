@@ -59,6 +59,7 @@ export function TicketForm({
   prefillTrigger,
   prefillStop,
   prefillTarget,
+  prefillWatchlistItemId,
 }: {
   accounts: Account[];
   defaultAccountId?: string;
@@ -66,6 +67,7 @@ export function TicketForm({
   prefillTrigger?: string;
   prefillStop?: string;
   prefillTarget?: string;
+  prefillWatchlistItemId?: string;
 }) {
   const router = useRouter();
   // Default to the user's active trading account when one is set.
@@ -222,6 +224,7 @@ export function TicketForm({
         body: JSON.stringify({
           ...body,
           is_paper: isPaper,
+          watchlist_item_id: prefillWatchlistItemId || null,
           override_regime: overrideRegime,
           override_streak: overrideStreak,
           override_drawdown: drawdownOverrideValid,

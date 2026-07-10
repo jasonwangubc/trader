@@ -123,6 +123,7 @@ class TicketIn(BaseModel):
     thesis: str = Field(min_length=10, max_length=2000)
     max_shares: int | None = Field(default=None, ge=1)
     is_paper: bool | None = None
+    watchlist_item_id: uuid.UUID | None = None  # links back to a Stage-2 watchlist row, if armed from one
     override_regime: bool = False   # explicitly proceed despite bear regime
     override_streak: bool = False   # explicitly proceed despite loss-streak block
     override_drawdown: bool = False  # proceed despite drawdown circuit breaker
@@ -370,6 +371,15 @@ async def create(
         )
     except TicketValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    if body.watchlist_item_id is not None:
+        from app.services.watchlist_service import link_ticket_to_watchlist_item
+        await link_ticket_to_watchlist_item(
+            session,
+            watchlist_item_id=body.watchlist_item_id,
+            ticket=ticket,
+            user_id=user_id,
+        )
 
     return TicketOut.from_orm_obj(ticket)
 

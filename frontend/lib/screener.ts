@@ -53,6 +53,9 @@ export interface ScoreResult {
   extension_pct: string | null;            // % current price is past pivot
 
   composite_score: string;
+  // ML ranker: calibrated probability (0-1, as string) that the setup reaches
+  // a 2R target before its stop after a breakout. null = no model / no setup.
+  ml_score: string | null;
 }
 
 export const PATTERN_LABELS: Record<string, string> = {

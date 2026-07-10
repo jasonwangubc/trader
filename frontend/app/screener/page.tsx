@@ -80,6 +80,8 @@ export default async function ScreenerPage({
     min_composite?: string;
     buyability?: string;
     pattern?: string;
+    sort_by?: string;
+    sort_dir?: string;
     page?: string;
   }>;
 }) {
@@ -91,6 +93,8 @@ export default async function ScreenerPage({
   const minComposite = parseInt(params.min_composite ?? "0") || 0;
   const buyabilityParam = params.buyability ?? "";
   const patternParam    = params.pattern ?? "";
+  const sortBy       = params.sort_by  ?? "composite_score";
+  const sortDir      = params.sort_dir ?? "desc";
   const page         = Math.max(1, parseInt(params.page ?? "1") || 1);
 
   const qp = new URLSearchParams();
@@ -101,6 +105,8 @@ export default async function ScreenerPage({
   if (minComposite) qp.set("min_composite", String(minComposite));
   if (buyabilityParam) qp.set("buyability", buyabilityParam);
   if (patternParam)    qp.set("pattern",    patternParam);
+  qp.set("sort_by",  sortBy);
+  qp.set("sort_dir", sortDir);
   qp.set("page",      String(page));
   qp.set("page_size", String(PAGE_SIZE));
 
@@ -177,6 +183,7 @@ export default async function ScreenerPage({
             total={resultsPage.total}
             minTT={minTT} minVCP={minVCP} minEPS={minEPS} minRS={minRS}
             minComposite={minComposite} buyability={buyabilityParam} pattern={patternParam}
+            sortBy={sortBy} sortDir={sortDir}
           />
         )}
 
@@ -202,11 +209,11 @@ export default async function ScreenerPage({
 
 function Pagination({
   page, pages, total,
-  minTT, minVCP, minEPS, minRS, minComposite, buyability, pattern,
+  minTT, minVCP, minEPS, minRS, minComposite, buyability, pattern, sortBy, sortDir,
 }: {
   page: number; pages: number; total: number;
   minTT: number; minVCP: number; minEPS: number; minRS: number; minComposite: number;
-  buyability: string; pattern: string;
+  buyability: string; pattern: string; sortBy: string; sortDir: string;
 }) {
   const buildUrl = (p: number) => {
     const q = new URLSearchParams();
@@ -217,6 +224,8 @@ function Pagination({
     if (minComposite) q.set("min_composite", String(minComposite));
     if (buyability)   q.set("buyability",    buyability);
     if (pattern)      q.set("pattern",       pattern);
+    if (sortBy !== "composite_score") q.set("sort_by",  sortBy);
+    if (sortDir !== "desc")           q.set("sort_dir", sortDir);
     if (p > 1)        q.set("page",          String(p));
     return `/screener${q.size ? "?" + q : ""}`;
   };

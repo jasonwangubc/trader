@@ -12,7 +12,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import DailyBar, ScreenerScore, ScreenerSymbol
 from app.db.session import get_session
 from app.api.auth import get_user_id
-from app.services.screener_service import PipelineStats, ScreenerProgress, get_screener_results, run_screener
+from app.services.screener_service import (
+    PipelineStats,
+    ScreenerProgress,
+    get_screener_results,
+    get_tiered_picks,
+    is_accelerating,
+    run_screener,
+    scan_in_progress,
+)
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
@@ -21,7 +29,12 @@ _last_stats: PipelineStats | None = None
 _progress: ScreenerProgress | None = None
 
 
-# ── Watchlist CRUD ────────────────────────────────────────────────────────────
+# ── Scan-universe CRUD (NOT the Stage-2 pivot watchlist — that's the separate
+#    WatchlistItem model / GET-POST-DELETE /api/watchlist, see
+#    app/api/watchlist.py and app/services/watchlist_service.py). This section
+#    manages ScreenerSymbol: which symbols get nightly EOD-synced and scored
+#    at all. Kept at the "/watchlist" sub-path here for backward compatibility
+#    with existing frontend calls to /api/screener/watchlist. ─────────────────
 
 class SymbolIn(BaseModel):
     symbol: str = Field(min_length=1, max_length=16)
@@ -135,7 +148,7 @@ async def run_scan(
     """Run a full screener scan: refresh universe, update price data, score all stocks,
     fetch missing fundamentals. Safe to run daily — price data is incremental (fast)."""
     global _sync_running, _progress
-    if _sync_running:
+    if _sync_running or scan_in_progress():
         return SyncStatusOut(
             running=True,
             message="Scan already running — check back in a few minutes",
@@ -155,7 +168,7 @@ async def trigger_sync(
 ) -> SyncStatusOut:
     """Legacy endpoint — use /scan instead."""
     global _sync_running, _progress
-    if _sync_running:
+    if _sync_running or scan_in_progress():
         return SyncStatusOut(running=True, message="Sync already in progress", progress=_progress_out(_progress))
     _sync_running = True
     _progress = ScreenerProgress()
@@ -387,6 +400,8 @@ class ScoreOut(BaseModel):
     extension_pct: Decimal | None
 
     composite_score: Decimal
+    # ML ranker: calibrated P(reach 2R target before stop | breakout), 0-1.
+    ml_score: Decimal | None = None
 
 
 class ResultsPage(BaseModel):
@@ -475,6 +490,7 @@ class PickRow(BaseModel):
     pivot_price: Decimal | None
     extension_pct: Decimal | None
     composite_score: float         # 0-100
+    ml_score: float | None         # 0-100 — model win estimate; None if no model
     eps_rank: int | None
     rs_rank: int | None
     accelerating: bool            # earnings accelerating (Q > Annual)
@@ -488,25 +504,6 @@ class PicksOut(BaseModel):
     tier_b: list[PickRow]
     as_of: datetime | None
     note: str
-
-
-def _is_accelerating(r: ScreenerScore) -> bool:
-    """Return True if earnings show acceleration or are strongly positive.
-
-    Preferred: compare quarterly (most-recent) vs annual (trend).
-    Fallback: if annual data is missing (common after a migration before rescan),
-    accept any stock with quarterly EPS growth > 25% — still a strong signal.
-    """
-    q = float(r.net_income_growth) if r.net_income_growth is not None else None
-    a = float(r.earnings_annual_growth) if r.earnings_annual_growth is not None else None
-
-    if q is None:
-        return False
-    if a is not None:
-        # Full check: quarterly genuinely beating annual trend
-        return q > a + 0.05 and q > 0.10
-    # Fallback: annual data not yet populated — use standalone quarterly threshold
-    return q > 0.25
 
 
 def _pick_reason(r: ScreenerScore, tier: str) -> str:
@@ -528,7 +525,7 @@ def _pick_reason(r: ScreenerScore, tier: str) -> str:
         parts.append(f"EPS {r.eps_rank}")
     if r.rs_rank is not None and r.rs_rank >= 80:
         parts.append(f"RS {r.rs_rank}")
-    if _is_accelerating(r):
+    if is_accelerating(r):
         parts.append("EPS accelerating")
     return " · ".join(parts) if parts else f"{r.pattern_type or 'setup'}"
 
@@ -544,122 +541,40 @@ def _pick_row(r: ScreenerScore, tier: str) -> PickRow:
         pivot_price=r.pivot_price,
         extension_pct=r.extension_pct,
         composite_score=round(float(r.composite_score) * 100, 1),
+        ml_score=round(float(r.ml_score) * 100, 1) if r.ml_score is not None else None,
         eps_rank=r.eps_rank,
         rs_rank=r.rs_rank,
-        accelerating=_is_accelerating(r),
+        accelerating=is_accelerating(r),
         tier=tier,
         reason=_pick_reason(r, tier),
     )
 
 
-# Tier eligibility rules — revised 2026-05-28 based on backtest evidence:
-#   1. Hard RS-rank gate per tier. Backtest showed financials and other
-#      low-momentum names dominate the picks because they easily satisfy
-#      geometric pattern criteria. Requiring RS ≥ 70-85 selects for actual
-#      market leaders — Minervini orthodoxy.
-#   2. Tier S premium-pattern set widened. Backtest showed HTF (the
-#      previous S-tier headliner) was actually the worst pattern by
-#      batting avg (30%) and total $. Bull Flag and 3 Weeks Tight were
-#      the standout per-trade performers. So Tier S now requires one of
-#      {bull_flag, three_weeks_tight, ascending_triangle, high_tight_flag},
-#      with HTF kept in only because its win/loss ratio (2.35×) is real
-#      when it does work — just rare.
-#   3. Tier B's framing changed from "watch for breakout" to "highest
-#      per-trade returns historically — set buy-stops at pivot." The
-#      backtest data showed Tier B (in_base) at +0.24R/trade vs S +0.10R
-#      and A +0.15R, because the breakout filter at the pivot self-selects
-#      for genuine momentum.
-#   4. Sector concentration cap per tier (max 3) to prevent any one
-#      sector dominating the limited picks slots.
-
-_TIER_S_PATTERNS = ("bull_flag", "three_weeks_tight", "ascending_triangle", "high_tight_flag")
-_RS_MIN_S = 85
-_RS_MIN_A = 75
-_RS_MIN_B = 70
-_MAX_PER_SECTOR_PER_TIER = 3
-_TIER_MAX = 10
-
-
-def _rs_ok(r: ScreenerScore, threshold: int) -> bool:
-    """RS rank gate — requires a populated rs_rank ≥ threshold."""
-    if r.rs_rank is None:
-        return False
-    return int(r.rs_rank) >= threshold
-
-
-def _sector_room(picks: list[PickRow], sector: str | None, max_per_sector: int) -> bool:
-    """Returns True if we can still add another pick from this sector."""
-    if not sector:
-        return True   # unknown sector — don't penalize
-    count = sum(1 for p in picks if p.sector == sector)
-    return count < max_per_sector
-
-
+# Tier eligibility rules live in screener_service.get_tiered_picks() — the
+# single source of truth shared with the nightly watchlist auto-sync
+# (watchlist_service.sync_watchlist_from_picks). This route is a thin
+# presentation wrapper: fetch eligible rows, map to PickRow, done.
 @router.get("/picks", response_model=PicksOut)
 async def todays_picks(
     session: AsyncSession = Depends(get_session),
 ) -> PicksOut:
     """Tiered curated picks — designed to eliminate decision paralysis.
 
-    Tier S:  Premium-pattern at pivot, RS ≥ 85 (proven market leaders)
+    Tier S:  Premium-pattern at pivot, RS ≥ 85, price > 50MA (proven leaders)
              Patterns: Bull Flag, 3 Weeks Tight, Asc Triangle, HTF
-    Tier A:  Other patterns at pivot, quality ≥ 0.60, RS ≥ 75, accel earnings
+    Tier A:  Other patterns at pivot, quality ≥ 0.60, RS ≥ 75, price > 50MA,
+             accel earnings
     Tier B:  Quality patterns in-base, RS ≥ 70 — highest per-trade returns
              in backtest (breakout filter selects for real momentum)
 
     All tiers cap at 3 picks per sector to force diversity.
     Returns at most ~10 picks per tier; usually fewer after gates.
     """
-    q = (
-        select(ScreenerScore)
-        .where(ScreenerScore.buyability.in_(["at_pivot", "in_base"]))
-        .where(ScreenerScore.pattern_quality.isnot(None))
-        .where(ScreenerScore.pattern_quality > 0.40)
-        .order_by(ScreenerScore.composite_score.desc())
-    )
-    result = await session.execute(q)
-    rows = result.scalars().all()
+    tiers = await get_tiered_picks(session)
 
-    used: set[str] = set()
-
-    # Tier S: Premium-pattern at pivot + RS leader (≥ 85)
-    tier_s: list[PickRow] = []
-    for r in rows:
-        if r.symbol in used: continue
-        if r.buyability != "at_pivot": continue
-        if r.pattern_type not in _TIER_S_PATTERNS: continue
-        if float(r.pattern_quality) < 0.50: continue
-        if not _rs_ok(r, _RS_MIN_S): continue
-        if not _sector_room(tier_s, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
-        tier_s.append(_pick_row(r, "S"))
-        used.add(r.symbol)
-        if len(tier_s) >= _TIER_MAX: break
-
-    # Tier A: Other patterns at pivot + quality ≥ 0.60 + RS ≥ 75 + accelerating earnings
-    tier_a: list[PickRow] = []
-    for r in rows:
-        if r.symbol in used: continue
-        if r.buyability != "at_pivot": continue
-        if r.pattern_type in _TIER_S_PATTERNS: continue   # eligible for S, not duplicated here
-        if float(r.pattern_quality) < 0.60: continue
-        if not _rs_ok(r, _RS_MIN_A): continue
-        if not _is_accelerating(r): continue
-        if not _sector_room(tier_a, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
-        tier_a.append(_pick_row(r, "A"))
-        used.add(r.symbol)
-        if len(tier_a) >= _TIER_MAX: break
-
-    # Tier B: In-base watchlist + RS ≥ 70
-    tier_b: list[PickRow] = []
-    for r in rows:
-        if r.symbol in used: continue
-        if r.buyability != "in_base": continue
-        if float(r.pattern_quality) < 0.55: continue
-        if not _rs_ok(r, _RS_MIN_B): continue
-        if not _sector_room(tier_b, r.sector, _MAX_PER_SECTOR_PER_TIER): continue
-        tier_b.append(_pick_row(r, "B"))
-        used.add(r.symbol)
-        if len(tier_b) >= _TIER_MAX: break
+    tier_s = [_pick_row(r, "S") for r in tiers["S"]]
+    tier_a = [_pick_row(r, "A") for r in tiers["A"]]
+    tier_b = [_pick_row(r, "B") for r in tiers["B"]]
 
     # Most recent scored_at as the "as of" timestamp
     as_of_q = await session.execute(select(func.max(ScreenerScore.scored_at)))
@@ -671,10 +586,12 @@ async def todays_picks(
         tier_b=tier_b,
         as_of=as_of,
         note=(
-            "Tier S = premium patterns (Bull Flag / 3WT / Asc Triangle / HTF) at pivot, RS ≥ 85. "
-            "Tier A = other quality bases at pivot, RS ≥ 75, accelerating earnings. "
+            "Tier S = premium patterns (Bull Flag / 3WT / Asc Triangle / HTF) at pivot, "
+            "RS ≥ 85, price > 50MA. "
+            "Tier A = other quality bases at pivot, RS ≥ 75, price > 50MA, accelerating earnings. "
             "Tier B = in-base, RS ≥ 70 — backtest shows BEST per-trade R (breakout filter selects for momentum). "
-            "Set buy-stops at the pivot for Tier B. Max 3 per sector per tier."
+            "Set buy-stops at the pivot for Tier B. Max 3 per sector per tier. "
+            "Only scores from the last 5 days are eligible."
         ),
     )
 
@@ -876,6 +793,8 @@ async def results(
     buyability: str | None = None,        # comma-separated: "at_pivot,in_base"
     pattern: str | None = None,           # comma-separated: "vcp,cwh,flat_base,high_tight_flag"
     sector: str | None = None,
+    sort_by: str = "composite_score",
+    sort_dir: str = "desc",
     page: int = 1,
     page_size: int = 20,
     session: AsyncSession = Depends(get_session),
@@ -890,6 +809,8 @@ async def results(
         buyability=buyability,
         pattern=pattern,
         sector=sector,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
     )
     total = len(all_rows)
     pages = max(1, (total + page_size - 1) // page_size)
@@ -941,4 +862,5 @@ def _score_out(r: ScreenerScore) -> ScoreOut:
         base_depth_pct=r.base_depth_pct,
         extension_pct=r.extension_pct,
         composite_score=r.composite_score,
+        ml_score=r.ml_score,
     )

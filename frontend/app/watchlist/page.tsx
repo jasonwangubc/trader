@@ -1,165 +1,176 @@
 import Link from "next/link";
-import { BarChart2, Plus, Target } from "lucide-react";
+import { BarChart2, Target } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { api, ApiError } from "@/lib/api";
 import { StockChart } from "@/components/stock-chart";
 import { WatchlistAdd } from "./watchlist-add";
+import { WatchlistRemoveButton } from "./watchlist-remove-button";
 
-export const metadata = { title: 'Watchlist' };
-
+export const metadata = { title: "Watchlist" };
 
 /**
- * Watchlist — intermediate state between "in screener universe" and "armed ticket".
- * Symbols you're tracking closely but haven't pre-committed to yet.
+ * Stage-2 pivot watchlist — persisted bridge between "screener says good"
+ * (Tier S/A picks) and "I armed a ticket." Auto-synced nightly; also
+ * supports manual add. Purely informational — arming a ticket (size, stop,
+ * target) remains a separate, deliberate step.
  *
- * Note: we reuse the screener_symbols table — the watchlist IS the screener universe.
- * The difference from the screener view is we show the chart and earnings for each
- * symbol, and the form is focused on "why I'm watching this" rather than scoring.
- *
- * In the future we could add a separate watchlist table with alert prices, but for
- * now this is sufficient: the monitor already polls for trigger conditions on ARMED
- * tickets, and this page is for visual review before committing.
+ * NOT the same table as /api/screener/watchlist (ScreenerSymbol, the nightly
+ * scan universe) — see the cross-reference note in app/api/screener.py.
  */
 
-interface ScoreResult {
+interface WatchlistItem {
+  id: string;
   symbol: string;
-  tt_score: number;
-  vcp_score: string;
-  rs_rank: number | null;
-  composite_score: string;
   sector: string | null;
+  pivot_price: string;
+  source: string;
+  pattern_type: string | null;
+  status: string;
+  added_at: string;
+  status_changed_at: string;
+  ticket_id: string | null;
+  notes: string | null;
   last_close: string | null;
+  extension_pct: string | null;
+  buyability: string | null;
+  composite_score: number | null;
 }
 
-interface EarningsInfo {
-  symbol: string;
-  next_earnings_date: string | null;
-  days_until: number | null;
-  last_eps_surprise_pct: string | null;
-  warning: string | null;
-}
+const STATUS_ORDER = ["at_pivot", "near_pivot", "watching", "armed", "extended", "broken"];
+
+const STATUS_STYLE: Record<string, { label: string; className: string }> = {
+  watching:   { label: "Watching",    className: "bg-muted text-muted-foreground" },
+  near_pivot: { label: "Near pivot",  className: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300" },
+  at_pivot:   { label: "At pivot",    className: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300" },
+  extended:   { label: "Extended",    className: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-300" },
+  broken:     { label: "Broken",      className: "bg-destructive/10 text-destructive" },
+  armed:      { label: "Armed",       className: "bg-primary/10 text-primary" },
+};
 
 export default async function WatchlistPage() {
-  let results: ScoreResult[] = [];
-  let earningsMap: Record<string, EarningsInfo> = {};
+  let items: WatchlistItem[] = [];
   let error: string | null = null;
 
   try {
-    // Top-scored symbols = primary watchlist
-    const [res, earningsList] = await Promise.all([
-      api<{ items: ScoreResult[] }>("/api/screener/results?min_tt=5&page_size=30"),
-      api<EarningsInfo[]>("/api/earnings").catch(() => [] as EarningsInfo[]),
-    ]);
-    results = res.items;
-    earningsMap = Object.fromEntries(earningsList.map(e => [e.symbol, e]));
+    items = await api<WatchlistItem[]>("/api/watchlist");
+    items = [...items].sort(
+      (a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status)
+        || (a.symbol < b.symbol ? -1 : 1),
+    );
   } catch (e) {
     error = e instanceof ApiError ? `${e.status}: ${e.message}` : String(e);
   }
 
   return (
     <main className="container mx-auto max-w-6xl p-6 sm:p-10">
-      <header className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-semibold tracking-tight">Watchlist</h1>
-          <p className="text-muted-foreground mt-1 text-sm">
-            Top setups from the screener — visually confirm before arming a ticket.
-            Run the screener scan to refresh.
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Link href="/screener/scan" className="border-input hover:bg-muted inline-flex h-9 items-center rounded-md border px-4 text-sm font-medium">
-            Refresh screener
-          </Link>
-        </div>
+      <header className="mb-6">
+        <h1 className="text-3xl font-semibold tracking-tight">Watchlist</h1>
+        <p className="text-muted-foreground mt-1 text-sm">
+          Tier S/A picks are added automatically every night with their pivot locked in.
+          You&apos;ll get an alert as one approaches its pivot with rising volume — arm a
+          ticket when you want to act on it.
+        </p>
       </header>
+
+      <div className="mb-6">
+        <WatchlistAdd />
+      </div>
 
       {error && (
         <div className="border-destructive/50 bg-destructive/10 text-destructive mb-6 rounded-md border p-4 text-sm">{error}</div>
       )}
 
-      {results.length === 0 ? (
+      {!error && items.length === 0 ? (
         <Card>
           <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            No setups yet. <Link href="/screener/scan" className="text-primary hover:underline">Run a screener scan</Link> first.
+            Nothing on your watchlist yet. Tier S/A picks are added automatically after the
+            next nightly scan, or add a symbol manually above.
           </CardContent>
         </Card>
       ) : (
         <div className="space-y-6">
-          {results.map(r => {
-            const earnings = earningsMap[r.symbol];
-            return (
-              <WatchlistCard
-                key={r.symbol}
-                result={r}
-                earnings={earnings}
-              />
-            );
-          })}
+          {items.map((item) => (
+            <WatchlistCard key={item.id} item={item} />
+          ))}
         </div>
       )}
     </main>
   );
 }
 
-function WatchlistCard({ result: r, earnings }: { result: ScoreResult; earnings?: EarningsInfo }) {
-  const composite = Math.round(parseFloat(r.composite_score) * 100);
-  const daysUntilEarnings = earnings?.days_until;
-  const earningsWarning = earnings?.warning;
+function WatchlistCard({ item }: { item: WatchlistItem }) {
+  const statusStyle = STATUS_STYLE[item.status] ?? { label: item.status, className: "bg-muted" };
+  const lastClose = item.last_close ? parseFloat(item.last_close) : null;
+  const pivot = parseFloat(item.pivot_price);
+  const extension = item.extension_pct !== null ? parseFloat(item.extension_pct) : null;
+  const isArmed = item.status === "armed";
+  const isTerminal = item.status === "broken";
 
   return (
     <Card>
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-4">
           <div className="flex items-center gap-3">
-            <span className="font-mono text-2xl font-bold">{r.symbol}</span>
-            {r.sector && <Badge variant="outline" className="text-xs">{r.sector}</Badge>}
-            {r.last_close && (
-              <span className="text-lg font-semibold text-muted-foreground">${parseFloat(r.last_close).toFixed(2)}</span>
+            <span className="font-mono text-2xl font-bold">{item.symbol}</span>
+            {item.sector && <Badge variant="outline" className="text-xs">{item.sector}</Badge>}
+            {lastClose !== null && (
+              <span className="text-lg font-semibold text-muted-foreground">${lastClose.toFixed(2)}</span>
             )}
-            {earningsWarning && (
-              <span className="rounded bg-amber-100 dark:bg-amber-900/30 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300">
-                📅 Earnings in {daysUntilEarnings}d
+            <span className={`rounded px-2 py-0.5 text-xs font-medium ${statusStyle.className}`}>
+              {statusStyle.label}
+            </span>
+            {item.source !== "manual" && (
+              <span className="text-muted-foreground text-[10px] uppercase tracking-wide">
+                Tier {item.source === "tier_s" ? "S" : "A"}
               </span>
             )}
           </div>
           <div className="flex items-center gap-2">
             <div className="text-center">
-              <div className="text-xl font-bold">{composite}</div>
-              <div className="text-muted-foreground text-[10px] uppercase">Score</div>
+              <div className="text-lg font-bold">${pivot.toFixed(2)}</div>
+              <div className="text-muted-foreground text-[10px] uppercase" title="Locked when this symbol was added to the watchlist — does not drift with nightly rescans">
+                Pivot
+              </div>
             </div>
-            <div className="text-center">
-              <div className="text-xl font-bold">{r.tt_score}/8</div>
-              <div className="text-muted-foreground text-[10px] uppercase">TT</div>
-            </div>
-            {r.rs_rank !== null && (
+            {extension !== null && (
               <div className="text-center">
-                <div className="text-xl font-bold">{r.rs_rank}</div>
-                <div className="text-muted-foreground text-[10px] uppercase">RS</div>
+                <div className="text-lg font-bold">{extension > 0 ? "+" : ""}{extension.toFixed(1)}%</div>
+                <div className="text-muted-foreground text-[10px] uppercase">From pivot</div>
               </div>
             )}
             <Link
-              href={`/chart/${r.symbol}`}
+              href={`/chart/${item.symbol}`}
               className="border-input hover:bg-muted inline-flex h-8 items-center gap-1 rounded-md border px-3 text-xs"
             >
               <BarChart2 className="h-3.5 w-3.5" /> Chart
             </Link>
-            <Link
-              href={`/tickets/new?symbol=${r.symbol}`}
-              className="bg-primary text-primary-foreground inline-flex h-8 items-center gap-1 rounded-md px-3 text-xs font-medium hover:bg-primary/90"
-            >
-              <Target className="h-3.5 w-3.5" /> Arm ticket
-            </Link>
+            {isArmed && item.ticket_id ? (
+              <Link
+                href={`/tickets/${item.ticket_id}`}
+                className="bg-primary text-primary-foreground inline-flex h-8 items-center gap-1 rounded-md px-3 text-xs font-medium hover:bg-primary/90"
+              >
+                <Target className="h-3.5 w-3.5" /> View ticket
+              </Link>
+            ) : (
+              <Link
+                href={`/tickets/new?symbol=${item.symbol}&trigger=${item.pivot_price}&watchlist_item_id=${item.id}`}
+                className="bg-primary text-primary-foreground inline-flex h-8 items-center gap-1 rounded-md px-3 text-xs font-medium hover:bg-primary/90"
+              >
+                <Target className="h-3.5 w-3.5" /> Arm ticket
+              </Link>
+            )}
+            {!isArmed && <WatchlistRemoveButton itemId={item.id} symbol={item.symbol} />}
           </div>
         </div>
-        {earningsWarning && (
-          <div className="mt-2 rounded border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/20 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300">
-            {earningsWarning}
+        {isTerminal && (
+          <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-3 py-1.5 text-xs text-destructive">
+            Base invalidated since this was added — no longer a live setup. Remove or keep for reference.
           </div>
         )}
       </CardHeader>
       <CardContent>
-        <StockChart symbol={r.symbol} height={280} showPivot showSmas className="w-full" />
+        <StockChart symbol={item.symbol} height={280} showPivot showSmas className="w-full" />
       </CardContent>
     </Card>
   );

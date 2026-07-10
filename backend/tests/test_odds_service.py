@@ -160,3 +160,52 @@ async def test_no_scan_is_unavailable(db_session):
     )
     assert not odds.available
     assert "No backtest signal scan" in (odds.reason or "")
+
+
+async def test_odds_use_any_lookback_scan(db_session):
+    """The odds card must find the newest successful scan regardless of its
+    lookback — a 1260-day (5y) scan with no 504 scan present still serves."""
+    signal_scan_service._bars_cache.clear()
+    _seed_symbol_bars(db_session, "TGT", "target")
+    _seed_symbol_bars(db_session, "STP", "stop")
+    _seed_symbol_bars(db_session, "TIM", "time")
+
+    scan = BacktestSignalScan(
+        lookback_days=1260,
+        symbols_scanned=3,
+        candidate_count=3,
+        status="success",
+        finished_at=datetime(2025, 3, 1),
+    )
+    db_session.add(scan)
+    await db_session.flush()
+    for symbol in ("TGT", "STP", "TIM"):
+        db_session.add(
+            BacktestSignalCandidate(
+                scan_id=scan.id,
+                symbol=symbol,
+                signal_date=datetime(2025, 1, 16),
+                bar_index=SIGNAL_BAR,
+                tt_score=6,
+                vcp_score=Decimal("0.700"),
+                pattern_type="vcp",
+                pattern_quality=Decimal("0.700"),
+                buyability="at_pivot",
+                pivot_price=Decimal(str(PIVOT)),
+                atr_at_signal=Decimal(str(ATR)),
+            )
+        )
+    await db_session.commit()
+
+    odds = await compute_outcome_odds(
+        db_session,
+        pattern_type="vcp",
+        buyability="at_pivot",
+        pattern_quality=0.70,
+        entry_price=100.0,
+        stop_price=95.0,
+        target_price=110.0,
+        atr=ATR,
+    )
+    assert odds.available
+    assert odds.n_triggered == 3

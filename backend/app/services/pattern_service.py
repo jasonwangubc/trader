@@ -511,13 +511,16 @@ def _score_flat_base(df: pd.DataFrame, base: dict) -> float:
     return float(np.clip(0.40 * depth_score + 0.30 * length_score + 0.30 * prior_score, 0.0, 1.0))
 
 
-def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
+def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> tuple[float, dict]:
     """Cup-with-Handle: U-shape consolidation with a small downward drift handle.
 
     Soft-penalty version + PIP shape match. Bulkowski says "be flexible" — so
     handle, depth, symmetry, and right-rim alignment are now all soft. A real
     CWH with a slightly deep handle or a marginally V-ish cup still scores.
     The PIP template comparison gives a length-independent shape score.
+
+    Returns (score, metrics) — metrics feed the ML feature extractor; handle
+    fields are None when no handle has formed yet.
     """
     length = base["base_length_days"]
     depth = base["base_depth_pct"]
@@ -531,11 +534,11 @@ def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
     depth_score = _soft_window(depth, lo=8.0, hi=40.0, falloff=0.5)
     # Bail out if length is clearly wrong (e.g. 10 bars) — saves work
     if length < 20 or length > 400:
-        return 0.0
+        return 0.0, {}
 
     sub = df.iloc[pivot_idx : last_idx + 1]
     if len(sub) < 5:
-        return 0.0
+        return 0.0, {}
     low_idx_rel = int(sub["low"].to_numpy().argmin())
     low_idx = pivot_idx + low_idx_rel
 
@@ -546,12 +549,12 @@ def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
     # Right side recovery — soft. Full credit at ≥95% of left rim, decays below.
     days_since_low = last_idx - low_idx
     if days_since_low < 5:
-        return 0.0   # not enough bars after the low to call it a recovery
+        return 0.0, {}   # not enough bars after the low to call it a recovery
     right_side = df.iloc[low_idx : last_idx + 1]
     right_high = float(right_side["high"].max())
     left_rim = float(sub["high"].iloc[: min(8, len(sub))].max())
     if left_rim <= 0:
-        return 0.0
+        return 0.0, {}
     rim_ratio = right_high / left_rim
     rim_score = float(np.clip((rim_ratio - 0.80) / 0.15, 0.0, 1.0))
 
@@ -586,6 +589,7 @@ def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
             # Drying = good. ratio of 0.5 → 1.0, ratio of 1.0 → 0.5, 1.3 → 0.1
             vol_dry_score = float(np.clip(1.5 - vol_ratio, 0.0, 1.0))
         else:
+            vol_ratio = None
             vol_dry_score = 0.5
 
         handle_score = (
@@ -594,9 +598,21 @@ def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
             0.25 * handle_pos_score +
             0.20 * vol_dry_score
         )
+        handle_metrics = {
+            "handle_depth_pct": round(handle_depth, 3),
+            "handle_bars": handle_bars,
+            "handle_position": round(float(handle_position), 3),
+            "handle_vol_ratio": round(float(vol_ratio), 3) if vol_ratio is not None else None,
+        }
     else:
         # No handle yet — still a candidate, just downgraded.
         handle_score = 0.35
+        handle_metrics = {
+            "handle_depth_pct": None,
+            "handle_bars": None,
+            "handle_position": None,
+            "handle_vol_ratio": None,
+        }
 
     # ── PIP template-match (shape-independent of base length) ─────────────────
     # Compare the smoothed close curve over the base to the CWH template PIPs.
@@ -604,7 +620,7 @@ def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
     smoothed = _smooth(close_arr)
     pip_score = _pip_match_score(smoothed, _CWH_TEMPLATE_PIPS)
 
-    return float(np.clip(
+    score = float(np.clip(
         0.15 * length_score +
         0.15 * depth_score +
         0.15 * symmetry_score +
@@ -613,20 +629,29 @@ def _score_cup_with_handle(df: pd.DataFrame, base: dict) -> float:
         0.20 * pip_score,
         0.0, 1.0,
     ))
+    metrics = {
+        **handle_metrics,
+        "rim_ratio": round(float(rim_ratio), 3),
+        "symmetry_score": round(float(symmetry_score), 3),
+        "pip_score": round(float(pip_score), 3),
+    }
+    return score, metrics
 
 
-def _score_vcp(df: pd.DataFrame, base: dict) -> float:
+def _score_vcp(df: pd.DataFrame, base: dict) -> tuple[float, dict]:
     """Volatility Contraction Pattern: successive lower-high contractions.
 
     Soft-penalty version. Uses ATR-confirmed zigzag pivots for contraction
     detection (volatility-adaptive), and a single contraction is allowed (just
     scored lower than 2+).
+
+    Returns (score, metrics) — metrics feed the ML feature extractor.
     """
     pivot_idx = base["pivot_idx"]
     last_idx = len(df) - 1
     sub = df.iloc[pivot_idx : last_idx + 1].reset_index(drop=True)
     if len(sub) < 25:
-        return 0.0
+        return 0.0, {}
 
     # Prefer ATR-confirmed pivots, fall back to smoothed swings on short bases.
     pivots = _atr_zigzag(sub)
@@ -642,7 +667,7 @@ def _score_vcp(df: pd.DataFrame, base: dict) -> float:
         pivots = marked
 
     if len(pivots) < 3:
-        return 0.0
+        return 0.0, {}
 
     # Build alternating H-L pairs from the pivot sequence
     contractions: list[float] = []
@@ -658,7 +683,7 @@ def _score_vcp(df: pd.DataFrame, base: dict) -> float:
     contractions = contractions[-4:][::-1]
 
     if not contractions:
-        return 0.0
+        return 0.0, {}
 
     # Tightness of the latest contraction — gaussian centered on ~4%, generous.
     # A 10% contraction still scores ~0.5; a 2% scores 1.0.
@@ -701,10 +726,18 @@ def _score_vcp(df: pd.DataFrame, base: dict) -> float:
     else:
         vol_score = 0.4
 
-    return float(np.clip(
+    score = float(np.clip(
         0.40 * progression + 0.35 * tightness_score + 0.25 * vol_score,
         0.0, 1.0,
     ))
+    metrics = {
+        "n_contractions": len(contractions),
+        "last_contraction_pct": round(last_depth, 3),
+        "progression": round(float(progression), 3),
+        "tightness_score": round(float(tightness_score), 3),
+        "vol_score": round(float(vol_score), 3),
+    }
+    return score, metrics
 
 
 def _score_high_tight_flag(df: pd.DataFrame) -> tuple[float, dict | None]:
@@ -1009,11 +1042,15 @@ def detect_pattern(
 
     base = _detect_base(df)
     candidates: list[tuple[str, float, dict | None]] = []
+    vcp_metrics: dict = {}
+    cwh_metrics: dict = {}
     if base is not None:
+        cwh_q, cwh_metrics = _score_cup_with_handle(df, base)
+        vcp_q, vcp_metrics = _score_vcp(df, base)
         candidates.extend([
             ("flat_base",          _score_flat_base(df, base),           base),
-            ("cwh",                _score_cup_with_handle(df, base),     base),
-            ("vcp",                _score_vcp(df, base),                 base),
+            ("cwh",                cwh_q,                                 base),
+            ("vcp",                vcp_q,                                 base),
             ("ascending_triangle", _score_ascending_triangle(df, base),  base),
         ])
     if htf_q  > 0: candidates.append(("high_tight_flag",    htf_q,  htf_info))
@@ -1053,6 +1090,12 @@ def detect_pattern(
     detail_dict: dict = {"all_scores": {c[0]: round(c[1], 3) for c in candidates}}
     if power_play:
         detail_dict["power_play"] = True
+    if base is not None:
+        detail_dict["zone_count"] = base["zone_count"]
+        if vcp_metrics:
+            detail_dict["vcp_metrics"] = vcp_metrics
+        if cwh_metrics:
+            detail_dict["cwh_metrics"] = cwh_metrics
 
     return PatternResult(
         pattern_type=pattern_type,  # type: ignore[arg-type]

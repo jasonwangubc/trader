@@ -586,6 +586,64 @@ class ScreenerScore(Base):
     # Composite score — weighted blend, zeroed if buyability == "extended" or "broken"
     composite_score: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal(0))
 
+    # ML ranker — calibrated P(setup reaches target before stop | breakout),
+    # from the active MLModel. NULL when no usable pattern or no trained model.
+    ml_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    ml_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # {model_id, fv}
+
+
+class WatchlistStatus(StrEnum):
+    WATCHING   = "watching"     # tracked, price not yet approaching the pivot
+    NEAR_PIVOT = "near_pivot"   # in_base, approaching band, rising volume
+    AT_PIVOT   = "at_pivot"     # buyability flipped to at_pivot — actionable now
+    EXTENDED   = "extended"     # ran past the pivot zone before being armed
+    BROKEN     = "broken"       # base invalidated (no_pattern/broken) — terminal
+    ARMED      = "armed"        # user armed a ticket from this item — terminal
+    REMOVED    = "removed"      # dismissed manually, or fell out of the scan universe
+
+
+class WatchlistSource(StrEnum):
+    TIER_S = "tier_s"
+    TIER_A = "tier_a"
+    MANUAL = "manual"
+
+
+class WatchlistItem(Base, TimestampMixin):
+    """Stage-2 pivot watchlist: Tier S/A picks (auto) or manually-added symbols,
+    tracked with a pivot price LOCKED at add time — independent of nightly
+    ScreenerScore overwrites, which recompute pivot/buyability on every scan.
+
+    Not the same thing as ScreenerSymbol (the nightly scan universe) — see the
+    cross-reference comment in app/api/screener.py above the /watchlist routes.
+    """
+    __tablename__ = "watchlist_items"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[str] = mapped_column(String(128), index=True, default=USER_DEFAULT)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+
+    pivot_price: Mapped[Decimal] = mapped_column(_money)          # locked at add time
+    source: Mapped[str] = mapped_column(String(16))               # WatchlistSource
+    pattern_type: Mapped[str | None] = mapped_column(String(24), nullable=True)  # snapshot at add time
+
+    status: Mapped[str] = mapped_column(String(16), default=WatchlistStatus.WATCHING, index=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_notified_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    ticket_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tickets.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # No unique constraint on (user_id, symbol): a symbol that breaks down and
+    # later forms a genuinely new base gets a fresh row with its own locked
+    # pivot rather than resurrecting stale history. App logic enforces "at
+    # most one active (status != removed) row per user+symbol".
+    __table_args__ = (
+        Index("ix_watchlist_items_user_symbol_status", "user_id", "symbol", "status"),
+    )
+
 
 class WheelCandidate(Base):
     """Snapshotted wheel-strategy candidate (CSP or CC) from the latest scan.
@@ -743,9 +801,44 @@ class BacktestSignalCandidate(Base):
     pivot_price: Mapped[Decimal] = mapped_column(_money)
     atr_at_signal: Mapped[Decimal] = mapped_column(_money)
 
+    # Point-in-time ML feature snapshot (ml_features.extract_features output,
+    # incl. "fv" feature version). NULL on scans predating the ML ranker.
+    features: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     __table_args__ = (
         Index("ix_backtest_candidates_scan_symbol", "scan_id", "symbol"),
     )
+
+
+class MLModel(Base):
+    """One trained setup-ranker model. At most one row has is_active=True;
+    run_screener loads that artifact to fill ScreenerScore.ml_score.
+
+    Status lifecycle: training → success | failed.
+    """
+    __tablename__ = "ml_models"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    scan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("backtest_signal_scans.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="training")
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    label_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)  # target_vs_rest | r_ge_1
+    feature_version: Mapped[int] = mapped_column(Integer, default=1)
+    params: Mapped[dict] = mapped_column(JSONB, default=dict)          # trade plan + lgbm params
+    feature_names: Mapped[list] = mapped_column(JSONB, default=list)
+    metrics: Mapped[dict] = mapped_column(JSONB, default=dict)         # auc, brier, calibration, decile lift vs baseline
+    feature_importances: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    n_train: Mapped[int] = mapped_column(Integer, default=0)
+    n_valid: Mapped[int] = mapped_column(Integer, default=0)
+    train_end_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    valid_start_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    artifact_path: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class BrokerExecution(Base):
